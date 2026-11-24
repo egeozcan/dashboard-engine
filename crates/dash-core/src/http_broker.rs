@@ -464,6 +464,16 @@ impl HttpBroker {
         if meta.credential_scheme == "basic" {
             redactor.register_secret(&B64.encode(plaintext.as_bytes()));
         }
+        if meta.credential_scheme.starts_with("query:") {
+            // `apply_credential` writes the value form-urlencoded; that wire form shows up in
+            // transport errors (reqwest prints the URL) and in upstream echoes of the request
+            // target, so it must be redacted like the plaintext.
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(plaintext.as_bytes()).collect();
+            if encoded != plaintext {
+                redactor.register_secret(&encoded);
+            }
+        }
         Ok(Credential {
             secret_name,
             scheme: meta.credential_scheme,
