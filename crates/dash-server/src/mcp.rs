@@ -385,6 +385,17 @@ pub async fn call_mcp_tool(
                 .await?))
         }
 
+        "execution_cancel" => {
+            let exec_id = req_str(&args, "execution_id")?;
+            let reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cancelled via MCP");
+            Ok(json!(services
+                .execution_cancel(exec_id, reason, principal)
+                .await?))
+        }
+
         // Diagnostics
         "logs_query" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
@@ -527,6 +538,7 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
         ("action_invoke", "Invoke an authorized live action outside Drafts"),
         ("execution_inspect", "Inspect action execution records and uncertain outcomes"),
         ("execution_resolve", "Manually resolve an unknown action execution with audit trail"),
+        ("execution_cancel", "Cancel a queued or running action execution (audited)"),
         ("logs_query", "Query sanitized runtime logs"),
         ("graph_trace", "Inspect read-only runtime Execution Graph and trace spans"),
         ("metrics_query", "Inspect runtime metrics (VMs, cache, subscribers, SQLite size)"),

@@ -27,6 +27,11 @@ pub enum HttpBrokerError {
     CredentialError(String, String),
     #[error("http transport failed: {0}")]
     Transport(String),
+    /// The request may already have reached the upstream (failure after the connection was established,
+    /// a timeout, or a lost response body). Carries the stable `UNKNOWN_OUTCOME` code so action
+    /// executions record `unknown`, never `failed` (§9.1, Appendix A.4).
+    #[error("UNKNOWN_OUTCOME: http request may have reached the upstream but no complete response was received: {0}")]
+    OutcomeUnknown(String),
     #[error("too many redirects")]
     TooManyRedirects,
     #[error("response exceeded maximum size of {MAX_RESPONSE_BYTES} bytes")]
@@ -141,8 +146,12 @@ impl HttpBroker {
             }
 
             let resp = builder.send().await.map_err(|e| {
-                let redacted = self.store.redactor().redact_str(&e.to_string());
-                HttpBrokerError::Transport(redacted)
+                let redacted = self.store.redactor().redact_str(&error_chain(&e));
+                if request_provably_not_sent(&e) || is_safe_method(&method_upper) {
+                    HttpBrokerError::Transport(redacted)
+                } else {
+                    HttpBrokerError::OutcomeUnknown(redacted)
+                }
             })?;
 
             if resp.status().is_redirection() {
@@ -163,10 +172,15 @@ impl HttpBroker {
                 }
             }
 
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| HttpBrokerError::Transport(self.store.redactor().redact_str(&e.to_string())))?;
+            // The upstream already answered (status line received): a body failure loses the outcome.
+            let bytes = resp.bytes().await.map_err(|e| {
+                let redacted = self.store.redactor().redact_str(&error_chain(&e));
+                if is_safe_method(&method_upper) {
+                    HttpBrokerError::Transport(redacted)
+                } else {
+                    HttpBrokerError::OutcomeUnknown(redacted)
+                }
+            })?;
             if bytes.len() > MAX_RESPONSE_BYTES {
                 return Err(HttpBrokerError::ResponseTooLarge);
             }
@@ -188,6 +202,29 @@ impl HttpBroker {
 
         Err(HttpBrokerError::TooManyRedirects)
     }
+}
+
+/// A request that failed while building it or while establishing the connection never reached the
+/// upstream. Anything else (send/body/timeout after connect) may have been processed.
+fn request_provably_not_sent(e: &reqwest::Error) -> bool {
+    e.is_builder() || e.is_connect()
+}
+
+/// Safe methods have no upstream side effect, so a lost response never makes their outcome uncertain.
+fn is_safe_method(method_upper: &str) -> bool {
+    matches!(method_upper, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// `Display` of a reqwest error omits its source chain; include it for diagnostics.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+        cur = src.source();
+    }
+    out
 }
 
 async fn validate_destination(url: &Url, policy: &NetworkPolicy) -> Result<(), HttpBrokerError> {

@@ -551,5 +551,19 @@ pub fn build_dash_runtime_sdk(lua: &Lua) -> mlua::Result<Table> {
         "uuid",
         lua.create_function(|_, ()| Ok(uuid::Uuid::new_v4().to_string()))?,
     )?;
+    // Structured `unknown` outcome for action handlers (§9.1): `return dash.unknown_outcome("reason")`
+    // tells the host the external operation may have happened although no response proves it.
+    dash.set(
+        "unknown_outcome",
+        lua.create_function(|lua, reason: Option<String>| {
+            let t = lua.create_table()?;
+            t.set("__unknown", true)?;
+            t.set(
+                "reason",
+                reason.unwrap_or_else(|| "upstream_connection_lost_after_request".into()),
+            )?;
+            Ok(t)
+        })?,
+    )?;
     Ok(dash)
 }

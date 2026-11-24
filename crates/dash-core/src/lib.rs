@@ -12,7 +12,10 @@ pub mod signal;
 pub mod state;
 pub mod telemetry;
 
-pub use actions::{ActionManager, DryRunReport, WidgetRequestEnvelope};
+pub use actions::{
+    ActionManager, DryRunReport, InvocationContext, WidgetRequestEnvelope, WidgetRequestOutcome,
+    UNKNOWN_OUTCOME_CODE,
+};
 pub use authority::{
     check_action_authority, check_connector_operation_authority, check_provider_access,
     validate_configured_graph, AuthError, Principal, PrincipalKind, ValidationIssue,
@@ -537,7 +540,7 @@ return dash.connector {
     id = "github.connector",
     capabilities = { "pull_requests.read", "pull_requests.merge" },
     operations = {
-        get_pr = { required_capabilities = { "pull_requests.read" } },
+        get_pr = { required_capabilities = { "pull_requests.read" }, read_only = true },
         merge_pr = { required_capabilities = { "pull_requests.merge" } },
     },
 }

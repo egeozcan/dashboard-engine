@@ -516,6 +516,18 @@ pub fn validate_configured_graph(
         }
     }
 
+    // Action `invalidates` entries that match nothing silently invalidate nothing (§9.1 step 6).
+    for (action_id, entry) in crate::actions::unresolved_invalidations(graph) {
+        issues.push(ValidationIssue {
+            severity: "warning".into(),
+            code: "UNRESOLVED_INVALIDATION".into(),
+            target: action_id,
+            message: format!(
+                "invalidates entry '{entry}' matches no Instance, Definition or input slot; nothing will be invalidated"
+            ),
+        });
+    }
+
     let valid = !issues.iter().any(|i| i.severity == "error");
     ValidationReport { valid, issues }
 }

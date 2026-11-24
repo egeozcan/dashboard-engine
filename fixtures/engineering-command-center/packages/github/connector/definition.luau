@@ -11,6 +11,7 @@ return dash.connector {
         list_prs = {
             description = "List pull requests for a repository",
             required_capabilities = { "pull_requests.read" },
+            read_only = true,
             args = dash.object {
                 repository = dash.string(),
                 state = dash.optional(dash.string()),
@@ -20,6 +21,7 @@ return dash.connector {
         get_pr = {
             description = "Get single pull request state",
             required_capabilities = { "pull_requests.read" },
+            read_only = true,
             args = dash.object {
                 repository = dash.string(),
                 number = dash.integer(),

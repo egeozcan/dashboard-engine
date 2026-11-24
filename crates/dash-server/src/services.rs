@@ -5,7 +5,7 @@ use dash_core::{
     validate_configured_graph, CapabilityCeiling, ConfiguredGraph, DashboardDoc, DryRunReport,
     ExecutionGraphSnapshot, HistorySeriesConfig, InstanceConfig, Principal,
     QueryEnvelope, RuntimeEngine, RuntimeMetricsSnapshot, SanitizedLogEntry, ValidationReport,
-    WidgetRequestEnvelope,
+    WidgetRequestEnvelope, WidgetRequestOutcome,
 };
 use dash_git::{
     read_packages_toml, write_packages_toml, ActivationResult, DraftManager, GitCommitInfo,
@@ -90,6 +90,8 @@ impl AppServices {
                 tokio::select! {
                     _ = ticker.tick() => {
                         services.engine().pool.reclaim_idle(None);
+                        // Host retry of `reconcile` with backoff for `unknown` executions (§9.1)
+                        services.engine().actions.run_due_reconciles(16).await;
                         services.run_due_history_samples().await;
                         services.run_due_polls().await;
                     }
@@ -415,6 +417,8 @@ impl AppServices {
             .queries
             .render_dashboard(dashboard_id, principal)
             .await?;
+        // Widget Requests are accepted only for widget_ids of the current render (Appendix A.3)
+        self.engine().actions.record_rendered_dashboard(&rendered);
         let g = self.graph();
         let doc = g.dashboards.get(dashboard_id).cloned();
         Ok(serde_json::json!({
@@ -501,6 +505,18 @@ impl AppServices {
             .await
     }
 
+    /// Widget Request dispatch returning a real action execution, or a refresh that is not one.
+    pub async fn dispatch_widget_request_outcome(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+    ) -> Result<WidgetRequestOutcome, String> {
+        self.engine()
+            .actions
+            .dispatch_widget_request_outcome(req, principal)
+            .await
+    }
+
     pub fn execution_inspect(&self, execution_id: Option<&str>) -> Result<serde_json::Value, String> {
         if let Some(id) = execution_id {
             let rec = self
@@ -528,6 +544,18 @@ impl AppServices {
         self.engine()
             .actions
             .resolve_execution(execution_id, status, reason, principal)
+            .await
+    }
+
+    pub async fn execution_cancel(
+        &self,
+        execution_id: &str,
+        reason: &str,
+        principal: &Principal,
+    ) -> Result<ActionExecutionRecord, String> {
+        self.engine()
+            .actions
+            .cancel_execution(execution_id, reason, principal)
             .await
     }
 

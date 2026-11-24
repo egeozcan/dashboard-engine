@@ -326,7 +326,13 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
     let credentials = parse_string_vec(tbl, "credentials")?;
     let invalidates = parse_string_vec(tbl, "invalidates")?;
     let dashboard_state_reads = parse_string_vec(tbl, "dashboard_state_reads")?;
-    let accepts_requests = parse_string_vec(tbl, "accepts_requests")?;
+    let mut accepts_requests = parse_string_vec(tbl, "accepts_requests")?;
+    let request_schemas = parse_request_schemas(tbl)?;
+    for name in request_schemas.keys() {
+        if !accepts_requests.iter().any(|r| r == name) {
+            accepts_requests.push(name.clone());
+        }
+    }
     let libraries = parse_string_vec(tbl, "libraries")?;
     let widget_asset: Option<String> = tbl.get("asset").ok();
 
@@ -369,6 +375,7 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
         invalidates,
         dashboard_state_reads,
         accepts_requests,
+        request_schemas,
         widget_props,
         widget_asset,
         updates,
@@ -588,6 +595,15 @@ fn parse_operations(
         let required_capabilities = parse_string_vec(&op_tbl, "required_capabilities")?;
         let args = parse_opt_schema(&op_tbl, "args")?.unwrap_or(SchemaSpec::Any);
         let result = parse_opt_schema(&op_tbl, "result")?.unwrap_or(SchemaSpec::Any);
+        let read_only = match op_tbl.get::<Value>("read_only")? {
+            Value::Nil => false,
+            Value::Boolean(b) => b,
+            _ => {
+                return Err(DeclarationError::InvalidContract(format!(
+                    "operation '{op_name}': read_only must be a boolean"
+                )))
+            }
+        };
         out.insert(
             op_name,
             ConnectorOperationSpec {
@@ -595,8 +611,22 @@ fn parse_operations(
                 required_capabilities,
                 args,
                 result,
+                read_only,
             },
         );
+    }
+    Ok(out)
+}
+
+/// `requests = { merge_requested = dash.object { ... } }` on Adapters and widget providers.
+fn parse_request_schemas(tbl: &Table) -> Result<BTreeMap<String, SchemaSpec>, DeclarationError> {
+    let mut out = BTreeMap::new();
+    let Value::Table(reqs) = tbl.get::<Value>("requests")? else {
+        return Ok(out);
+    };
+    for pair in reqs.pairs::<String, Value>() {
+        let (name, schema_val) = pair?;
+        out.insert(name, parse_schema_value(schema_val)?);
     }
     Ok(out)
 }

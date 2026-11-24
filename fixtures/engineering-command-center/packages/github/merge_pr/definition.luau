@@ -24,5 +24,7 @@ return dash.action_provider {
     emits = {
         { semantic_type = "github.pr_merged", schema_version = "1", durable = true },
     },
-    invalidates = { "open_prs", "linked_prs" },
+    -- Declares the affected data-provider Definition (not Workspace Instance names); every Instance of
+    -- it, and everything downstream of those (e.g. linked PR joins), is invalidated.
+    invalidates = { "github.pull_requests" },
 }

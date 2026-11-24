@@ -11,6 +11,7 @@ return dash.connector {
         get_issues = {
             description = "Fetch issues by keys",
             required_capabilities = { "issues.read" },
+            read_only = true,
             args = dash.object {
                 keys = dash.list(dash.string()),
             },

@@ -585,6 +585,14 @@ impl QueryEngine {
             .get(connector_id)
             .ok_or_else(|| format!("connector instance '{connector_id}' not found"))?
             .clone();
+        // Only connector Instances run here; an action bound as an input must go through
+        // ActionManager::invoke (own execution record, authority and audit, §9.2).
+        if conn_inst.category != DefinitionCategory::Connector {
+            return Err(format!(
+                "instance '{connector_id}' is a {}, not a connector; connector operations cannot target it",
+                conn_inst.category.as_str()
+            ));
+        }
 
         check_connector_operation_authority(principal, &conn_inst, operation, &g)
             .map_err(|e| e.to_string())?;
@@ -667,7 +675,16 @@ impl QueryEngine {
                 None,
             )
             .await
-            .map_err(|e| self.store.redactor().redact_str(&e.to_string()))
+            .map_err(|e| match e {
+                // The connector handler was interrupted mid-flight: any request it issued may have
+                // been processed upstream (§9.1 `unknown`).
+                dash_luau::RuntimeError::Timeout(_) | dash_luau::RuntimeError::Cancelled => format!(
+                    "{}: connector '{}' operation '{operation}' did not complete: {e}",
+                    crate::actions::UNKNOWN_OUTCOME_CODE,
+                    conn_inst.id
+                ),
+                other => self.store.redactor().redact_str(&other.to_string()),
+            })
     }
 
     /// Push a direct update (or simulated push) for an instance's cached queries and compute keyed delta.

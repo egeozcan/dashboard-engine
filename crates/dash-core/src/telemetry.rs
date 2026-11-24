@@ -155,6 +155,41 @@ impl Telemetry {
         span_id
     }
 
+    /// Like [`Telemetry::record_span`], but with a caller-chosen `span_id` so nested work (e.g. child
+    /// action executions) can name this span as its parent before it is recorded (§5.1.5, §15.1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_span_with_id(
+        &self,
+        span_id: &str,
+        trace_id: &str,
+        parent_span_id: Option<&str>,
+        name: &str,
+        principal_id: &str,
+        attributes: serde_json::Value,
+        status: &str,
+        duration_ms: i64,
+    ) {
+        let span = TraceSpanRecord {
+            span_id: span_id.to_string(),
+            trace_id: trace_id.to_string(),
+            parent_span_id: parent_span_id.map(|s| s.to_string()),
+            name: name.to_string(),
+            principal_id: principal_id.to_string(),
+            attributes: self.redactor.redact_json(&attributes),
+            status: status.to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            duration_ms,
+        };
+        {
+            let mut guard = self.spans.lock().expect("spans mutex poisoned");
+            if guard.len() >= MAX_RECENT_SPANS {
+                guard.pop_front();
+            }
+            guard.push_back(span.clone());
+        }
+        let _ = self.store.record_trace_span(&span);
+    }
+
     pub fn recent_spans(&self, limit: usize) -> Vec<TraceSpanRecord> {
         let guard = self.spans.lock().expect("spans mutex poisoned");
         if !guard.is_empty() {

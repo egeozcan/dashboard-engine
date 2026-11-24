@@ -349,6 +349,14 @@ pub struct ConnectorOperationSpec {
     pub required_capabilities: Vec<String>,
     pub args: SchemaSpec,
     pub result: SchemaSpec,
+    /// Declared to perform no side effects. Only `read_only` operations may run inside an action's
+    /// Dry run or `reconcile` handler (§9.1); undeclared operations are treated as mutating.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +434,10 @@ pub struct DefinitionManifest {
     pub dashboard_state_reads: Vec<String>,
     #[serde(default)]
     pub accepts_requests: Vec<String>,
+    /// Payload schemas for accepted widget Requests (`requests = { name = schema }`), validated by the
+    /// host before dispatch (Appendix A.3).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_schemas: BTreeMap<String, SchemaSpec>,
     #[serde(default)]
     pub widget_props: Option<SchemaSpec>,
     #[serde(default)]

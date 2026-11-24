@@ -384,7 +384,7 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
             let assert = req.assert.as_ref().or(step_assert);
             let rec = engine
                 .actions
-                .dispatch_widget_request(
+                .dispatch_widget_request_outcome(
                     WidgetRequestEnvelope {
                         protocol: "dash.widget/1".into(),
                         dashboard_id: req.dashboard.clone(),
@@ -401,10 +401,10 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 .await?;
             if let Some(a) = assert {
                 if let Some(ref exp_s) = a.status {
-                    if &rec.status != exp_s {
+                    if rec.status() != exp_s {
                         return Err(format!(
                             "step {idx}: expected request status '{exp_s}', got '{}'",
-                            rec.status
+                            rec.status()
                         ));
                     }
                 }
