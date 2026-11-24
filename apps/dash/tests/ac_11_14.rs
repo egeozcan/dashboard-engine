@@ -669,6 +669,11 @@ async fn ac11_ui_edits_code_layout_and_bindings_then_observes_execution_graph_an
     let runtime = src["runtime_luau"].as_str().unwrap();
     assert!(runtime.contains("\"Open PRs (\""), "{runtime}");
     let edited = runtime.replace("\"Open PRs (\"", "\"Open pull requests (\"");
+    // The Definition's own tests pin the counter label: keep them in step with the edit, or
+    // the pre-activation test gate rejects the Draft.
+    let tests = src["tests_luau"].as_str().unwrap();
+    assert!(tests.contains("\"Open PRs ("), "{tests}");
+    let edited_tests = tests.replace("\"Open PRs (", "\"Open pull requests (");
     app.post_ok(
         &format!("/api/drafts/{id}/definitions"),
         json!({
@@ -676,7 +681,7 @@ async fn ac11_ui_edits_code_layout_and_bindings_then_observes_execution_graph_an
             "name": "pr_trend_adapter",
             "definition_luau": src["definition_luau"],
             "runtime_luau": edited,
-            "tests_luau": src["tests_luau"],
+            "tests_luau": edited_tests,
         }),
     )
     .await;
@@ -1447,7 +1452,13 @@ async fn ac13_concurrent_readers_never_observe_a_mixed_generation() {
                     .unwrap()
                     .replace("\"Open PRs (\"", "\"Open PRs v2 (\""),
             ),
-            src["tests_luau"].as_str(),
+            // Keep the Definition's label assertions in step with the runtime edit.
+            Some(
+                &src["tests_luau"]
+                    .as_str()
+                    .unwrap()
+                    .replace("\"Open PRs (", "\"Open PRs v2 ("),
+            ),
             &admin,
         )
         .unwrap();
