@@ -321,6 +321,15 @@ export class SignalClient {
         for (const l of this.dashboards.get(m.dashboard_id) ?? []) l(m);
         return;
       }
+      case "subscribed":
+        // A new Generation moved the query to a new query_key: follow it (a resync snapshot
+        // on the new key follows).
+        if (typeof msg.replaces === "string" && typeof msg.query_key === "string") {
+          for (const s of this.queries.values()) {
+            if (s.queryKey === msg.replaces) s.queryKey = msg.query_key;
+          }
+        }
+        return;
       case "query_signal":
         this.handleQuerySignal(msg.envelope as QueryEnvelope);
         return;

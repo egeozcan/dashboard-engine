@@ -145,6 +145,31 @@ describe("SignalClient", () => {
     client.close();
   });
 
+  it("follows a query subscription re-bound to a new query_key by a Generation change", () => {
+    const client = makeClient();
+    const states: unknown[] = [];
+    client.subscribeQuery("open_prs", { repository: "acme/platform" }, (s) => states.push(s.value));
+    const ws = MockWebSocket.latest();
+    ws.open();
+    ws.receive({ type: "subscribed", query_key: "qk1", instance: "open_prs" });
+    ws.receive({ type: "query_signal", envelope: snap(1, [{ id: "x", n: 1 }]) });
+
+    ws.receive({ type: "subscribed", query_key: "qk2", instance: "open_prs", replaces: "qk1" });
+    ws.receive({
+      type: "query_signal",
+      resync: true,
+      envelope: snap(4, [{ id: "x", n: 2 }], { query_key: "qk2", generation: 2 }),
+    });
+    ws.receive({
+      type: "query_signal",
+      envelope: { ...delta(4, 5, [{ op: "delete", key: "x" }]), query_key: "qk2", generation: 2 },
+    });
+    expect(states).toEqual([[{ id: "x", n: 1 }], [{ id: "x", n: 2 }], []]);
+    // No resubscribe was needed.
+    expect(ws.sent.filter((m) => m.type === "subscribe_query")).toHaveLength(1);
+    client.close();
+  });
+
   it("forwards Dashboard State Signals and errors", () => {
     const client = makeClient();
     const onState = vi.fn();

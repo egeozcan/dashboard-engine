@@ -411,10 +411,11 @@ async fn query_subscriptions_dedup_unsubscribe_and_deliver_deltas() {
         .iter()
         .filter(|m| m["type"] == "query_signal")
         .collect();
-    assert_eq!(signals.len(), 2, "{msgs:?}");
+    // Only the keyed delta: the snapshot of the same version published after it is not resent
+    // in full (§6.2 keyed deltas save bandwidth and outbound queue slots).
+    assert_eq!(signals.len(), 1, "{msgs:?}");
     assert_eq!(signals[0]["envelope"]["kind"], "delta");
     assert_eq!(signals[0]["envelope"]["base_version"].as_u64().unwrap(), v0);
-    assert_eq!(signals[1]["envelope"]["kind"], "snapshot");
 
     send(
         &mut ws,
@@ -549,5 +550,198 @@ async fn lagging_subscriber_resyncs_to_latest_snapshot_and_keeps_receiving() {
     let (m, _) = expect_type(&mut ws, "query_signal").await;
     assert_eq!(m["resync"], true);
     assert_eq!(m["envelope"]["version"].as_u64(), Some(last + 1));
+    h.abort();
+}
+
+#[tokio::test]
+async fn initial_snapshot_is_not_followed_by_replayed_loading_or_duplicate_snapshot() {
+    let (_tmp, _services, addr, h) = boot().await;
+    let params: Value = serde_json::from_str(PARAMS).unwrap();
+    let mut ws = connect(addr, ADMIN_TOKEN).await;
+    // Uncached query: the leader publishes `loading` before the value, while this socket's
+    // stream is already registered.
+    send(
+        &mut ws,
+        json!({"type": "subscribe_query", "instance": "open_prs", "params": params}),
+    )
+    .await;
+    let (first, _) = expect_type(&mut ws, "query_signal").await;
+    assert_eq!(first["envelope"]["status"], "fresh");
+    let rest = drain(&mut ws, Duration::from_millis(500)).await;
+    let replayed: Vec<&Value> = rest
+        .iter()
+        .filter(|m| m["type"] == "query_signal")
+        .collect();
+    assert!(
+        replayed.is_empty(),
+        "status went backwards / snapshot resent: {replayed:?}"
+    );
+    h.abort();
+}
+
+#[tokio::test]
+async fn query_subscription_rebinds_when_a_generation_changes_its_query_key() {
+    let (_tmp, services, addr, h) = boot().await;
+    let params: Value = serde_json::from_str(PARAMS).unwrap();
+    let mut ws = connect(addr, ADMIN_TOKEN).await;
+    send(
+        &mut ws,
+        json!({"type": "subscribe_query", "instance": "open_prs", "params": params}),
+    )
+    .await;
+    let (sub, _) = expect_type(&mut ws, "subscribed").await;
+    let old_qk = sub["query_key"].as_str().unwrap().to_string();
+    expect_type(&mut ws, "query_signal").await;
+
+    // Activation of a Generation whose open_prs Definition changed (new identity_version).
+    let mut g = (*services.graph()).clone();
+    let def_id = g.instances["open_prs"].definition.clone();
+    g.definitions
+        .get_mut(&def_id)
+        .unwrap()
+        .manifest
+        .identity_version
+        .push_str("-changed");
+    g.generation_id += 1;
+    services.engine().graph.store(std::sync::Arc::new(g));
+
+    let (rebound, _) = expect_type(&mut ws, "subscribed").await;
+    assert_eq!(rebound["replaces"], old_qk.as_str());
+    let new_qk = rebound["query_key"].as_str().unwrap().to_string();
+    assert_ne!(new_qk, old_qk);
+    assert_eq!(
+        new_qk,
+        services
+            .engine()
+            .queries
+            .resolve_query_key("open_prs", &params, &Principal::administrator())
+            .unwrap()
+    );
+    let (snap, _) = expect_type(&mut ws, "query_signal").await;
+    assert_eq!(snap["resync"], true);
+    assert_eq!(snap["envelope"]["query_key"], new_qk.as_str());
+
+    // Later computations (published on the new key) keep arriving.
+    services
+        .engine()
+        .queries
+        .push_query_value(
+            "open_prs",
+            &params,
+            &Principal::administrator(),
+            json!([{"id": "acme/platform#77", "number": 77, "state": "open"}]),
+        )
+        .unwrap();
+    let (next, _) = expect_type(&mut ws, "query_signal").await;
+    assert_eq!(next["envelope"]["query_key"], new_qk.as_str());
+
+    // The socket's subscription is addressed by the new key.
+    send(
+        &mut ws,
+        json!({"type": "resync_query", "query_key": new_qk}),
+    )
+    .await;
+    let (m, _) = expect_type(&mut ws, "query_signal").await;
+    assert_eq!(m["resync"], true);
+    send(
+        &mut ws,
+        json!({"type": "unsubscribe_query", "query_key": new_qk}),
+    )
+    .await;
+    let (unsub, _) = expect_type(&mut ws, "unsubscribed").await;
+    assert_eq!(unsub["existed"], true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(services.engine().signals.subscriber_count(&new_qk), 0);
+    assert_eq!(services.engine().signals.subscriber_count(&old_qk), 0);
+    h.abort();
+}
+
+#[tokio::test]
+async fn state_signals_stop_when_a_generation_revokes_dashboard_read_authority() {
+    let (_tmp, services, addr, h) = boot().await;
+    let adapters: Vec<String> = services.graph().dashboards["engineering"]
+        .adapters
+        .iter()
+        .map(|p| p.adapter_instance.clone())
+        .collect();
+    let adapter_refs: Vec<&str> = adapters.iter().map(String::as_str).collect();
+    let token = agent(&services, &adapter_refs);
+    let mut ws = connect(addr, &token).await;
+    send(
+        &mut ws,
+        json!({"type": "subscribe_dashboard", "dashboard_id": "engineering"}),
+    )
+    .await;
+    let _ = drain(&mut ws, Duration::from_millis(500)).await;
+    let state = services.engine().state.clone();
+    let gen0 = services.graph().generation_id;
+    state
+        .set(
+            "dashboard",
+            "engineering",
+            "selected_repository",
+            1,
+            gen0,
+            json!("acme/payments"),
+            None,
+        )
+        .unwrap();
+    let (sig, _) = expect_type(&mut ws, "state_signal").await;
+    assert_eq!(sig["payload"]["value"], "acme/payments");
+
+    // A new Generation places an Adapter this Agent may not read.
+    let mut g = (*services.graph()).clone();
+    let mut extra = g.dashboards["engineering"].adapters[0].clone();
+    extra.adapter_instance = "open_prs".into();
+    g.dashboards
+        .get_mut("engineering")
+        .unwrap()
+        .adapters
+        .push(extra);
+    g.generation_id += 1;
+    services.engine().graph.store(std::sync::Arc::new(g));
+
+    // Immediately (before any periodic check) no more State is delivered...
+    state
+        .set(
+            "dashboard",
+            "engineering",
+            "selected_repository",
+            1,
+            gen0 + 1,
+            json!("acme/platform"),
+            None,
+        )
+        .unwrap();
+    let msgs = drain(&mut ws, Duration::from_millis(1200)).await;
+    assert!(msgs.iter().all(|m| m["type"] != "state_signal"), "{msgs:?}");
+    // ...and the subscription is ended with an authority error.
+    assert!(
+        msgs.iter()
+            .any(|m| m["type"] == "error" && m["code"] == "forbidden"),
+        "{msgs:?}"
+    );
+
+    // A refused re-subscribe does not revive delivery either.
+    send(
+        &mut ws,
+        json!({"type": "subscribe_dashboard", "dashboard_id": "engineering"}),
+    )
+    .await;
+    let (err, _) = expect_type(&mut ws, "error").await;
+    assert_eq!(err["code"], "forbidden");
+    state
+        .set(
+            "dashboard",
+            "engineering",
+            "selected_repository",
+            1,
+            gen0 + 1,
+            json!("acme/payments"),
+            None,
+        )
+        .unwrap();
+    let msgs = drain(&mut ws, Duration::from_millis(400)).await;
+    assert!(msgs.iter().all(|m| m["type"] != "state_signal"), "{msgs:?}");
     h.abort();
 }
