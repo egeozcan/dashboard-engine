@@ -44,6 +44,7 @@ pub struct DraftManager {
     data_dir: PathBuf,
     store: SqliteStore,
     engine: RuntimeEngine,
+    use_mocks: bool,
     activate_lock: std::sync::Arc<Mutex<()>>,
 }
 
@@ -53,6 +54,16 @@ impl DraftManager {
         data_dir: PathBuf,
         store: SqliteStore,
         budget: dash_luau::ResourceBudget,
+    ) -> Result<Self, GitError> {
+        Self::initialize_with_mocks(workspace_dir, data_dir, store, budget, false).await
+    }
+
+    pub async fn initialize_with_mocks(
+        workspace_dir: PathBuf,
+        data_dir: PathBuf,
+        store: SqliteStore,
+        budget: dash_luau::ResourceBudget,
+        use_mocks: bool,
     ) -> Result<Self, GitError> {
         let branch = "main";
         let head = ensure_git_repo(&workspace_dir, branch).await?;
@@ -78,7 +89,7 @@ impl DraftManager {
             let _ = store.upsert_activation_journal(&repaired);
         }
 
-        let mut graph = load_workspace_graph(&workspace_dir, &data_dir, &head, 1, false)?;
+        let mut graph = load_workspace_graph(&workspace_dir, &data_dir, &head, 1, use_mocks)?;
         let gen_id = store
             .record_generation(&head, &graph.graph_digest())
             .map_err(|e| GitError::Workspace(e.to_string()))?;
@@ -121,6 +132,7 @@ impl DraftManager {
             data_dir,
             store,
             engine,
+            use_mocks,
             activate_lock: std::sync::Arc::new(Mutex::new(())),
         })
     }
@@ -535,7 +547,7 @@ impl DraftManager {
             &self.data_dir,
             &new_commit,
             old_graph.generation_id + 1,
-            false,
+            self.use_mocks,
         )?;
         let new_gen_id = self
             .store

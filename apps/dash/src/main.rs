@@ -39,6 +39,9 @@ enum Commands {
         bind: SocketAddr,
         #[arg(long = "trusted-proxy", default_value = "127.0.0.1")]
         trusted_proxies: Vec<IpAddr>,
+        /// Substitute Mock connector definitions for local demos without external credentials
+        #[arg(long, default_value_t = false)]
+        use_mocks: bool,
     },
     /// Run all Luau Definition tests and YAML Scenario tests in isolated Preview
     Test,
@@ -175,8 +178,9 @@ async fn main() -> Result<()> {
         Commands::Serve {
             bind,
             trusted_proxies,
+            use_mocks,
         } => {
-            let services = open_services(&cli.workspace, &cli.data_dir, trusted_proxies).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, trusted_proxies, use_mocks).await?;
             let worker_handle = services.spawn_background_workers();
             let app = build_router(services.clone());
 
@@ -214,7 +218,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Reload => {
-            let services = open_services(&cli.workspace, &cli.data_dir, vec![]).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
             let act = services
                 .drafts
                 .reload_workspace(&Principal::administrator())
@@ -223,7 +227,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Git { action } => {
-            let services = open_services(&cli.workspace, &cli.data_dir, vec![]).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
             match action {
                 GitAction::Status => {
                     let s = services.git_status().await.map_err(|e| anyhow::anyhow!(e))?;
@@ -240,7 +244,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Doctor => {
-            let services = open_services(&cli.workspace, &cli.data_dir, vec![]).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
             let doc = services.workspace_doctor()?;
             println!("{}", serde_json::to_string_pretty(&doc)?);
         }
@@ -250,7 +254,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Secret { action } => {
-            let services = open_services(&cli.workspace, &cli.data_dir, vec![]).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
             let admin = Principal::administrator();
             match action {
                 SecretAction::Set {
@@ -272,7 +276,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Token { action } => {
-            let services = open_services(&cli.workspace, &cli.data_dir, vec![]).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
             let admin = Principal::administrator();
             match action {
                 TokenAction::Create { name, ceiling } => {
@@ -301,7 +305,7 @@ async fn main() -> Result<()> {
             principal_id,
             ceiling,
         } => {
-            let services = open_services(&cli.workspace, &cli.data_dir, vec![]).await?;
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
             let parsed: CapabilityCeiling = serde_json::from_str(&ceiling)?;
             services
                 .service_principal_grant(&principal_id, parsed, &Principal::administrator())
@@ -316,13 +320,15 @@ async fn open_services(
     workspace: &PathBuf,
     data_dir: &PathBuf,
     trusted_proxies: Vec<IpAddr>,
+    use_mocks: bool,
 ) -> Result<AppServices> {
     let store = SqliteStore::open(data_dir)?;
-    let mgr = DraftManager::initialize(
+    let mgr = DraftManager::initialize_with_mocks(
         workspace.clone(),
         data_dir.clone(),
         store,
         ResourceBudget::default(),
+        use_mocks,
     )
     .await?;
     Ok(AppServices::new(mgr, trusted_proxies))
