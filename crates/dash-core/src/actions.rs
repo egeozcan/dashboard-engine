@@ -4649,9 +4649,9 @@ return R
         let stray = find(&rendered, "adapter_stray").expect("stray node rendered");
         assert_eq!(stray["widget_type"], "dash.text", "{stray}");
         assert!(
-            stray["render_error"]
-                .as_str()
-                .is_some_and(|m| m.contains("WIDGET_CONTRACT_VIOLATION") && m.contains("t.not_a_widget")),
+            stray["render_error"].as_str().is_some_and(
+                |m| m.contains("WIDGET_CONTRACT_VIOLATION") && m.contains("t.not_a_widget")
+            ),
             "{stray}"
         );
         // Built-in widgets that only render, and unknown widget types, send no Requests.

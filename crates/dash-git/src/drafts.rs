@@ -795,14 +795,9 @@ impl DraftManager {
         // The fetch is steered by `principal`: restricted Principals are held to the
         // Administrator network ceiling and get no ambient Git credentials (R7:SEC-5).
         let fetch_policy = PackageFetchPolicy::for_principal(principal, &self.store);
-        let lock = resolve_package_update_with_policy(
-            wt,
-            &self.data_dir,
-            &cfg,
-            pkg_name,
-            &fetch_policy,
-        )
-        .await?;
+        let lock =
+            resolve_package_update_with_policy(wt, &self.data_dir, &cfg, pkg_name, &fetch_policy)
+                .await?;
         // Persist both files, restoring the originals if either write fails.
         let originals: Vec<(PathBuf, Option<Vec<u8>>)> = ["packages.toml", "packages.lock"]
             .iter()
