@@ -1236,6 +1236,7 @@ mod tests {
             adapters: vec![],
             initial_state: BTreeMap::new(),
             overrides: BTreeMap::new(),
+            state_schema: BTreeMap::new(),
         };
         assert!(write_dashboard_in_workspace(&ws, &doc).is_err());
         doc.id = "/tmp/evil".into();

@@ -483,6 +483,17 @@ impl DraftManager {
             )));
         }
 
+        // State migrations must be possible before anything is committed (§8). Checked before
+        // Preview so a draft whose State cannot migrate is refused with that reason.
+        let wt = PathBuf::from(&draft.worktree_path);
+        let candidate_graph = load_workspace_graph(&wt, &self.data_dir, &active_rev, 0, false).await?;
+        self.engine
+            .state
+            .check_generation_state(&candidate_graph.dashboards)
+            .map_err(|e| {
+                GitError::Workspace(format!("{e}; activation refused, live State preserved"))
+            })?;
+
         // Validate & test if not already passed since last mutation
         if draft.validation_report.is_none() || draft.test_report.is_none() {
             let report = self.draft_preview_and_test(draft_id).await?;
@@ -504,9 +515,8 @@ impl DraftManager {
             }
         }
 
-        let wt = Path::new(&draft.worktree_path);
+        let wt = wt.as_path();
         // Also ensure live validation (checking Service principal grants etc. against real store)
-        let candidate_graph = load_workspace_graph(wt, &self.data_dir, &active_rev, 0, false).await?;
         let live_val = validate_configured_graph(&candidate_graph, &self.store, false);
         if !live_val.valid {
             return Err(GitError::Workspace(format!(
@@ -514,13 +524,6 @@ impl DraftManager {
                 live_val.issues
             )));
         }
-        // State migrations must be possible before anything is committed (§8).
-        self.engine
-            .state
-            .check_generation_state(&candidate_graph.dashboards)
-            .map_err(|e| {
-                GitError::Workspace(format!("{e}; activation refused, live State preserved"))
-            })?;
 
         // Principal-aware authority (§5.2, §11.3, ADR-0002): every editor of the draft and the
         // activating Principal must hold the secrets / Service principal ceilings the change reaches.
