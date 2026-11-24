@@ -263,7 +263,11 @@ impl UserData for LuaContext {
                 Value::UserData(ud) => {
                     let handle = ud.borrow::<FutureHandle>()?.clone();
                     let json_val = handle.resolve().await.map_err(mlua::Error::runtime)?;
-                    lua.to_value(&json_val)
+                    if json_val.is_null() {
+                        Ok(Value::Nil)
+                    } else {
+                        lua.to_value(&json_val)
+                    }
                 }
                 other => Ok(other),
             }
@@ -454,7 +458,11 @@ impl UserData for StateFacade {
                 .state_get(&this.scope, &key)
                 .await
                 .map_err(mlua::Error::runtime)?;
-            lua.to_value(&val)
+            if val.is_null() {
+                Ok(Value::Nil)
+            } else {
+                lua.to_value(&val)
+            }
         });
 
         methods.add_async_method(
