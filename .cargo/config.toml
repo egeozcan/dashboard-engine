@@ -6,3 +6,7 @@
 # An explicit value in the environment wins.
 [env]
 DASH_ALLOW_COLOCATED_VAULT_KEY_IN_TEMP = { value = "1", force = false }
+# Test threads (libtest) and runtime worker threads without an explicit size default to 2 MiB;
+# deep end-to-end tests (e.g. ac12's widget Request -> action -> connector chain) need ~2.1 MiB in
+# debug builds. The daemon itself builds its runtime with an explicit 8 MiB worker stack.
+RUST_MIN_STACK = { value = "8388608", force = false }

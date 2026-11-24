@@ -193,8 +193,20 @@ enum TokenAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Worker-thread stack size for the daemon runtime. The default 2 MiB leaves too little headroom
+/// for deeply nested Adapter → action → connector call chains (notably in debug builds), so the
+/// runtime is built explicitly with a larger, bounded stack.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
