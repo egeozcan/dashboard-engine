@@ -321,36 +321,69 @@ impl AutomationEngine {
     /// sequence order, deliver matching Events (with bounded retry, then dead-letter) and advance
     /// the checkpoint. Run at startup, periodically and whenever the live broadcast signals new
     /// Events or reports lag.
+    /// Source Instances an automation's Event triggers consume (`all_sources` is filled lazily
+    /// from the log for triggers without a `source_input`).
+    fn event_sources(
+        &self,
+        inst: &InstanceConfig,
+        def: &LoadedDefinition,
+        all_sources: &mut Option<Vec<String>>,
+    ) -> BTreeSet<String> {
+        let mut sources = BTreeSet::new();
+        for t in def.manifest.triggers.iter().filter(|t| t.kind == "event") {
+            match t.source_input.as_deref() {
+                Some(slot) => {
+                    if let Some(src) = inst.inputs.get(slot) {
+                        sources.insert(src.clone());
+                    }
+                }
+                None => {
+                    if all_sources.is_none() {
+                        *all_sources = Some(self.events.log().sources().unwrap_or_default());
+                    }
+                    sources.extend(all_sources.clone().unwrap_or_default());
+                }
+            }
+        }
+        sources
+    }
+
+    /// Register the durable consumer of every active automation that has none yet, at the
+    /// current Generation's activation point. Called when a Generation becomes active (startup
+    /// and activation), *before* Events can be emitted under it: a consumer first registered by
+    /// a later drain would start after that later Generation's activation and silently skip
+    /// Events emitted (but not yet delivered) before a restart (§7.2 at-least-once). Returns the
+    /// number of consumers registered.
+    pub fn register_consumers(&self) -> usize {
+        let g = self.graph.load_full();
+        let mut all_sources: Option<Vec<String>> = None;
+        let mut registered = 0;
+        for (auto_id, inst, def) in Self::automations(&g) {
+            for src in self.event_sources(inst, def, &mut all_sources) {
+                if let Ok(None) = self.events.find_checkpoint(auto_id, &src) {
+                    let start = self.consumer_start_sequence(&g, &src);
+                    match self.events.ack_checkpoint(auto_id, &src, start) {
+                        Ok(()) => registered += 1,
+                        Err(e) => self.log_error(
+                            auto_id,
+                            &format!("cannot register consumer for '{src}': {e}"),
+                        ),
+                    }
+                }
+            }
+        }
+        registered
+    }
+
     pub async fn drain_durable_events(&self) -> DrainReport {
         let g = self.graph.load_full();
         let mut report = DrainReport::default();
         let mut all_sources: Option<Vec<String>> = None;
         for (auto_id, inst, def) in Self::automations(&g) {
-            let event_triggers: Vec<&TriggerDeclSpec> = def
-                .manifest
-                .triggers
-                .iter()
-                .filter(|t| t.kind == "event")
-                .collect();
-            if event_triggers.is_empty() {
+            if !def.manifest.triggers.iter().any(|t| t.kind == "event") {
                 continue;
             }
-            let mut sources = BTreeSet::new();
-            for t in &event_triggers {
-                match t.source_input.as_deref() {
-                    Some(slot) => {
-                        if let Some(src) = inst.inputs.get(slot) {
-                            sources.insert(src.clone());
-                        }
-                    }
-                    None => {
-                        if all_sources.is_none() {
-                            all_sources = Some(self.events.log().sources().unwrap_or_default());
-                        }
-                        sources.extend(all_sources.clone().unwrap_or_default());
-                    }
-                }
-            }
+            let sources = self.event_sources(inst, def, &mut all_sources);
             for src in sources {
                 let mut ckpt = match self.events.find_checkpoint(auto_id, &src) {
                     Ok(Some(c)) => c,

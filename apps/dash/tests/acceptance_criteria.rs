@@ -354,6 +354,7 @@ async fn ac05_secrets_zero_leakage_and_host_mediated_http() {
 
 #[tokio::test]
 async fn ac06_reactive_graph_dedup_params_isolation_and_dynamic_cleanup() {
+    // Smoke check only; the criterion is covered end to end in tests/ac_06_10.rs.
     let tmp = TempDir::new().unwrap();
     let (services, _addr, h) = boot_http_app(&tmp, vec![]).await;
     let admin = Principal::administrator();
@@ -401,6 +402,7 @@ async fn ac06_reactive_graph_dedup_params_isolation_and_dynamic_cleanup() {
 
 #[tokio::test]
 async fn ac07_updates_polling_push_deltas_gap_resync_and_stale_retention() {
+    // Smoke check only; the criterion is covered end to end in tests/ac_06_10.rs.
     let tmp = TempDir::new().unwrap();
     let (services, _addr, h) = boot_http_app(&tmp, vec![]).await;
     let admin = Principal::administrator();
@@ -465,6 +467,7 @@ async fn ac07_updates_polling_push_deltas_gap_resync_and_stale_retention() {
 
 #[tokio::test]
 async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() {
+    // Smoke check only; the criterion is covered end to end in tests/ac_06_10.rs.
     let tmp = TempDir::new().unwrap();
     let ws = tmp.path().join("ws");
     let data = tmp.path().join("data");
@@ -625,6 +628,7 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
 
 #[tokio::test]
 async fn ac09_state_scopes_stable_widget_ids_and_layout_overrides() {
+    // Smoke check only; the criterion is covered end to end in tests/ac_06_10.rs.
     let tmp = TempDir::new().unwrap();
     let (services, _addr, h) = boot_http_app(&tmp, vec![]).await;
     let admin = Principal::administrator();
@@ -661,6 +665,7 @@ async fn ac09_state_scopes_stable_widget_ids_and_layout_overrides() {
 
 #[tokio::test]
 async fn ac10_actions_dry_run_nested_permissions_invalidation_unknown_reconcile_and_resolve() {
+    // Smoke check only; the criterion is covered end to end in tests/ac_06_10.rs.
     // Run full Scenario suite + audited resolution verification
     let tmp = TempDir::new().unwrap();
     let ws = tmp.path().join("ws");
