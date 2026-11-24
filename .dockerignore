@@ -1,0 +1,12 @@
+# Keep host build outputs and platform-specific binaries (e.g. darwin esbuild/rollup in
+# web/node_modules) out of the Docker build context.
+target/
+**/target/
+**/node_modules/
+web/dist/
+**/.dash-data/
+.git/
+.claude/
+*.db
+*.db-wal
+*.db-shm

@@ -10,7 +10,7 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -27,10 +27,30 @@ pub enum VaultError {
     Io(#[from] std::io::Error),
 }
 
+/// Upper bound on Administrator-set secret plaintexts held by the redactor (§20: no unbounded caches).
+pub const MAX_REDACTED_SECRETS: usize = 4096;
+/// Upper bound on server-generated credential tokens (sessions, Agent tokens) held by the redactor.
+/// The oldest token is evicted first; tokens are high-entropy and never appear in content unless leaked.
+pub const MAX_REDACTED_TOKENS: usize = 2048;
+/// Minimum length of a server-generated token accepted by [`Redactor::register_token`].
+pub const MIN_REDACTED_TOKEN_LEN: usize = 16;
+
+#[derive(Default)]
+struct RedactorInner {
+    secrets: HashSet<String>,
+    tokens: HashSet<String>,
+    token_order: VecDeque<String>,
+}
+
 /// Thread-safe redactor storing known sensitive plaintext substrings to scrub from logs/traces/errors.
+///
+/// Only values the engine itself knows to be sensitive may be registered: decrypted vault secrets
+/// (`register_secret`) and server-generated credentials after creation or successful verification
+/// (`register_token`). Caller-supplied, unauthenticated input must never be registered, otherwise any
+/// client could poison redaction of ordinary words (§5.2, §14.3).
 #[derive(Clone, Default)]
 pub struct Redactor {
-    secrets: Arc<RwLock<HashSet<String>>>,
+    inner: Arc<RwLock<RedactorInner>>,
 }
 
 impl Redactor {
@@ -38,26 +58,75 @@ impl Redactor {
         Self::default()
     }
 
+    /// Register a central secret plaintext (vault-managed). Bounded by [`MAX_REDACTED_SECRETS`].
     pub fn register_secret(&self, secret: &str) {
         if secret.len() >= 4 {
-            if let Ok(mut guard) = self.secrets.write() {
-                guard.insert(secret.to_string());
+            if let Ok(mut guard) = self.inner.write() {
+                if guard.secrets.contains(secret) {
+                    return;
+                }
+                if guard.secrets.len() >= MAX_REDACTED_SECRETS {
+                    tracing::warn!(
+                        "redactor secret set is full ({MAX_REDACTED_SECRETS}); new secret not registered"
+                    );
+                    return;
+                }
+                guard.secrets.insert(secret.to_string());
             }
         }
     }
 
-    pub fn unregister_secret(&self, secret: &str) {
-        if let Ok(mut guard) = self.secrets.write() {
-            guard.remove(secret);
+    /// Register a server-generated credential token (session or Agent token). Bounded with
+    /// oldest-first eviction by [`MAX_REDACTED_TOKENS`]; short values are ignored.
+    pub fn register_token(&self, token: &str) {
+        if token.len() < MIN_REDACTED_TOKEN_LEN {
+            return;
+        }
+        if let Ok(mut guard) = self.inner.write() {
+            if guard.tokens.contains(token) {
+                return;
+            }
+            while guard.tokens.len() >= MAX_REDACTED_TOKENS {
+                let Some(old) = guard.token_order.pop_front() else {
+                    break;
+                };
+                guard.tokens.remove(&old);
+            }
+            guard.tokens.insert(token.to_string());
+            guard.token_order.push_back(token.to_string());
         }
     }
 
+    pub fn unregister_secret(&self, secret: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.secrets.remove(secret);
+            if guard.tokens.remove(secret) {
+                guard.token_order.retain(|t| t != secret);
+            }
+        }
+    }
+
+    /// Number of registered sensitive values (secrets + tokens).
+    pub fn registered_len(&self) -> usize {
+        self.inner
+            .read()
+            .map(|g| g.secrets.len() + g.tokens.len())
+            .unwrap_or(0)
+    }
+
+    pub fn is_registered(&self, value: &str) -> bool {
+        self.inner
+            .read()
+            .map(|g| g.secrets.contains(value) || g.tokens.contains(value))
+            .unwrap_or(false)
+    }
+
     pub fn redact_str(&self, input: &str) -> String {
-        let Ok(guard) = self.secrets.read() else {
+        let Ok(guard) = self.inner.read() else {
             return "[REDACTED_ERROR]".to_string();
         };
         let mut out = input.to_string();
-        for s in guard.iter() {
+        for s in guard.secrets.iter().chain(guard.tokens.iter()) {
             if out.contains(s.as_str()) {
                 out = out.replace(s.as_str(), "[REDACTED]");
             }

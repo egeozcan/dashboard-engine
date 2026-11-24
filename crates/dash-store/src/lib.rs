@@ -1,6 +1,7 @@
 //! SQLite storage engine, transactional migrations, secret vault, and redaction.
 
 pub mod migrations;
+pub mod retention;
 pub mod vault;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use retention::{RetentionPolicy, RetentionReport, StoreCheck};
 pub use vault::{Redactor, SecretVault, VaultError};
 
 #[derive(Debug, Error)]
@@ -227,10 +229,28 @@ impl SqliteStore {
         self.db_path.as_deref()
     }
 
+    /// Total on-disk SQLite footprint: main database plus `-wal` and `-shm` side files (§15.1 "SQLite space").
     pub fn db_size_bytes(&self) -> u64 {
+        let Some(p) = self.db_path.as_ref() else {
+            return 0;
+        };
+        let main = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        main + self.wal_size_bytes() + Self::side_file_len(p, "-shm")
+    }
+
+    /// Size of the write-ahead log file alone.
+    pub fn wal_size_bytes(&self) -> u64 {
         self.db_path
             .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .map(|p| Self::side_file_len(p, "-wal"))
+            .unwrap_or(0)
+    }
+
+    fn side_file_len(db: &Path, suffix: &str) -> u64 {
+        let mut os = db.as_os_str().to_os_string();
+        os.push(suffix);
+        std::fs::metadata(PathBuf::from(os))
+            .map(|m| m.len())
             .unwrap_or(0)
     }
 
@@ -1066,7 +1086,8 @@ impl SqliteStore {
         ceiling: serde_json::Value,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<AgentPrincipalRecord, StoreError> {
-        self.redactor().register_secret(token_plaintext);
+        // Server-generated plaintext: safe to register for redaction (bounded token tier).
+        self.redactor().register_token(token_plaintext);
         let agent_id = format!("agt_{}", Uuid::now_v7().simple());
         let token_hash = hash_token(token_plaintext);
         let ceiling_json = serde_json::to_string(&ceiling)?;
@@ -1093,9 +1114,9 @@ impl SqliteStore {
         &self,
         token_plaintext: &str,
     ) -> Result<Option<AgentPrincipalRecord>, StoreError> {
-        self.redactor().register_secret(token_plaintext);
+        // NEVER register caller-supplied input before verification (redaction poisoning, §14.3).
         let token_hash = hash_token(token_plaintext);
-        self.with_conn_sync(|conn| {
+        let verified = self.with_conn_sync(|conn| {
             let rec = conn
                 .query_row(
                     "SELECT agent_id, name, ceiling_json, expires_at, revoked_at, created_at
@@ -1119,15 +1140,20 @@ impl SqliteStore {
                     return Ok(None);
                 }
                 if let Some(ref exp) = a.expires_at {
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(exp) {
-                        if dt.with_timezone(&Utc) <= Utc::now() {
-                            return Ok(None);
-                        }
+                    match DateTime::parse_from_rfc3339(exp) {
+                        Ok(dt) if dt.with_timezone(&Utc) > Utc::now() => {}
+                        // Expired or unparseable expiry: fail closed.
+                        _ => return Ok(None),
                     }
                 }
             }
             Ok(rec)
-        })
+        })?;
+        if verified.is_some() {
+            // Verified, server-issued token (e.g. after a restart): register for redaction.
+            self.redactor().register_token(token_plaintext);
+        }
+        Ok(verified)
     }
 
     pub fn revoke_agent_principal(&self, agent_id: &str) -> Result<bool, StoreError> {
@@ -1203,7 +1229,8 @@ impl SqliteStore {
         principal_id: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<String, StoreError> {
-        self.redactor().register_secret(token_plaintext);
+        // Server-generated session token: safe to register (bounded token tier).
+        self.redactor().register_token(token_plaintext);
         let session_id = format!("ses_{}", Uuid::now_v7().simple());
         let token_hash = hash_token(token_plaintext);
         let created_at = Utc::now().to_rfc3339();
@@ -1222,9 +1249,9 @@ impl SqliteStore {
         &self,
         token_plaintext: &str,
     ) -> Result<Option<(String, String, String)>, StoreError> {
-        self.redactor().register_secret(token_plaintext);
+        // NEVER register the caller-supplied cookie before verification (redaction poisoning, §14.3).
         let token_hash = hash_token(token_plaintext);
-        self.with_conn_sync(|conn| {
+        let verified = self.with_conn_sync(|conn| {
             let row: Option<(String, String, String, String)> = conn
                 .query_row(
                     "SELECT session_id, csrf_token, principal_id, expires_at
@@ -1241,7 +1268,11 @@ impl SqliteStore {
                 }
             }
             Ok(None)
-        })
+        })?;
+        if verified.is_some() {
+            self.redactor().register_token(token_plaintext);
+        }
+        Ok(verified)
     }
 
     pub fn delete_session(&self, token_plaintext: &str) -> Result<(), StoreError> {
@@ -1691,6 +1722,66 @@ mod tests {
         let backup_path = dir.path().join("backup.db");
         store.backup_to(&backup_path).unwrap();
         assert!(backup_path.exists());
+    }
+
+    #[test]
+    fn unverified_tokens_never_poison_redaction() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // Unauthenticated callers present arbitrary words as Bearer tokens / session cookies.
+        assert!(store.authenticate_agent_token("merge_pr").unwrap().is_none());
+        assert!(store.validate_session("open").unwrap().is_none());
+        assert!(store.authenticate_agent_token("acme/platform").unwrap().is_none());
+        assert_eq!(store.redactor().registered_len(), 0);
+        store
+            .append_audit("admin", "administrator", "action.invoke", "merge_pr", "ok", json!({"repo": "acme/platform", "state": "open"}))
+            .unwrap();
+        let audits = store.list_audits(1).unwrap();
+        assert_eq!(audits[0].detail["repo"], "acme/platform");
+        assert_eq!(audits[0].detail["state"], "open");
+
+        // A real, server-issued token is registered once verified (e.g. after restart).
+        let tok = "dsh_agt_0123456789abcdef0123456789abcdef";
+        store.create_agent_principal("bot", tok, json!({}), None).unwrap();
+        let fresh = store.redactor().clone();
+        fresh.unregister_secret(tok);
+        assert!(!fresh.is_registered(tok));
+        assert!(store.authenticate_agent_token(tok).unwrap().is_some());
+        assert!(store.redactor().is_registered(tok));
+    }
+
+    #[test]
+    fn redactor_token_tier_is_bounded() {
+        let r = Redactor::new();
+        for i in 0..(vault::MAX_REDACTED_TOKENS + 10) {
+            r.register_token(&format!("ses_{i:032}"));
+        }
+        assert_eq!(r.registered_len(), vault::MAX_REDACTED_TOKENS);
+        // Oldest evicted first.
+        assert!(!r.is_registered(&format!("ses_{:032}", 0)));
+        assert!(r.is_registered(&format!("ses_{:032}", vault::MAX_REDACTED_TOKENS + 9)));
+        // Short values are ignored entirely.
+        r.register_token("open");
+        assert!(!r.is_registered("open"));
+    }
+
+    #[test]
+    fn expired_agent_token_rejected() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let tok = "dsh_agt_expired_0123456789abcdef0123456789";
+        store
+            .create_agent_principal("old", tok, json!({}), Some(Utc::now() - chrono::Duration::seconds(5)))
+            .unwrap();
+        assert!(store.authenticate_agent_token(tok).unwrap().is_none());
+    }
+
+    #[test]
+    fn db_size_includes_wal() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(dir.path()).unwrap();
+        store.append_audit("a", "administrator", "op", "t", "ok", json!({})).unwrap();
+        let main = std::fs::metadata(dir.path().join("dash.db")).unwrap().len();
+        assert!(store.wal_size_bytes() > 0);
+        assert!(store.db_size_bytes() > main);
     }
 
     #[test]
