@@ -4633,11 +4633,32 @@ return R
             .await
             .unwrap_err();
         assert!(err.contains("does not declare"), "{err}");
+        // An unknown widget type never reaches the browser as such: the render replaces the node
+        // by a `dash.text` error node (F1b, §4.2), which, being a silent built-in, sends nothing.
+        let rendered = e.queries.render_dashboard("main", &admin).await.unwrap();
+        fn find<'a>(n: &'a serde_json::Value, id: &str) -> Option<&'a serde_json::Value> {
+            if n.get("widget_id").and_then(|v| v.as_str()) == Some(id) {
+                return Some(n);
+            }
+            match n {
+                serde_json::Value::Array(a) => a.iter().find_map(|c| find(c, id)),
+                serde_json::Value::Object(o) => o.values().find_map(|c| find(c, id)),
+                _ => None,
+            }
+        }
+        let stray = find(&rendered, "adapter_stray").expect("stray node rendered");
+        assert_eq!(stray["widget_type"], "dash.text", "{stray}");
+        assert!(
+            stray["render_error"]
+                .as_str()
+                .is_some_and(|m| m.contains("WIDGET_CONTRACT_VIOLATION") && m.contains("t.not_a_widget")),
+            "{stray}"
+        );
         // Built-in widgets that only render, and unknown widget types, send no Requests.
         for (wid, needle) in [
             ("adapter_label", "does not send Requests"),
             ("adapter_root", "does not send Requests"),
-            ("adapter_stray", "unknown widget type"),
+            ("adapter_stray", "does not send Requests"),
         ] {
             let err = a
                 .dispatch_widget_request_outcome(req("refresh", wid, 1, json!({})), &admin)
