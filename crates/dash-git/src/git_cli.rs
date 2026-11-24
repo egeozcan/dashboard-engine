@@ -253,9 +253,15 @@ pub async fn clone_at_ref(
     if let Some(parent) = dest_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    if source_url.starts_with('-') || git_ref.starts_with('-') {
+        return Err(GitError::Package(format!(
+            "refusing option-like git URL or ref: '{source_url}' '{git_ref}'"
+        )));
+    }
     let output = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["clone", source_url, &dest_dir.to_string_lossy()])
+        .env("GIT_ALLOW_PROTOCOL", "https:ssh:file")
+        .args(["clone", "--", source_url, &dest_dir.to_string_lossy()])
         .output()
         .await?;
     if !output.status.success() {
@@ -264,6 +270,6 @@ pub async fn clone_at_ref(
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    run_git(dest_dir, &["checkout", git_ref]).await?;
+    run_git(dest_dir, &["checkout", git_ref, "--"]).await?;
     git_head(dest_dir).await
 }

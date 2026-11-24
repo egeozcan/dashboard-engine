@@ -1,7 +1,7 @@
 //! Isolated Preview runtime, Definition test execution, and declarative YAML Scenario test runner (§4.5, §10.3).
 
 use crate::git_cli::GitError;
-use crate::workspace::load_workspace_graph;
+use crate::workspace::load_workspace_graph_async as load_workspace_graph;
 use dash_core::{
     validate_configured_graph, FailureInjectionRule, Principal, RuntimeEngine, ValidationReport,
     WidgetRequestEnvelope,
@@ -176,7 +176,7 @@ pub async fn run_workspace_definition_tests(
     data_dir: &Path,
     target_definitions: Option<&[String]>,
 ) -> Result<Vec<DefinitionTestReport>, GitError> {
-    let graph = load_workspace_graph(workspace_dir, data_dir, "preview", 1, true)?;
+    let graph = load_workspace_graph(workspace_dir, data_dir, "preview", 1, true).await?;
     let libs = graph.resolved_libraries();
     let bridge = Arc::new(NullHostBridge);
     let mut reports = Vec::new();
@@ -212,7 +212,7 @@ pub async fn run_preview_and_scenarios(
     data_dir: &Path,
     changed_definitions: Option<&[String]>,
 ) -> Result<PreviewTestReport, GitError> {
-    let graph = load_workspace_graph(workspace_dir, data_dir, "preview", 1, true)?;
+    let graph = load_workspace_graph(workspace_dir, data_dir, "preview", 1, true).await?;
     let preview_store = SqliteStore::open_in_memory()
         .map_err(|e| GitError::Workspace(e.to_string()))?;
 

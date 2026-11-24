@@ -7,13 +7,14 @@ use crate::git_cli::{
     GitError, GitStatusReport,
 };
 use crate::packages::{
-    copy_tree_excluding_git, read_packages_toml, resolve_and_lock_packages, write_packages_toml,
+    copy_tree_excluding_git, fetch_locked_packages, missing_locked_packages, read_packages_lock,
+    read_packages_toml, resolve_and_lock_packages, update_package_lock, write_packages_toml,
     PackageDependencySpec, PackagesLock,
 };
 use crate::preview::{run_preview_and_scenarios, PreviewTestReport};
 use crate::workspace::{
-    delete_instance_in_workspace, load_workspace_graph, upsert_instance_in_workspace,
-    write_dashboard_in_workspace, write_definition_in_workspace,
+    delete_instance_in_workspace, load_workspace_graph_async as load_workspace_graph,
+    upsert_instance_in_workspace, write_dashboard_in_workspace, write_definition_in_workspace,
 };
 use chrono::Utc;
 use dash_core::{
@@ -77,6 +78,11 @@ impl DraftManager {
         if !pkg_toml.dependencies.is_empty() && !lock_path.exists() {
             resolve_and_lock_packages(&workspace_dir, &data_dir).await?;
         }
+        // A committed packages.lock on a fresh Installation: materialize the pinned commits.
+        let lock = read_packages_lock(&workspace_dir)?;
+        if !missing_locked_packages(&data_dir, &lock).is_empty() {
+            fetch_locked_packages(&data_dir, &lock).await?;
+        }
 
         // Crash recovery on startup from activation_journal (§12.2, §15.2)
         let incomplete = store
@@ -94,7 +100,7 @@ impl DraftManager {
             let _ = store.upsert_activation_journal(&repaired);
         }
 
-        let mut graph = load_workspace_graph(&workspace_dir, &data_dir, &head, 1, use_mocks)?;
+        let mut graph = load_workspace_graph(&workspace_dir, &data_dir, &head, 1, use_mocks).await?;
         let gen_id = store
             .record_generation(&head, &graph.graph_digest())
             .map_err(|e| GitError::Workspace(e.to_string()))?;
@@ -284,7 +290,7 @@ impl DraftManager {
         let mut cfg = read_packages_toml(wt)?;
         cfg.dependencies.insert(pkg_name.to_string(), spec);
         write_packages_toml(wt, &cfg)?;
-        let lock = resolve_and_lock_packages(wt, &self.data_dir).await?;
+        let lock = update_package_lock(wt, &self.data_dir, pkg_name).await?;
         self.record_draft_mutation(&mut draft, format!("dependency:{pkg_name}"))?;
         Ok((draft, lock))
     }
@@ -293,7 +299,7 @@ impl DraftManager {
     pub async fn draft_validate(&self, draft_id: &str) -> Result<ValidationReport, GitError> {
         let mut draft = self.draft_status(draft_id)?;
         let wt = Path::new(&draft.worktree_path);
-        let graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, false)?;
+        let graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, false).await?;
         let report = validate_configured_graph(&graph, &self.store, false);
 
         draft.validation_report = Some(serde_json::to_value(&report).unwrap());
@@ -317,8 +323,8 @@ impl DraftManager {
 
         // Identify changed definitions vs base
         let base_graph =
-            load_workspace_graph(&self.workspace_dir, &self.data_dir, &draft.base_revision, 0, true)?;
-        let draft_graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, true)?;
+            load_workspace_graph(&self.workspace_dir, &self.data_dir, &draft.base_revision, 0, true).await?;
+        let draft_graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, true).await?;
         let mut changed_defs = Vec::new();
         for (id, def) in &draft_graph.definitions {
             let unchanged = base_graph
@@ -486,7 +492,7 @@ impl DraftManager {
 
         let wt = Path::new(&draft.worktree_path);
         // Also ensure live validation (checking Service principal grants etc. against real store)
-        let candidate_graph = load_workspace_graph(wt, &self.data_dir, &active_rev, 0, false)?;
+        let candidate_graph = load_workspace_graph(wt, &self.data_dir, &active_rev, 0, false).await?;
         let live_val = validate_configured_graph(&candidate_graph, &self.store, false);
         if !live_val.valid {
             return Err(GitError::Workspace(format!(
@@ -553,7 +559,8 @@ impl DraftManager {
             &new_commit,
             old_graph.generation_id + 1,
             self.use_mocks,
-        )?;
+        )
+        .await?;
         let new_gen_id = self
             .store
             .record_generation(&new_commit, &live_graph.graph_digest())

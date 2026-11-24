@@ -25,10 +25,58 @@ pub enum DeclarationError {
 }
 
 /// Evaluates `definition.luau` source and resolved accompanying files into a deterministic manifest.
+///
+/// Determinism (§4.3) is enforced twice: APIs that expose heap addresses, GC state or randomness
+/// raise `NON_DETERMINISTIC`, and as a backstop the declaration is evaluated in two fresh VMs whose
+/// canonical manifests must be byte-identical.
 pub fn evaluate_declaration(
     definition_source: &str,
     resolved_sources: &BTreeMap<String, Vec<u8>>,
 ) -> Result<DefinitionManifest, DeclarationError> {
+    let first = evaluate_declaration_once(definition_source)?;
+    let second = evaluate_declaration_once(definition_source)?;
+    let a = first
+        .canonical_json()
+        .map_err(|e| DeclarationError::InvalidContract(format!("manifest serialization: {e}")))?;
+    let b = second
+        .canonical_json()
+        .map_err(|e| DeclarationError::InvalidContract(format!("manifest serialization: {e}")))?;
+    if a != b {
+        return Err(DeclarationError::NonDeterministic(format!(
+            "declaration of '{}' produced different manifests on repeated evaluation",
+            first.id
+        )));
+    }
+    let mut manifest = first;
+    manifest.identity_version = compute_sources_digest(resolved_sources);
+    manifest.generate_luau_types();
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn forbid_fn(lua: &Lua, what: &'static str) -> mlua::Result<Function> {
+    lua.create_function(move |_, _: mlua::MultiValue| -> mlua::Result<()> {
+        Err(mlua::Error::runtime(format!(
+            "NON_DETERMINISTIC: {what} is forbidden during declaration phase"
+        )))
+    })
+}
+
+/// True when converting `v` to a string would expose a heap address (non-deterministic).
+fn is_address_valued(v: &Value) -> bool {
+    match v {
+        Value::Table(t) => match t.metatable() {
+            Some(mt) => !matches!(mt.raw_get::<Value>("__tostring"), Ok(Value::Function(_))),
+            None => true,
+        },
+        Value::Function(_) | Value::Thread(_) | Value::UserData(_) | Value::LightUserData(_) => {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn evaluate_declaration_once(definition_source: &str) -> Result<DefinitionManifest, DeclarationError> {
     let libs = StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::BIT | StdLib::MATH;
     let lua = Lua::new_with(libs, LuaOptions::default())?;
     lua.set_memory_limit(8 * 1024 * 1024)?; // 8 MiB max for declaration phase
@@ -54,6 +102,40 @@ pub fn evaluate_declaration(
         })?;
         math_tbl.set("random", forbid_rand.clone())?;
         math_tbl.set("randomseed", forbid_rand)?;
+
+        // GC introspection exposes allocator state.
+        let globals = lua.globals();
+        globals.set("collectgarbage", forbid_fn(&lua, "collectgarbage")?)?;
+        globals.set("gcinfo", forbid_fn(&lua, "gcinfo")?)?;
+
+        // tostring()/string.format("%s") of tables, functions, threads and userdata expose heap
+        // addresses; reject them instead of letting an address leak into the manifest.
+        let orig_tostring: Function = globals.get("tostring")?;
+        globals.set(
+            "tostring",
+            lua.create_function(move |_, v: Value| -> mlua::Result<Value> {
+                if is_address_valued(&v) {
+                    return Err(mlua::Error::runtime(format!(
+                        "NON_DETERMINISTIC: tostring() of a {} exposes a heap address",
+                        v.type_name()
+                    )));
+                }
+                orig_tostring.call::<Value>(v)
+            })?,
+        )?;
+        let string_tbl: Table = globals.get("string")?;
+        let orig_format: Function = string_tbl.get("format")?;
+        string_tbl.set(
+            "format",
+            lua.create_function(move |_, args: mlua::MultiValue| -> mlua::Result<Value> {
+                if args.iter().skip(1).any(is_address_valued) {
+                    return Err(mlua::Error::runtime(
+                        "NON_DETERMINISTIC: string.format of a table/function/thread/userdata exposes a heap address",
+                    ));
+                }
+                orig_format.call::<Value>(args)
+            })?,
+        )?;
     }
 
     let dash_mod = build_dash_declaration_sdk(&lua)?;
@@ -91,11 +173,7 @@ pub fn evaluate_declaration(
         }
     };
 
-    let mut manifest = parse_declaration_table(&tbl)?;
-    manifest.identity_version = compute_sources_digest(resolved_sources);
-    manifest.generate_luau_types();
-    validate_manifest(&manifest)?;
-    Ok(manifest)
+    parse_declaration_table(&tbl)
 }
 
 fn build_dash_declaration_sdk(lua: &Lua) -> mlua::Result<Table> {
@@ -300,13 +378,14 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
         }
     };
 
-    let id: String = tbl
-        .get("id")
-        .map_err(|_| DeclarationError::InvalidContract("missing required field 'id'".into()))?;
+    check_known_keys(tbl, allowed_declaration_keys(category), "declaration")?;
 
-    let description: String = tbl.get("description").unwrap_or_default();
-    let runtime: String = tbl.get("runtime").unwrap_or_else(|_| "runtime.luau".into());
-    let handler: String = tbl.get("handler").unwrap_or_else(|_| match category {
+    let id: String = get_opt_string(tbl, "id")?
+        .ok_or_else(|| DeclarationError::InvalidContract("missing required field 'id'".into()))?;
+
+    let description: String = get_opt_string(tbl, "description")?.unwrap_or_default();
+    let runtime: String = get_opt_string(tbl, "runtime")?.unwrap_or_else(|| "runtime.luau".into());
+    let handler: String = get_opt_string(tbl, "handler")?.unwrap_or_else(|| match category {
         DefinitionCategory::DataProvider => "query".into(),
         DefinitionCategory::ActionProvider => "execute".into(),
         DefinitionCategory::Adapter => "render".into(),
@@ -314,10 +393,10 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
         DefinitionCategory::Automation => "run".into(),
         DefinitionCategory::Library | DefinitionCategory::WidgetProvider => String::new(),
     });
-    let dry_run_handler: Option<String> = tbl.get("dry_run").ok();
-    let reconcile_handler: Option<String> = tbl.get("reconcile").ok();
-    let request_handler: Option<String> = tbl.get("on_request").ok();
-    let target_connector: Option<String> = tbl.get("for").ok();
+    let dry_run_handler: Option<String> = get_opt_string(tbl, "dry_run")?;
+    let reconcile_handler: Option<String> = get_opt_string(tbl, "reconcile")?;
+    let request_handler: Option<String> = get_opt_string(tbl, "on_request")?;
+    let target_connector: Option<String> = get_opt_string(tbl, "for")?;
 
     let fixtures = parse_string_map(tbl, "fixtures")?;
     let capabilities = parse_string_vec(tbl, "capabilities")?;
@@ -328,7 +407,7 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
     let dashboard_state_reads = parse_string_vec(tbl, "dashboard_state_reads")?;
     let accepts_requests = parse_string_vec(tbl, "accepts_requests")?;
     let libraries = parse_string_vec(tbl, "libraries")?;
-    let widget_asset: Option<String> = tbl.get("asset").ok();
+    let widget_asset: Option<String> = get_opt_string(tbl, "asset")?;
 
     let operations = parse_operations(tbl)?;
     let inputs = parse_inputs(tbl)?;
@@ -378,19 +457,141 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
     })
 }
 
+/// `^[a-z][a-z0-9_]{0,63}$` — the shape of a Package name or a Definition name.
+pub fn is_valid_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    s.len() <= 64 && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A Definition ID is exactly `package.definition`, both parts valid identifiers (§4.1).
+pub fn is_valid_definition_id(s: &str) -> bool {
+    match s.split_once('.') {
+        Some((pkg, def)) => is_valid_identifier(pkg) && is_valid_identifier(def),
+        None => false,
+    }
+}
+
+/// A semantic type name is a dotted lowercase name with a version suffix, e.g. `dev.pull_request@1`.
+pub fn is_valid_semantic_type_name(s: &str) -> bool {
+    let Some((name, ver)) = s.rsplit_once('@') else {
+        return false;
+    };
+    if ver.is_empty() || !ver.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    name.split('.').all(|seg| {
+        let mut cs = seg.chars();
+        matches!(cs.next(), Some(c) if c.is_ascii_lowercase())
+            && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    })
+}
+
+/// A path declared inside a Definition (runtime, fixture, asset) must be a plain relative path
+/// that stays inside the Definition directory: no absolute paths, no `..`, no backslashes.
+pub fn is_safe_relative_path(p: &str) -> bool {
+    if p.is_empty() || p.len() > 512 || p.starts_with('/') || p.contains('\\') || p.contains('\0') {
+        return false;
+    }
+    // Reject Windows drive prefixes like `C:`.
+    if p.len() >= 2 && p.as_bytes()[1] == b':' {
+        return false;
+    }
+    p.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
-    if !m.id.contains('.') || m.id.trim().is_empty() {
+    if !is_valid_definition_id(&m.id) {
         return Err(DeclarationError::InvalidContract(format!(
-            "definition id '{}' must have format 'package.definition'",
+            "definition id '{}' must have format 'package.definition' (each part matching [a-z][a-z0-9_]*)",
             m.id
         )));
     }
+    if !m.runtime.is_empty() && !is_safe_relative_path(&m.runtime) {
+        return Err(DeclarationError::InvalidContract(format!(
+            "definition '{}': runtime path '{}' must be relative and stay inside the Definition directory",
+            m.id, m.runtime
+        )));
+    }
+    for (name, path) in &m.fixtures {
+        if !is_safe_relative_path(path) {
+            return Err(DeclarationError::InvalidContract(format!(
+                "definition '{}': fixture '{name}' path '{path}' must be relative and stay inside the Definition directory",
+                m.id
+            )));
+        }
+    }
+    if let Some(asset) = &m.widget_asset {
+        if !asset.is_empty() && !is_safe_relative_path(asset) {
+            return Err(DeclarationError::InvalidContract(format!(
+                "definition '{}': asset path '{asset}' must be relative and stay inside the Definition directory",
+                m.id
+            )));
+        }
+    }
+    for lib in &m.libraries {
+        if !is_valid_definition_id(lib) {
+            return Err(DeclarationError::InvalidContract(format!(
+                "definition '{}': library '{lib}' is not a valid Definition ID",
+                m.id
+            )));
+        }
+    }
+    for (input_name, spec) in &m.inputs {
+        let def = match spec {
+            InputRefSpec::Connector { definition, .. }
+            | InputRefSpec::Data { definition, .. }
+            | InputRefSpec::Action { definition } => definition,
+        };
+        if let Some(d) = def {
+            if !is_valid_definition_id(d) {
+                return Err(DeclarationError::InvalidContract(format!(
+                    "definition '{}': input '{input_name}' references invalid Definition ID '{d}'",
+                    m.id
+                )));
+            }
+        }
+    }
+    for t in &m.triggers {
+        if !matches!(t.kind.as_str(), "cron" | "event" | "signal") {
+            return Err(DeclarationError::InvalidContract(format!(
+                "definition '{}': unknown trigger kind '{}' (expected cron | event | signal)",
+                m.id, t.kind
+            )));
+        }
+    }
+    // Every operation's required capabilities must come from the declared capability vocabulary.
+    for (op_name, op) in &m.operations {
+        for cap in &op.required_capabilities {
+            if !m.capabilities.iter().any(|c| c == cap) {
+                return Err(DeclarationError::InvalidContract(format!(
+                    "definition '{}': operation '{op_name}' requires capability '{cap}' that is not in the declared capabilities",
+                    m.id
+                )));
+            }
+        }
+    }
     match m.category {
         DefinitionCategory::Mock => {
-            if m.target_connector.as_deref().unwrap_or("").is_empty() {
-                return Err(DeclarationError::InvalidContract(
-                    "mock definition requires 'for = \"<connector_id>\"'".into(),
-                ));
+            match m.target_connector.as_deref() {
+                Some(t) if is_valid_definition_id(t) => {}
+                Some(t) if !t.is_empty() => {
+                    return Err(DeclarationError::InvalidContract(format!(
+                        "mock '{}': target '{t}' is not a valid connector Definition ID",
+                        m.id
+                    )))
+                }
+                _ => {
+                    return Err(DeclarationError::InvalidContract(
+                        "mock definition requires 'for = \"<connector_id>\"'".into(),
+                    ))
+                }
             }
         }
         DefinitionCategory::DataProvider => {
@@ -426,37 +627,142 @@ fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
     Ok(())
 }
 
-fn parse_string_vec(tbl: &Table, key: &str) -> Result<Vec<String>, DeclarationError> {
-    match tbl.get::<Value>(key)? {
-        Value::Nil => Ok(Vec::new()),
-        Value::Table(t) => {
-            let mut out = Vec::new();
-            for pair in t.pairs::<Value, String>() {
-                let (_, v) = pair?;
-                out.push(v);
+/// Top-level declaration keys accepted per category. Unknown keys (typically typos such as
+/// `ouput`) are rejected rather than silently dropping part of the contract (§4.3, §17 #2).
+fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static str] {
+    use DefinitionCategory as C;
+    match category {
+        C::Connector => &[
+            "id", "description", "runtime", "handler", "libraries", "config", "credentials",
+            "capabilities", "operations", "emits",
+        ],
+        C::Mock => &[
+            "id", "description", "runtime", "handler", "libraries", "config", "for", "fixtures",
+            "credentials", "capabilities", "operations", "emits",
+        ],
+        C::DataProvider => &[
+            "id", "description", "runtime", "handler", "libraries", "config", "inputs", "query",
+            "output", "updates", "emits", "required_capabilities", "optional_capabilities",
+        ],
+        C::ActionProvider => &[
+            "id", "description", "runtime", "handler", "libraries", "config", "inputs", "args",
+            "result", "dry_run", "reconcile", "emits", "invalidates", "required_capabilities",
+            "optional_capabilities",
+        ],
+        C::Adapter => &[
+            "id", "description", "runtime", "handler", "libraries", "config", "inputs", "output",
+            "dashboard_state_reads", "accepts_requests", "on_request",
+        ],
+        C::WidgetProvider => &["id", "description", "asset", "props", "accepts_requests"],
+        C::Library => &["id", "description", "runtime", "libraries"],
+        C::Automation => &[
+            "id", "description", "runtime", "handler", "libraries", "config", "inputs",
+            "triggers", "emits", "required_capabilities", "optional_capabilities",
+        ],
+    }
+}
+
+fn check_known_keys(tbl: &Table, allowed: &[&str], ctx: &str) -> Result<(), DeclarationError> {
+    for pair in tbl.pairs::<Value, Value>() {
+        let (k, _) = pair?;
+        let key = match &k {
+            Value::String(s) => s.to_str()?.to_string(),
+            other => {
+                return Err(DeclarationError::InvalidContract(format!(
+                    "{ctx}: keys must be strings, got {}",
+                    other.type_name()
+                )))
             }
-            Ok(out)
+        };
+        if key == "__dash_category" {
+            continue;
         }
-        _ => Err(DeclarationError::InvalidContract(format!(
-            "field '{key}' must be an array of strings"
+        if !allowed.contains(&key.as_str()) {
+            return Err(DeclarationError::InvalidContract(format!(
+                "{ctx}: unknown field '{key}' (allowed: {})",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Typed optional getter: absent -> None; present with the wrong type -> InvalidContract.
+fn get_opt_string(tbl: &Table, key: &str) -> Result<Option<String>, DeclarationError> {
+    match tbl.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        other => Err(DeclarationError::InvalidContract(format!(
+            "field '{key}' must be a string, got {}",
+            other.type_name()
         ))),
     }
 }
 
+fn get_opt_bool(tbl: &Table, key: &str) -> Result<Option<bool>, DeclarationError> {
+    match tbl.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Boolean(b) => Ok(Some(b)),
+        other => Err(DeclarationError::InvalidContract(format!(
+            "field '{key}' must be a boolean, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn get_opt_u64(tbl: &Table, key: &str) -> Result<Option<u64>, DeclarationError> {
+    match tbl.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Integer(i) if i >= 0 => Ok(Some(i as u64)),
+        Value::Number(n) if n >= 0.0 && n.fract() == 0.0 && n <= u64::MAX as f64 => {
+            Ok(Some(n as u64))
+        }
+        other => Err(DeclarationError::InvalidContract(format!(
+            "field '{key}' must be a non-negative integer, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn parse_string_vec(tbl: &Table, key: &str) -> Result<Vec<String>, DeclarationError> {
+    let bad = || DeclarationError::InvalidContract(format!("field '{key}' must be an array of strings"));
+    match tbl.get::<Value>(key)? {
+        Value::Nil => Ok(Vec::new()),
+        Value::Table(t) => {
+            let mut out = Vec::new();
+            for v in t.clone().sequence_values::<Value>() {
+                match v? {
+                    Value::String(s) => out.push(s.to_str()?.to_string()),
+                    _ => return Err(bad()),
+                }
+            }
+            // A map-shaped table (non-sequence keys) is not an array.
+            if t.pairs::<Value, Value>().count() != out.len() {
+                return Err(bad());
+            }
+            Ok(out)
+        }
+        _ => Err(bad()),
+    }
+}
+
 fn parse_string_map(tbl: &Table, key: &str) -> Result<BTreeMap<String, String>, DeclarationError> {
+    let bad = || DeclarationError::InvalidContract(format!("field '{key}' must be a map of strings"));
     match tbl.get::<Value>(key)? {
         Value::Nil => Ok(BTreeMap::new()),
         Value::Table(t) => {
             let mut out = BTreeMap::new();
-            for pair in t.pairs::<String, String>() {
-                let (k, v) = pair?;
-                out.insert(k, v);
+            for pair in t.pairs::<Value, Value>() {
+                match pair? {
+                    (Value::String(k), Value::String(v)) => {
+                        out.insert(k.to_str()?.to_string(), v.to_str()?.to_string());
+                    }
+                    _ => return Err(bad()),
+                }
             }
             Ok(out)
         }
-        _ => Err(DeclarationError::InvalidContract(format!(
-            "field '{key}' must be a map of strings"
-        ))),
+        _ => Err(bad()),
     }
 }
 
@@ -470,11 +776,11 @@ fn parse_opt_schema(tbl: &Table, key: &str) -> Result<Option<SchemaSpec>, Declar
 fn parse_schema_value(val: Value) -> Result<SchemaSpec, DeclarationError> {
     match val {
         Value::String(s) => Ok(SchemaSpec::Semantic {
-            semantic_type: s.to_str()?.to_string(),
+            semantic_type: checked_semantic_name(s.to_str()?.to_string())?,
             shape: None,
         }),
         Value::Table(t) => {
-            let kind: String = t.get("kind").unwrap_or_else(|_| "object".into());
+            let kind: String = get_opt_string(&t, "kind")?.unwrap_or_else(|| "object".into());
             match kind.as_str() {
                 "string" => Ok(SchemaSpec::String),
                 "number" => Ok(SchemaSpec::Number),
@@ -504,7 +810,13 @@ fn parse_schema_value(val: Value) -> Result<SchemaSpec, DeclarationError> {
                     })
                 }
                 "semantic" => {
-                    let semantic_type: String = t.get("semantic_type")?;
+                    let semantic_type = checked_semantic_name(
+                        get_opt_string(&t, "semantic_type")?.ok_or_else(|| {
+                            DeclarationError::InvalidContract(
+                                "semantic schema requires 'semantic_type'".into(),
+                            )
+                        })?,
+                    )?;
                     let shape = match t.get::<Value>("shape")? {
                         Value::Nil => None,
                         s => Some(Box::new(parse_schema_value(s)?)),
@@ -541,6 +853,16 @@ fn parse_schema_value(val: Value) -> Result<SchemaSpec, DeclarationError> {
     }
 }
 
+fn checked_semantic_name(name: String) -> Result<String, DeclarationError> {
+    if is_valid_semantic_type_name(&name) {
+        Ok(name)
+    } else {
+        Err(DeclarationError::InvalidContract(format!(
+            "semantic type '{name}' must be a versioned name like 'dev.pull_request@1'"
+        )))
+    }
+}
+
 fn parse_inputs(tbl: &Table) -> Result<BTreeMap<String, InputRefSpec>, DeclarationError> {
     let mut out = BTreeMap::new();
     let Value::Table(inputs) = tbl.get::<Value>("inputs")? else {
@@ -553,7 +875,7 @@ fn parse_inputs(tbl: &Table) -> Result<BTreeMap<String, InputRefSpec>, Declarati
                 "input '{name}' must use dash.connector_ref / dash.data_ref / dash.action_ref"
             ))
         })?;
-        let definition: Option<String> = spec_tbl.get("definition").ok();
+        let definition: Option<String> = get_opt_string(&spec_tbl, "definition")?;
         let spec = match ref_kind.as_str() {
             "connector" => InputRefSpec::Connector {
                 definition,
@@ -584,7 +906,12 @@ fn parse_operations(
     };
     for pair in ops.pairs::<String, Table>() {
         let (op_name, op_tbl) = pair?;
-        let description: String = op_tbl.get("description").unwrap_or_default();
+        check_known_keys(
+            &op_tbl,
+            &["description", "required_capabilities", "args", "result"],
+            &format!("operation '{op_name}'"),
+        )?;
+        let description: String = get_opt_string(&op_tbl, "description")?.unwrap_or_default();
         let required_capabilities = parse_string_vec(&op_tbl, "required_capabilities")?;
         let args = parse_opt_schema(&op_tbl, "args")?.unwrap_or(SchemaSpec::Any);
         let result = parse_opt_schema(&op_tbl, "result")?.unwrap_or(SchemaSpec::Any);
@@ -615,12 +942,24 @@ fn parse_emits(tbl: &Table) -> Result<Vec<EventDeclSpec>, DeclarationError> {
                 durable: true,
                 payload: None,
             }),
-            Value::Table(t) => out.push(EventDeclSpec {
-                semantic_type: t.get("semantic_type")?,
-                schema_version: t.get("schema_version").unwrap_or_else(|_| "1".into()),
-                durable: t.get("durable").unwrap_or(true),
-                payload: parse_opt_schema(&t, "payload")?,
-            }),
+            Value::Table(t) => {
+                check_known_keys(
+                    &t,
+                    &["semantic_type", "schema_version", "durable", "payload"],
+                    "emits entry",
+                )?;
+                out.push(EventDeclSpec {
+                    semantic_type: get_opt_string(&t, "semantic_type")?.ok_or_else(|| {
+                        DeclarationError::InvalidContract(
+                            "emits entry requires 'semantic_type'".into(),
+                        )
+                    })?,
+                    schema_version: get_opt_string(&t, "schema_version")?
+                        .unwrap_or_else(|| "1".into()),
+                    durable: get_opt_bool(&t, "durable")?.unwrap_or(true),
+                    payload: parse_opt_schema(&t, "payload")?,
+                })
+            }
             _ => {
                 return Err(DeclarationError::InvalidContract(
                     "emits entries must be event type string or table".into(),
@@ -635,11 +974,16 @@ fn parse_updates(tbl: &Table) -> Result<UpdateModes, DeclarationError> {
     let Value::Table(u) = tbl.get::<Value>("updates")? else {
         return Ok(UpdateModes::default());
     };
+    check_known_keys(
+        &u,
+        &["on_demand", "subscribe", "poll_interval_secs", "push"],
+        "updates",
+    )?;
     Ok(UpdateModes {
-        on_demand: u.get("on_demand").unwrap_or(true),
-        subscribe: u.get("subscribe").unwrap_or(false),
-        poll_interval_secs: u.get("poll_interval_secs").ok(),
-        push: u.get("push").unwrap_or(false),
+        on_demand: get_opt_bool(&u, "on_demand")?.unwrap_or(true),
+        subscribe: get_opt_bool(&u, "subscribe")?.unwrap_or(false),
+        poll_interval_secs: get_opt_u64(&u, "poll_interval_secs")?,
+        push: get_opt_bool(&u, "push")?.unwrap_or(false),
     })
 }
 
@@ -650,13 +994,237 @@ fn parse_triggers(tbl: &Table) -> Result<Vec<TriggerDeclSpec>, DeclarationError>
     };
     for pair in trigs.pairs::<Value, Table>() {
         let (_, t) = pair?;
+        check_known_keys(
+            &t,
+            &["kind", "schedule", "event_type", "source_input", "catch_up"],
+            "trigger",
+        )?;
         out.push(TriggerDeclSpec {
-            kind: t.get("kind")?,
-            schedule: t.get("schedule").ok(),
-            event_type: t.get("event_type").ok(),
-            source_input: t.get("source_input").ok(),
-            catch_up: t.get("catch_up").ok(),
+            kind: get_opt_string(&t, "kind")?.ok_or_else(|| {
+                DeclarationError::InvalidContract("trigger requires 'kind'".into())
+            })?,
+            schedule: get_opt_string(&t, "schedule")?,
+            event_type: get_opt_string(&t, "event_type")?,
+            source_input: get_opt_string(&t, "source_input")?,
+            catch_up: get_opt_string(&t, "catch_up")?,
         });
     }
     Ok(out)
+}
+
+/// Load-time check of a Definition's runtime module: the source must compile as Luau, and every
+/// handler the manifest declares (`handler`, `dry_run`, `reconcile`, `on_request`) must be named
+/// in it. The module is compiled but never executed here; operational code only ever runs in
+/// runtime VMs (§4.3).
+pub fn check_runtime_source(
+    manifest: &DefinitionManifest,
+    runtime_source: &str,
+) -> Result<(), DeclarationError> {
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())?;
+    lua.load(runtime_source)
+        .set_name(format!("{}/runtime.luau", manifest.id))
+        .into_function()
+        .map_err(|e| {
+            DeclarationError::InvalidContract(format!(
+                "runtime module of '{}' does not compile: {e}",
+                manifest.id
+            ))
+        })?;
+    let mut handlers: Vec<(&str, &str)> = Vec::new();
+    if !manifest.handler.is_empty() {
+        handlers.push(("handler", manifest.handler.as_str()));
+    }
+    for (field, h) in [
+        ("dry_run", &manifest.dry_run_handler),
+        ("reconcile", &manifest.reconcile_handler),
+        ("on_request", &manifest.request_handler),
+    ] {
+        if let Some(h) = h {
+            handlers.push((field, h.as_str()));
+        }
+    }
+    for (field, h) in handlers {
+        if !is_valid_lua_identifier(h) {
+            return Err(DeclarationError::InvalidContract(format!(
+                "definition '{}': {field} '{h}' is not a valid Luau function name",
+                manifest.id
+            )));
+        }
+        if !source_mentions_identifier(runtime_source, h) {
+            return Err(DeclarationError::InvalidContract(format!(
+                "definition '{}': declared {field} '{h}' is not defined in its runtime module",
+                manifest.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_lua_identifier(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `ident` occurs in `src` as a whole identifier token (outside `--` line comments).
+fn source_mentions_identifier(src: &str, ident: &str) -> bool {
+    src.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let bytes = code.as_bytes();
+        let mut start = 0;
+        while let Some(pos) = code[start..].find(ident) {
+            let i = start + pos;
+            let j = i + ident.len();
+            let before_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok = j >= bytes.len() || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_');
+            if before_ok && after_ok {
+                return true;
+            }
+            start = j;
+        }
+        false
+    })
+}
+
+/// Statically collect the module names a Luau source passes to `require("...")` / `require "..."`.
+pub fn scan_required_modules(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = src[start..].find("require") {
+        let i = start + pos;
+        let mut j = i + "require".len();
+        start = j;
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            continue;
+        }
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'(' {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+        }
+        if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+            let quote = bytes[j];
+            if let Some(end) = src[j + 1..].find(quote as char) {
+                out.push(src[j + 1..j + 1 + end].to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval(src: &str) -> Result<DefinitionManifest, DeclarationError> {
+        evaluate_declaration(src, &BTreeMap::new())
+    }
+
+    fn dp(body: &str) -> String {
+        format!("local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"p.d\", {body} }}")
+    }
+
+    #[test]
+    fn address_and_gc_dependent_values_are_non_deterministic() {
+        for pre in [
+            "local d = tostring({})",
+            "local d = tostring(function() end)",
+            "local d = string.format(\"%s\", {})",
+            "local d = (\"%s\"):format({})",
+            "local d = collectgarbage(\"count\")",
+            "local d = gcinfo()",
+            "local d = math.random()",
+        ] {
+            let src = format!(
+                "local dash = require(\"dash\")\n{pre}\nreturn dash.data_provider {{ id = \"p.d\", description = tostring(d) }}"
+            );
+            assert!(
+                matches!(eval(&src), Err(DeclarationError::NonDeterministic(_))),
+                "{pre} must be rejected as non-deterministic"
+            );
+        }
+        // Scalars still stringify deterministically.
+        let ok = eval(&dp("description = tostring(42) .. string.format(\"%d\", 7)")).unwrap();
+        assert_eq!(ok.description, "427");
+    }
+
+    #[test]
+    fn unknown_or_mistyped_fields_are_rejected() {
+        for body in [
+            "ouptut = dash.string()",
+            "quer = 5",
+            "dry_run = \"x\"",
+            "handler = {}",
+            "runtime = 42",
+            "description = true",
+            "updates = { subscribe = \"yes\" }",
+            "updates = { poll_interval_secs = -1 }",
+            "updates = { polll = true }",
+        ] {
+            assert!(
+                matches!(eval(&dp(body)), Err(DeclarationError::InvalidContract(_))),
+                "{body} must be rejected"
+            );
+        }
+        let conn = r#"local dash = require("dash")
+return dash.connector { id = "p.c", capabilities = { "a" }, operations = { op = { required_capabilities = { "a" }, descripton = "typo" } } }"#;
+        assert!(matches!(eval(conn), Err(DeclarationError::InvalidContract(_))));
+        let ok = eval(&dp("updates = { on_demand = true, poll_interval_secs = 60 }")).unwrap();
+        assert_eq!(ok.updates.poll_interval_secs, Some(60));
+    }
+
+    #[test]
+    fn ids_paths_and_semantic_names_are_validated() {
+        for id in [".", "a.", ".b", "x.y.z", "A.b", "a-b.c", "nodot"] {
+            let src = format!("local dash = require(\"dash\")\nreturn dash.library {{ id = \"{id}\" }}");
+            assert!(eval(&src).is_err(), "id {id:?} must be rejected");
+        }
+        for body in [
+            "runtime = \"/etc/passwd\"",
+            "runtime = \"../../x.luau\"",
+            "runtime = \"a\\\\b.luau\"",
+            "output = dash.list(\"whatever\")",
+            "output = dash.semantic(\"Dev.PR@x\")",
+            "libraries = { \"../evil\" }",
+        ] {
+            assert!(eval(&dp(body)).is_err(), "{body} must be rejected");
+        }
+        let mock_fixture = r#"local dash = require("dash")
+return dash.mock { id = "p.m", ["for"] = "p.c", fixtures = { x = "../secret.json" } }"#;
+        assert!(eval(mock_fixture).is_err());
+        assert!(eval(&dp("output = dash.list(\"dev.pull_request@1\")")).is_ok());
+    }
+
+    #[test]
+    fn operation_capabilities_must_be_declared() {
+        let bad = r#"local dash = require("dash")
+return dash.connector { id = "p.c", capabilities = { "read" }, operations = { merge = { required_capabilities = { "merge" } } } }"#;
+        assert!(matches!(eval(bad), Err(DeclarationError::InvalidContract(_))));
+    }
+
+    #[test]
+    fn runtime_source_check_requires_compiling_module_with_handlers() {
+        let m = eval(
+            "local dash = require(\"dash\")\nreturn dash.action_provider { id = \"p.a\", dry_run = \"preview\" }",
+        )
+        .unwrap();
+        assert!(check_runtime_source(&m, "local R = {}; function R.execute() end; function R.preview() end; return R").is_ok());
+        assert!(check_runtime_source(&m, "local R = {}; function R.execute() end; return R").is_err());
+        assert!(check_runtime_source(&m, "-- execute preview\nreturn {}").is_err());
+        assert!(check_runtime_source(&m, "local R = {; function R.execute() end").is_err());
+    }
+
+    #[test]
+    fn require_scanner_finds_module_names() {
+        let src = "local a = require(\"eng.utils\")\nlocal b = require 'eng.more'\nlocal c = myrequire(\"no\")\nlocal d = require( \"x.y\" )";
+        assert_eq!(scan_required_modules(src), vec!["eng.utils", "eng.more", "x.y"]);
+    }
 }
