@@ -107,7 +107,7 @@ struct CircuitState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Admission {
+pub(crate) enum Admission {
     Closed,
     /// Half-open trial execution; closes the breaker on success, reopens it on failure.
     Probe,
@@ -1748,7 +1748,7 @@ impl QueryEngine {
 
     /// Update the breaker of a non-query execution. Timeouts and memory violations always count;
     /// script errors count only when `count_script_errors` (business errors of connectors don't).
-    fn record_runtime_outcome(
+    pub(crate) fn record_runtime_outcome(
         &self,
         breaker_key: &str,
         admission: Admission,
@@ -2323,7 +2323,7 @@ impl QueryEngine {
         })
     }
 
-    fn breaker_admit(&self, key: &str) -> Admission {
+    pub(crate) fn breaker_admit(&self, key: &str) -> Admission {
         let Some(mut st) = self.circuit_breakers.get_mut(key) else {
             return Admission::Closed;
         };

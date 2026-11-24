@@ -304,7 +304,14 @@ fn test_graph() -> ConfiguredGraph {
             adapters: vec![],
             initial_state: BTreeMap::new(),
             overrides: BTreeMap::new(),
-            state_schema: BTreeMap::new(),
+            // Automation Dashboard State writes are mediated by the declared schema (§8).
+            state_schema: BTreeMap::from([(
+                "note".to_string(),
+                dash_core::state::StateKeyDeclaration {
+                    value_type: dash_core::state::StateValueType::String,
+                    ..Default::default()
+                },
+            )]),
         },
     );
     g.service_principals.insert(

@@ -2,7 +2,7 @@
 //! mandatory", §20 "No unbounded queues or caches"), plus read-only diagnostics used by `dash doctor`.
 
 use crate::{AuditRecord, SqliteStore, StoreError};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +100,78 @@ fn trim_to_rows(
     Ok(conn.execute(&sql, params![max_rows])?)
 }
 
+/// The one durable Event retention rule (§7.2, §13), shared by [`SqliteStore::enforce_retention`]
+/// and [`SqliteStore::prune_events_before`] so the two passes cannot drift apart. An Event
+/// emitted before `cutoff` is deleted only when
+/// - it is not the newest Event of its source: the head row is always kept, so the per-source
+///   sequence never restarts below a consumer checkpoint after a restart;
+/// - every registered consumer of its source has acknowledged it;
+/// - no unresolved dead letter references it, so the dead letter can still be redriven.
+///
+/// Finished automation execution records older than `cutoff` whose Event is gone (or that had no
+/// Event) can no longer guard a replay and are dropped with the same retention.
+/// Returns the number of deleted Events.
+pub(crate) fn prune_retained_events(
+    conn: &rusqlite::Connection,
+    cutoff: DateTime<Utc>,
+) -> Result<usize, StoreError> {
+    let is_old = |at: &str| {
+        DateTime::parse_from_rfc3339(at)
+            .map(|d| d.with_timezone(&Utc) < cutoff)
+            .unwrap_or(false)
+    };
+    let candidates: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.event_id, e.emitted_at FROM events e
+             WHERE e.sequence < (SELECT MAX(e2.sequence) FROM events e2
+                                  WHERE e2.source_instance = e.source_instance)
+               AND e.sequence <= COALESCE(
+                    (SELECT MIN(c.last_sequence) FROM event_consumer_checkpoints c
+                      WHERE c.source_instance = e.source_instance),
+                    e.sequence)
+               AND NOT EXISTS (SELECT 1 FROM dead_letters d
+                                WHERE d.event_id = e.event_id AND d.resolved = 0)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row?);
+        }
+        v
+    };
+    let tx = conn.unchecked_transaction()?;
+    let mut deleted = 0;
+    for (event_id, at) in candidates {
+        if is_old(&at) {
+            deleted += tx.execute("DELETE FROM events WHERE event_id = ?1", params![event_id])?;
+        }
+    }
+    let stale_runs: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT a.execution_id, a.started_at FROM automation_executions a
+             WHERE a.status != 'running'
+               AND (a.event_id IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id = a.event_id))",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row?);
+        }
+        v
+    };
+    for (execution_id, at) in stale_runs {
+        if is_old(&at) {
+            tx.execute(
+                "DELETE FROM automation_executions WHERE execution_id = ?1",
+                params![execution_id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(deleted)
+}
+
 impl SqliteStore {
     /// Apply the retention policy to every growing table and enforce the SQLite size budget.
     /// Safe to call repeatedly; intended for the daemon's maintenance loop (off the async runtime).
@@ -128,15 +200,9 @@ impl SqliteStore {
             report.audit_records_deleted +=
                 trim_to_rows(conn, "audit_records", "timestamp", policy.audit_max_rows)?;
 
-            report.events_deleted = conn.execute(
-                "DELETE FROM events WHERE emitted_at < ?1
-                   AND sequence < (SELECT MAX(e2.sequence) FROM events e2
-                                   WHERE e2.source_instance = events.source_instance)
-                   AND (NOT EXISTS (SELECT 1 FROM event_consumer_checkpoints c
-                                    WHERE c.source_instance = events.source_instance)
-                        OR sequence <= (SELECT MIN(c.last_sequence) FROM event_consumer_checkpoints c
-                                        WHERE c.source_instance = events.source_instance))",
-                params![cutoff(policy.event_days)],
+            report.events_deleted = prune_retained_events(
+                conn,
+                Utc::now() - Duration::days(policy.event_days.max(0)),
             )?;
 
             let exec_cutoff = cutoff(policy.action_execution_days);
@@ -456,6 +522,51 @@ mod tests {
 
     fn old_ts(days: i64) -> String {
         (Utc::now() - Duration::days(days)).to_rfc3339()
+    }
+
+    #[test]
+    fn retention_keeps_events_unresolved_dead_letters_reference() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ids: Vec<String> = (0..4)
+            .map(|_| {
+                store
+                    .append_event("merge_pr", "github.pr_merged", "1", "t", true, json!({}))
+                    .unwrap()
+                    .event_id
+            })
+            .collect();
+        store
+            .with_conn_sync(|c| {
+                c.execute("UPDATE events SET emitted_at = ?1", params![old_ts(60)])?;
+                Ok(())
+            })
+            .unwrap();
+        // Every Event is acknowledged; #2 failed delivery and is dead-lettered (unresolved),
+        // #1 was dead-lettered and later resolved.
+        store
+            .set_consumer_checkpoint("complete_work", "merge_pr", 4)
+            .unwrap();
+        let resolved = store
+            .record_dead_letter("complete_work", &ids[0], 3, "jira 503")
+            .unwrap();
+        store.resolve_dead_letter(&resolved).unwrap();
+        store
+            .record_dead_letter("complete_work", &ids[1], 3, "jira 503")
+            .unwrap();
+        let report = store
+            .enforce_retention(&RetentionPolicy::default())
+            .unwrap();
+        assert_eq!(
+            report.events_deleted, 2,
+            "#1 and #3 go; #2 (DLQ) and #4 (head) stay"
+        );
+        assert!(store.get_event(&ids[0]).unwrap().is_none());
+        assert!(
+            store.get_event(&ids[1]).unwrap().is_some(),
+            "an unresolved dead letter must stay redrivable"
+        );
+        assert!(store.get_event(&ids[2]).unwrap().is_none());
+        assert!(store.get_event(&ids[3]).unwrap().is_some());
     }
 
     #[test]
