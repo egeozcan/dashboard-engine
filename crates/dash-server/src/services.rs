@@ -90,6 +90,7 @@ impl AppServices {
                 tokio::select! {
                     _ = ticker.tick() => {
                         services.engine().pool.reclaim_idle(None);
+                        services.engine().queries.prune_idle();
                         services.run_due_history_samples().await;
                         services.run_due_polls().await;
                     }

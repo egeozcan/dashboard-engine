@@ -33,6 +33,8 @@ export interface RenderedDashboard {
   layout: string;
   generation: number;
   dashboard_state: Record<string, unknown>;
+  /** Per-key record versions, sent back as `expected_version` for compare-and-swap writes. */
+  dashboard_state_versions?: Record<string, number>;
   overrides: Record<string, unknown>;
   adapters: AdapterRender[];
 }
@@ -47,6 +49,8 @@ export interface DashboardDoc {
     query_params: Record<string, unknown>;
   }>;
   initial_state: Record<string, unknown>;
+  /** Declared Dashboard State keys (schema version, type, size limit, migration policy). */
+  state_schema?: Record<string, unknown>;
   overrides: Record<
     string,
     {

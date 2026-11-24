@@ -278,6 +278,7 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
                 adapters: vec![],
                 initial_state: BTreeMap::new(),
                 overrides: BTreeMap::new(),
+                state_schema: BTreeMap::new(),
             },
         )
         .unwrap();
