@@ -192,6 +192,12 @@ export class SignalClient {
   private queries = new Map<string, QuerySub>();
   /** Per Instance, subscriptions awaiting the server's `subscribed`/`error` reply, in request order. */
   private pendingQueries = new Map<string, QuerySub[]>();
+  /**
+   * query_keys released locally while another `subscribe_query` of the same Instance was still
+   * unanswered (per Instance). That reply may bind to the same server key (params that
+   * canonicalize alike), so the unsubscribe waits until no such reply is outstanding.
+   */
+  private deferredReleases = new Map<string, Set<string>>();
   private stateListeners = new Set<StateListener>();
   private statusListeners = new Set<StatusListener>();
   private errorListeners = new Set<ErrorListener>();
@@ -223,6 +229,7 @@ export class SignalClient {
       this.setStatus("open");
       for (const id of this.dashboards.keys()) this.send({ type: "subscribe_dashboard", dashboard_id: id });
       this.pendingQueries.clear();
+      this.deferredReleases.clear();
       for (const sub of this.queries.values()) {
         sub.queryKey = null;
         sub.resyncing = false;
@@ -297,7 +304,7 @@ export class SignalClient {
       this.queries.delete(id);
       s.closed = true;
       // Unbound subscriptions are released when their `subscribed` reply arrives.
-      if (s.queryKey !== null) this.releaseQueryKey(s.queryKey);
+      if (s.queryKey !== null) this.releaseQueryKey(s.queryKey, s.instance);
     };
   }
 
@@ -349,20 +356,38 @@ export class SignalClient {
     return sub;
   }
 
-  /** Stop the server forwarder for `queryKey` unless another live subscription shares it. */
-  private releaseQueryKey(queryKey: string) {
+  /**
+   * Stop the server forwarder for `queryKey` unless another live subscription shares it, or
+   * may share it once its pending `subscribe_query` of the same Instance is answered.
+   */
+  private releaseQueryKey(queryKey: string, instance: string) {
     for (const s of this.queries.values()) if (s.queryKey === queryKey) return;
+    if ((this.pendingQueries.get(instance) ?? []).some((s) => !s.closed)) {
+      const deferred = this.deferredReleases.get(instance) ?? new Set<string>();
+      deferred.add(queryKey);
+      this.deferredReleases.set(instance, deferred);
+      return;
+    }
     this.send({ type: "unsubscribe_query", query_key: queryKey });
+  }
+
+  /** Re-check releases deferred for `instance` after one of its pending replies arrived. */
+  private flushDeferredReleases(instance: string) {
+    const deferred = this.deferredReleases.get(instance);
+    if (!deferred) return;
+    this.deferredReleases.delete(instance);
+    for (const key of deferred) this.releaseQueryKey(key, instance);
   }
 
   private handleSubscribed(queryKey: string, instance: string) {
     const sub = this.takePending(instance);
     if (!sub) return;
     if (sub.closed) {
-      this.releaseQueryKey(queryKey);
-      return;
+      this.releaseQueryKey(queryKey, instance);
+    } else {
+      sub.queryKey = queryKey;
     }
-    sub.queryKey = queryKey;
+    this.flushDeferredReleases(instance);
   }
 
   private send(msg: Record<string, unknown>) {
@@ -415,7 +440,10 @@ export class SignalClient {
         };
         // A refused `subscribe_query` (query_denied, subscription_limit) answers the oldest
         // pending request for its Instance; it carries no query_key.
-        if (err.instance && !err.queryKey && !err.dashboardId) this.takePending(err.instance);
+        if (err.instance && !err.queryKey && !err.dashboardId) {
+          this.takePending(err.instance);
+          this.flushDeferredReleases(err.instance);
+        }
         for (const l of this.errorListeners) l(err.message, err.dashboardId, err);
         return;
       }

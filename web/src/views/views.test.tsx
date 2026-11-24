@@ -101,6 +101,7 @@ describe("DashboardView", () => {
           args: { id: 2 },
           dry_run: { action_instance: "deploy_service", feasible: true, advisory: true, warnings: ["slow"], effects: { deploys: 1 } },
           requires_confirmation: true,
+          dry_run_token: "wdr_confirmed",
         }),
       ],
       ["/api/widget-request", "POST", () => ({ execution_id: "act_1", status: "succeeded" })],
@@ -140,14 +141,21 @@ describe("DashboardView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Confirm & Execute" }));
     await screen.findByText(/execution act_1/);
-    expect(calls.filter((c) => c.url === "/api/widget-request" && c.method === "POST")).toHaveLength(1);
+    const dispatches = calls.filter((c) => c.url === "/api/widget-request" && c.method === "POST");
+    expect(dispatches).toHaveLength(1);
+    // The dispatch is bound to the Dry run the user confirmed (R7:SEC-1).
+    expect(dispatches[0].body).toMatchObject({ dry_run_token: "wdr_confirmed" });
   });
 
   it("runs Requests that resolve to a refresh without confirmation", async () => {
     const { calls } = mockFetch([
       ["/api/dashboards", "GET", () => [doc()]],
       ["/api/dashboards/ops", "GET", () => ({ document: doc(), rendered: renderedWith([{ id: 1, title: "first" }]) })],
-      ["/api/widget-request/dry-run", "POST", () => ({ resolution: "refresh", requires_confirmation: false })],
+      [
+        "/api/widget-request/dry-run",
+        "POST",
+        () => ({ resolution: "refresh", requires_confirmation: false, dry_run_token: "wdr_refresh" }),
+      ],
       ["/api/widget-request", "POST", () => ({ execution_id: "req_1", status: "succeeded" })],
     ]);
     render(<DashboardView />);
@@ -155,7 +163,8 @@ describe("DashboardView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Ship it" }));
     await screen.findByText(/execution req_1/);
     expect(screen.queryByText("Confirm action (Dry run)")).not.toBeVisible();
-    expect(calls.map((c) => c.url)).toContain("/api/widget-request");
+    const dispatch = calls.find((c) => c.url === "/api/widget-request");
+    expect(dispatch?.body).toMatchObject({ dry_run_token: "wdr_refresh" });
   });
 
   it("saves Designer edits onto the Draft's base Dashboard and aborts the Draft on failure", async () => {

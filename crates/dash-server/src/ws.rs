@@ -111,6 +111,10 @@ pub async fn ws_handler(
 struct QuerySubscription {
     handle: tokio::task::JoinHandle<()>,
     resync: Arc<Notify>,
+    /// Stable identity of what was subscribed (Instance and canonical params). Unlike the
+    /// query_key it survives a Generation change, so a re-subscription made before the
+    /// forwarder re-bound is still recognized as a duplicate.
+    identity: String,
     /// The query_key this subscription currently streams. The forwarder re-binds it when a new
     /// Generation changes the key (e.g. a Definition update changes its `identity_version`).
     key: Arc<RwLock<String>>,
@@ -120,6 +124,27 @@ impl QuerySubscription {
     fn current_key(&self) -> Option<String> {
         self.key.read().ok().map(|k| k.clone())
     }
+}
+
+/// [`QuerySubscription::identity`] of a `subscribe_query` request.
+fn subscription_identity(instance: &str, params: &Value) -> String {
+    fn canonical(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let sorted: std::collections::BTreeMap<&String, Value> =
+                    m.iter().map(|(k, v)| (k, canonical(v))).collect();
+                serde_json::to_value(sorted).unwrap_or(Value::Null)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+            other => other.clone(),
+        }
+    }
+    let params = if params.is_null() {
+        json!({})
+    } else {
+        canonical(params)
+    };
+    format!("{instance}\u{1f}{params}")
 }
 
 /// Re-key the socket's query subscriptions after their forwarders re-bound to a new query_key,
@@ -371,11 +396,16 @@ async fn subscribe_query(
             return;
         }
     };
-    if subs.contains_key(&qk) {
-        // Deduplicated: one forwarder per query per socket. Send a fresh snapshot instead.
-        if let Some(s) = subs.get(&qk) {
-            s.resync.notify_one();
-        }
+    let identity = subscription_identity(&instance, &params);
+    // Deduplicated: one forwarder per query per socket. Send a fresh snapshot instead. A
+    // forwarder still bound to the key of an earlier Generation is the same subscription: the
+    // resync makes it re-bind now (announcing `replaces`) instead of on its next tick.
+    let existing = subs.get(&qk).or_else(|| {
+        subs.values()
+            .find(|s| s.identity == identity && !s.handle.is_finished())
+    });
+    if let Some(s) = existing {
+        s.resync.notify_one();
         let _ = out
             .send(json!({ "type": "subscribed", "query_key": qk, "instance": instance, "duplicate": true }))
             .await;
@@ -433,6 +463,7 @@ async fn subscribe_query(
         QuerySubscription {
             handle,
             resync,
+            identity,
             key,
         },
     );
@@ -526,7 +557,70 @@ struct QueryForwarder {
     resync: Arc<Notify>,
 }
 
+/// Outcome of [`QueryForwarder::rebind`].
+enum Rebind {
+    Unchanged,
+    /// Re-bound to a new query_key (announced with `replaces`); a resync snapshot is due.
+    Moved,
+    /// The query can no longer be resolved; the subscription ended with an error.
+    Ended,
+}
+
 impl QueryForwarder {
+    /// Re-resolve the query_key when the active Generation changed since `generation`.
+    async fn rebind(
+        &self,
+        qk: &mut String,
+        rx: &mut broadcast::Receiver<QueryEnvelope>,
+        cursor: &mut DeliveryCursor,
+        generation: &mut i64,
+    ) -> Rebind {
+        let gid = self.services.graph().generation_id;
+        if gid == *generation {
+            return Rebind::Unchanged;
+        }
+        *generation = gid;
+        match self.services.engine().queries.resolve_query_key(
+            &self.instance,
+            &self.params,
+            &self.principal,
+        ) {
+            Ok(new_qk) if new_qk == *qk => Rebind::Unchanged,
+            Ok(new_qk) => {
+                // Subscribe before computing so no update on the new key is lost.
+                *rx = self.services.engine().signals.subscribe_stream(&new_qk);
+                if let Ok(mut k) = self.key.write() {
+                    *k = new_qk.clone();
+                }
+                let msg = json!({
+                    "type": "subscribed",
+                    "query_key": new_qk,
+                    "instance": self.instance,
+                    "replaces": *qk,
+                });
+                if self.out.send(msg).await.is_err() {
+                    return Rebind::Ended;
+                }
+                *qk = new_qk;
+                *cursor = DeliveryCursor::default();
+                Rebind::Moved
+            }
+            Err(err) => {
+                let _ = self
+                    .out
+                    .send(json!({
+                        "type": "error",
+                        "code": "query_denied",
+                        "query_key": *qk,
+                        "instance": self.instance,
+                        "message": err,
+                    }))
+                    .await;
+                Rebind::Ended
+            }
+        }
+    }
+
     /// `qk`/`rx`/`cursor` are the subscription's current binding and what was delivered on it;
     /// `generation` is the Generation `qk` was resolved in.
     ///
@@ -562,51 +656,19 @@ impl QueryForwarder {
                     Err(RecvError::Lagged(_)) => true,
                     Err(RecvError::Closed) => return,
                 },
-                _ = self.resync.notified() => true,
-                _ = gen_tick.tick() => {
-                    let gid = self.services.graph().generation_id;
-                    if gid == generation {
-                        continue;
+                // A resync (e.g. a duplicate subscribe) first re-binds a key a new Generation
+                // moved, so the snapshot it sends is the current query's.
+                _ = self.resync.notified() => {
+                    match self.rebind(&mut qk, &mut rx, &mut cursor, &mut generation).await {
+                        Rebind::Ended => return,
+                        Rebind::Moved | Rebind::Unchanged => true,
                     }
-                    generation = gid;
-                    match self.services.engine().queries.resolve_query_key(
-                        &self.instance,
-                        &self.params,
-                        &self.principal,
-                    ) {
-                        Ok(new_qk) if new_qk == qk => continue,
-                        Ok(new_qk) => {
-                            // Subscribe before computing so no update on the new key is lost.
-                            rx = self.services.engine().signals.subscribe_stream(&new_qk);
-                            if let Ok(mut k) = self.key.write() {
-                                *k = new_qk.clone();
-                            }
-                            let msg = json!({
-                                "type": "subscribed",
-                                "query_key": new_qk,
-                                "instance": self.instance,
-                                "replaces": qk,
-                            });
-                            if self.out.send(msg).await.is_err() {
-                                return;
-                            }
-                            qk = new_qk;
-                            cursor = DeliveryCursor::default();
-                            true
-                        }
-                        Err(err) => {
-                            let _ = self
-                                .out
-                                .send(json!({
-                                    "type": "error",
-                                    "code": "query_denied",
-                                    "query_key": qk,
-                                    "instance": self.instance,
-                                    "message": err,
-                                }))
-                                .await;
-                            return;
-                        }
+                }
+                _ = gen_tick.tick() => {
+                    match self.rebind(&mut qk, &mut rx, &mut cursor, &mut generation).await {
+                        Rebind::Ended => return,
+                        Rebind::Moved => true,
+                        Rebind::Unchanged => continue,
                     }
                 }
             };
@@ -949,6 +1011,22 @@ mod tests {
     }
 
     #[test]
+    fn subscription_identity_ignores_param_order_and_null_params() {
+        assert_eq!(
+            subscription_identity("p", &json!({ "a": 1, "b": { "y": 2, "x": 1 } })),
+            subscription_identity("p", &json!({ "b": { "x": 1, "y": 2 }, "a": 1 }))
+        );
+        assert_eq!(
+            subscription_identity("p", &Value::Null),
+            subscription_identity("p", &json!({}))
+        );
+        assert_ne!(
+            subscription_identity("p", &json!({ "a": 1 })),
+            subscription_identity("q", &json!({ "a": 1 }))
+        );
+    }
+
+    #[test]
     fn rekeying_follows_rebound_subscriptions_and_drops_ended_ones() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -964,6 +1042,7 @@ mod tests {
                 QuerySubscription {
                     handle,
                     resync: Arc::new(Notify::new()),
+                    identity: subscription_identity("i", &json!({ "k": key })),
                     key: Arc::new(RwLock::new(key.to_string())),
                 }
             };
@@ -1156,10 +1235,24 @@ pub(crate) async fn run_dashboard_subscription(
                             .await;
                         break;
                     }
-                    if let Ok(mut d) = dashboards.write() {
-                        if let Some(g) = d.get_mut(&dashboard_id) {
-                            *g = gid;
-                        }
+                    // The State Signal path may have seen an intermediate Generation that
+                    // revoked read authority and dropped this Dashboard from the socket's set.
+                    // Then State delivery has stopped: end this render subscription too, so
+                    // the two never disagree and the client is told (it may subscribe again).
+                    let still_subscribed = match dashboards.write() {
+                        Ok(mut d) => d.get_mut(&dashboard_id).map(|g| *g = gid).is_some(),
+                        Err(_) => false,
+                    };
+                    if !still_subscribed {
+                        let _ = out_tx
+                            .send(json!({
+                                "type": "error",
+                                "code": "forbidden",
+                                "dashboard_id": dashboard_id,
+                                "message": "read authority over this dashboard was revoked by an intermediate generation; subscribe again",
+                            }))
+                            .await;
+                        break;
                     }
                     let upstream = services.dashboard_upstream_instances(&dashboard_id);
                     seen.clear();

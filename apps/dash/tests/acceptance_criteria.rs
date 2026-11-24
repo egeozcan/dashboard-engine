@@ -890,6 +890,7 @@ async fn pr_badge_widget_refresh_request_succeeds() {
                 kind: "request".into(),
                 request: "refresh_requested".into(),
                 payload: json!({}),
+                dry_run_token: None,
             },
             &admin,
         )

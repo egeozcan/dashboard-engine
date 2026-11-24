@@ -56,10 +56,11 @@ export const DiagnosticsView: React.FC = () => {
     try {
       await apiFetch("/api/secrets", {
         method: "POST",
+        // No policy fields: rotating an existing secret keeps its stored binding policy and
+        // description (the server upserts); a new secret gets the defaults.
         body: JSON.stringify({
           name: secName,
           plaintext: secVal,
-          allowed_bindings: ["*"],
         }),
       });
       setSecName("");

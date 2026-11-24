@@ -213,7 +213,11 @@ pub struct PoolMetrics {
     pub active_vms: usize,
     pub queued_or_running: usize,
     pub total_executions: u64,
+    /// Pooled (cached) Instance VMs booted.
     pub total_vm_starts: u64,
+    /// Invocations run in a throwaway VM ([`VmPool::execute_handler_isolated`]).
+    #[serde(default)]
+    pub total_isolated_runs: u64,
     pub total_timeouts: u64,
     pub total_memory_exceeded: u64,
     pub total_queue_rejections: u64,
@@ -306,6 +310,7 @@ struct VmHandle {
 struct PoolCounters {
     executions: AtomicU64,
     vm_starts: AtomicU64,
+    isolated_runs: AtomicU64,
     timeouts: AtomicU64,
     memory_exceeded: AtomicU64,
     queue_rejections: AtomicU64,
@@ -425,6 +430,7 @@ impl VmPool {
                 .sum(),
             total_executions: self.counters.executions.load(Ordering::Relaxed),
             total_vm_starts: self.counters.vm_starts.load(Ordering::Relaxed),
+            total_isolated_runs: self.counters.isolated_runs.load(Ordering::Relaxed),
             total_timeouts: self.counters.timeouts.load(Ordering::Relaxed),
             total_memory_exceeded: self.counters.memory_exceeded.load(Ordering::Relaxed),
             total_queue_rejections: self.counters.queue_rejections.load(Ordering::Relaxed),
@@ -620,6 +626,42 @@ impl VmPool {
         self.vms.remove_if(instance_id, |_, v| v.vm_uid == vm_uid);
     }
 
+    /// Boot a VM for `bundle` (not registered in the pool).
+    fn spawn_vm(
+        &self,
+        bundle: &CompiledInstanceBundle,
+        budget: &ResourceBudget,
+    ) -> Result<(PooledVm, VmHandle), RuntimeError> {
+        let t0 = Instant::now();
+        let lua = build_sandboxed_vm(bundle, budget)?;
+        let startup = t0.elapsed();
+        let vm_arc = Arc::new(tokio::sync::Mutex::new(lua));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let uid = format!("vm_{}", Uuid::now_v7().simple());
+        Ok((
+            PooledVm {
+                vm_uid: uid.clone(),
+                definition_digest: bundle.manifest.identity_version.clone(),
+                config_digest: bundle.config_digest.clone(),
+                budget_fingerprint: budget.fingerprint(),
+                idle_ttl: budget.idle_ttl,
+                last_used: Instant::now(),
+                in_flight: Arc::clone(&in_flight),
+                admission: Arc::clone(&admission),
+                lua: Arc::clone(&vm_arc),
+            },
+            VmHandle {
+                vm_uid: uid,
+                lua: vm_arc,
+                in_flight,
+                admission,
+                started: true,
+                startup,
+            },
+        ))
+    }
+
     /// Atomically fetch the Instance VM or boot a new one (no check-then-insert race).
     fn get_or_spawn_vm(
         &self,
@@ -627,38 +669,11 @@ impl VmPool {
         budget: &ResourceBudget,
     ) -> Result<VmHandle, RuntimeError> {
         let fp = budget.fingerprint();
-        let spawn = |pool: &VmPool| -> Result<(PooledVm, VmHandle), RuntimeError> {
-            let t0 = Instant::now();
-            let lua = build_sandboxed_vm(bundle, budget)?;
-            let startup = t0.elapsed();
+        let spawn = |pool: &VmPool| {
+            let vm = pool.spawn_vm(bundle, budget)?;
             pool.counters.vm_starts.fetch_add(1, Ordering::Relaxed);
-            let vm_arc = Arc::new(tokio::sync::Mutex::new(lua));
-            let in_flight = Arc::new(AtomicUsize::new(0));
-            let admission = Arc::new(tokio::sync::Semaphore::new(1));
-            let uid = format!("vm_{}", Uuid::now_v7().simple());
-            Ok((
-                PooledVm {
-                    vm_uid: uid.clone(),
-                    definition_digest: bundle.manifest.identity_version.clone(),
-                    config_digest: bundle.config_digest.clone(),
-                    budget_fingerprint: fp.clone(),
-                    idle_ttl: budget.idle_ttl,
-                    last_used: Instant::now(),
-                    in_flight: Arc::clone(&in_flight),
-                    admission: Arc::clone(&admission),
-                    lua: Arc::clone(&vm_arc),
-                },
-                VmHandle {
-                    vm_uid: uid,
-                    lua: vm_arc,
-                    in_flight,
-                    admission,
-                    started: true,
-                    startup,
-                },
-            ))
+            Ok::<_, RuntimeError>(vm)
         };
-
         match self.vms.entry(bundle.instance_id.clone()) {
             Entry::Occupied(mut o) => {
                 let v = o.get_mut();
@@ -697,7 +712,24 @@ impl VmPool {
         ctx_cfg: ExecutionContextConfig,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<serde_json::Value, RuntimeError> {
-        self.execute_handler_with_stats(bundle, handler_name, ctx_cfg, cancel_flag)
+        self.execute_handler_stats_mode(bundle, handler_name, ctx_cfg, cancel_flag, false)
+            .await
+            .0
+    }
+
+    /// Like [`VmPool::execute_handler`], but in a fresh VM booted for this one invocation and
+    /// dropped afterwards (never cached, never shared). No module-local state flows into or out
+    /// of the invocation, so code cannot tell which caller drives it from what earlier calls
+    /// left behind (e.g. a widget Request's Dry run versus its dispatch). The Instance's budget
+    /// and the pool-wide admission still apply.
+    pub async fn execute_handler_isolated(
+        &self,
+        bundle: &CompiledInstanceBundle,
+        handler_name: &str,
+        ctx_cfg: ExecutionContextConfig,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        self.execute_handler_stats_mode(bundle, handler_name, ctx_cfg, cancel_flag, true)
             .await
             .0
     }
@@ -709,6 +741,18 @@ impl VmPool {
         handler_name: &str,
         ctx_cfg: ExecutionContextConfig,
         cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> (Result<serde_json::Value, RuntimeError>, ExecutionStats) {
+        self.execute_handler_stats_mode(bundle, handler_name, ctx_cfg, cancel_flag, false)
+            .await
+    }
+
+    async fn execute_handler_stats_mode(
+        &self,
+        bundle: &CompiledInstanceBundle,
+        handler_name: &str,
+        ctx_cfg: ExecutionContextConfig,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        isolated: bool,
     ) -> (Result<serde_json::Value, RuntimeError>, ExecutionStats) {
         let mut stats = ExecutionStats {
             instance_id: bundle.instance_id.clone(),
@@ -727,7 +771,14 @@ impl VmPool {
         };
         self.counters.executions.fetch_add(1, Ordering::Relaxed);
         let res = self
-            .execute_inner(bundle, handler_name, ctx_cfg, cancel_flag, &mut stats)
+            .execute_inner(
+                bundle,
+                handler_name,
+                ctx_cfg,
+                cancel_flag,
+                &mut stats,
+                isolated,
+            )
             .await;
         stats.outcome = match &res {
             Ok(_) => "ok",
@@ -768,13 +819,19 @@ impl VmPool {
         ctx_cfg: ExecutionContextConfig,
         cancel_flag: Option<Arc<AtomicBool>>,
         stats: &mut ExecutionStats,
+        isolated: bool,
     ) -> Result<serde_json::Value, RuntimeError> {
         let inherited_deadline = current_execution_deadline();
         let budget = self.effective_budget(&bundle.instance_id);
         stats.memory_limit_bytes = budget.memory_limit_bytes;
         let queued_at = Instant::now();
 
-        let vm = self.get_or_spawn_vm(bundle, &budget)?;
+        let vm = if isolated {
+            self.counters.isolated_runs.fetch_add(1, Ordering::Relaxed);
+            self.spawn_vm(bundle, &budget)?.1
+        } else {
+            self.get_or_spawn_vm(bundle, &budget)?
+        };
         stats.vm_uid = vm.vm_uid.clone();
         stats.vm_started = vm.started;
         stats.vm_startup_ms = vm.startup.as_millis() as u64;
@@ -956,7 +1013,9 @@ impl VmPool {
 
         // Evict the VM that failed (and only that VM) so clean state is guaranteed next time. A
         // timed-out/cancelled coroutine may have been abandoned mid-execution.
-        if matches!(
+        if isolated {
+            // Never registered: dropping the handle discards the VM.
+        } else if matches!(
             res,
             Err(RuntimeError::Timeout(_))
                 | Err(RuntimeError::MemoryExceeded(_))
@@ -1390,6 +1449,46 @@ return R
             sleep: Duration::from_millis(sleep_ms),
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn isolated_executions_share_no_module_state_and_are_not_cached() {
+        const COUNTER_RT: &str = r#"
+local R = {}
+local calls = 0
+function R.query(ctx) calls = calls + 1; return { calls = calls } end
+return R
+"#;
+        let pool = VmPool::new(budget(2_000));
+        let b = bundle("counter", DP_DECL, COUNTER_RT);
+        let run = |isolated: bool| {
+            let (pool, b) = (pool.clone(), b.clone());
+            async move {
+                let c = cfg(
+                    DefinitionCategory::DataProvider,
+                    "counter",
+                    &["up"],
+                    probe(0),
+                );
+                if isolated {
+                    pool.execute_handler_isolated(&b, "query", c, None).await
+                } else {
+                    pool.execute_handler(&b, "query", c, None).await
+                }
+            }
+        };
+        assert_eq!(run(false).await.unwrap()["calls"], 1);
+        assert_eq!(run(false).await.unwrap()["calls"], 2);
+        let cached = pool.vm_uid("counter");
+        // An isolated run neither sees the cached VM's state nor leaves any behind.
+        assert_eq!(run(true).await.unwrap()["calls"], 1);
+        assert_eq!(run(true).await.unwrap()["calls"], 1);
+        assert_eq!(
+            pool.vm_uid("counter"),
+            cached,
+            "isolated runs never replace the cached VM"
+        );
+        assert_eq!(run(false).await.unwrap()["calls"], 3);
     }
 
     #[tokio::test]

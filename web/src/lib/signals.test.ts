@@ -239,6 +239,36 @@ describe("SignalClient", () => {
     client.close();
   });
 
+  it("does not release a query_key a still-pending subscription will share (F7)", () => {
+    const client = makeClient();
+    const offA = client.subscribeQuery("open_prs", { a: 1, b: 2 }, vi.fn());
+    const sock = MockWebSocket.latest();
+    sock.open();
+    sock.receive({ type: "subscribed", query_key: "qk_ab", instance: "open_prs" });
+    // Same canonical query, different local id: its reply is still outstanding.
+    const b: unknown[] = [];
+    client.subscribeQuery("open_prs", { b: 2, a: 1 }, (s) => b.push(s.value));
+    offA();
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toEqual([]);
+    sock.receive({ type: "subscribed", query_key: "qk_ab", instance: "open_prs", duplicate: true });
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toEqual([]);
+    sock.receive({ type: "query_signal", envelope: snap(1, ["rows"], { query_key: "qk_ab" }) });
+    expect(b).toEqual([["rows"]]);
+
+    // A pending reply for a different key releases the deferred one once it arrives.
+    const offC = client.subscribeQuery("open_prs", { c: 1 }, vi.fn());
+    const offD = client.subscribeQuery("open_prs", { d: 1 }, vi.fn());
+    sock.receive({ type: "subscribed", query_key: "qk_c", instance: "open_prs" });
+    offC();
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toEqual([]);
+    sock.receive({ type: "subscribed", query_key: "qk_d", instance: "open_prs" });
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toEqual([
+      { type: "unsubscribe_query", query_key: "qk_c" },
+    ]);
+    offD();
+    client.close();
+  });
+
   it("forwards Dashboard State Signals and errors", () => {
     const client = makeClient();
     const onState = vi.fn();

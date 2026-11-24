@@ -656,6 +656,154 @@ async fn query_subscription_rebinds_when_a_generation_changes_its_query_key() {
     h.abort();
 }
 
+/// F1a: a re-subscription made right after a Generation moved the query_key (before the
+/// forwarder's own Generation check) is the same subscription: one forwarder, no duplicates.
+#[tokio::test]
+async fn resubscribing_right_after_a_generation_change_keeps_one_forwarder() {
+    let (_tmp, services, addr, h) = boot().await;
+    let params: Value = serde_json::from_str(PARAMS).unwrap();
+    let mut ws = connect(addr, ADMIN_TOKEN).await;
+    let subscribe = json!({"type": "subscribe_query", "instance": "open_prs", "params": params});
+    send(&mut ws, subscribe.clone()).await;
+    let (sub, _) = expect_type(&mut ws, "subscribed").await;
+    let old_qk = sub["query_key"].as_str().unwrap().to_string();
+    expect_type(&mut ws, "query_signal").await;
+
+    let mut g = (*services.graph()).clone();
+    let def_id = g.instances["open_prs"].definition.clone();
+    g.definitions
+        .get_mut(&def_id)
+        .unwrap()
+        .manifest
+        .identity_version
+        .push_str("-changed");
+    g.generation_id += 1;
+    services.engine().graph.store(std::sync::Arc::new(g));
+    send(&mut ws, subscribe).await;
+
+    let msgs = drain(&mut ws, Duration::from_millis(1200)).await;
+    let subscribed: Vec<&Value> = msgs.iter().filter(|m| m["type"] == "subscribed").collect();
+    assert!(
+        subscribed
+            .iter()
+            .all(|m| m["duplicate"] == true || m["replaces"] == old_qk.as_str()),
+        "a second subscription was started: {subscribed:?}"
+    );
+    let new_qk = services
+        .engine()
+        .queries
+        .resolve_query_key("open_prs", &params, &Principal::administrator())
+        .unwrap();
+    assert!(subscribed
+        .iter()
+        .any(|m| m["replaces"] == old_qk.as_str() && m["query_key"] == new_qk.as_str()));
+    assert_eq!(services.engine().signals.subscriber_count(&new_qk), 1);
+
+    // Each update reaches the socket once.
+    services
+        .engine()
+        .queries
+        .push_query_value(
+            "open_prs",
+            &params,
+            &Principal::administrator(),
+            json!([{"id": "acme/platform#78", "number": 78, "state": "open"}]),
+        )
+        .unwrap();
+    let msgs = drain(&mut ws, Duration::from_millis(500)).await;
+    let mut versions: Vec<u64> = msgs
+        .iter()
+        .filter(|m| m["type"] == "query_signal")
+        .filter_map(|m| m["envelope"]["version"].as_u64())
+        .collect();
+    let n = versions.len();
+    versions.dedup();
+    assert_eq!(versions.len(), n, "duplicate deliveries: {msgs:?}");
+    h.abort();
+}
+
+/// F1a: a revocation only the State Signal path observed (G2 revokes, G3 restores before the
+/// render task's Generation check) ends the render subscription too: renders never continue
+/// silently while State delivery has stopped.
+#[tokio::test]
+async fn transient_revocation_seen_by_state_signals_ends_the_render_subscription() {
+    let (_tmp, services, addr, h) = boot().await;
+    let adapters: Vec<String> = services.graph().dashboards["engineering"]
+        .adapters
+        .iter()
+        .map(|p| p.adapter_instance.clone())
+        .collect();
+    let adapter_refs: Vec<&str> = adapters.iter().map(String::as_str).collect();
+    let token = agent(&services, &adapter_refs);
+    let mut ws = connect(addr, &token).await;
+    send(
+        &mut ws,
+        json!({"type": "subscribe_dashboard", "dashboard_id": "engineering"}),
+    )
+    .await;
+    let _ = drain(&mut ws, Duration::from_millis(700)).await;
+    let state = services.engine().state.clone();
+    let restored = (*services.graph()).clone();
+
+    let mut g2 = restored.clone();
+    let mut extra = g2.dashboards["engineering"].adapters[0].clone();
+    extra.adapter_instance = "open_prs".into();
+    g2.dashboards
+        .get_mut("engineering")
+        .unwrap()
+        .adapters
+        .push(extra);
+    g2.generation_id += 1;
+    services
+        .engine()
+        .graph
+        .store(std::sync::Arc::new(g2.clone()));
+    state
+        .set(
+            "dashboard",
+            "engineering",
+            "selected_repository",
+            1,
+            g2.generation_id,
+            json!("acme/platform"),
+            None,
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut g3 = restored;
+    g3.generation_id = g2.generation_id + 1;
+    services
+        .engine()
+        .graph
+        .store(std::sync::Arc::new(g3.clone()));
+
+    let msgs = drain(&mut ws, Duration::from_millis(1200)).await;
+    assert!(
+        msgs.iter()
+            .any(|m| m["type"] == "error" && m["code"] == "forbidden"),
+        "the client is told that delivery stopped: {msgs:?}"
+    );
+    // Afterwards nothing is pushed for the Dashboard any more.
+    state
+        .set(
+            "dashboard",
+            "engineering",
+            "selected_repository",
+            1,
+            g3.generation_id,
+            json!("acme/payments"),
+            None,
+        )
+        .unwrap();
+    let msgs = drain(&mut ws, Duration::from_millis(800)).await;
+    assert!(
+        msgs.iter()
+            .all(|m| m["type"] != "dashboard_render" && m["type"] != "state_signal"),
+        "{msgs:?}"
+    );
+    h.abort();
+}
+
 #[tokio::test]
 async fn state_signals_stop_when_a_generation_revokes_dashboard_read_authority() {
     let (_tmp, services, addr, h) = boot().await;

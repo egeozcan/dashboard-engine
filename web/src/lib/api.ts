@@ -143,6 +143,8 @@ export interface WidgetRequestDryRun {
   dry_run?: DryRunReport | null;
   dry_run_error?: string | null;
   requires_confirmation: boolean;
+  /** Present for Adapters with `on_request`: the dispatch must carry it (single use). */
+  dry_run_token?: string | null;
 }
 
 export interface DefinitionSources {

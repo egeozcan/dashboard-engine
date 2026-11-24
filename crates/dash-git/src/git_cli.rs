@@ -202,11 +202,17 @@ pub struct SanitizedRemoteUrl {
 /// Remove credentials from a Git remote URL (§5.2, §12.1: remote credentials are host secrets
 /// and never appear in API responses).
 ///
-/// - `scheme://user:password@host/path?query#fragment` becomes `scheme://host/path`: the whole
+/// - `http(s)://user:password@host/path?query#fragment` becomes `http(s)://host/path`: the whole
 ///   userinfo is dropped (a lone user component of an HTTPS URL is commonly a token), and so are
 ///   the query string and fragment, which can carry tokens too.
+/// - other schemes (`ssh://`, `git://`, `file://`) keep their user, which is a login, not a
+///   secret; only a password is dropped.
 /// - scp-like `user@host:path` is kept as is: the user there is an SSH login, not a secret.
 /// - local paths are returned unchanged.
+///
+/// `removed_secrets` lists only values known to be credentials (passwords, a lone HTTPS user,
+/// query values of credential-like keys such as `private_token`), since callers register them
+/// with the store-wide redactor: an ordinary word there would corrupt every redacted output.
 pub fn sanitize_remote_url(raw: &str) -> SanitizedRemoteUrl {
     let raw = raw.trim();
     let Some(scheme_end) = raw.find("://") else {
@@ -216,28 +222,44 @@ pub fn sanitize_remote_url(raw: &str) -> SanitizedRemoteUrl {
         };
     };
     let (scheme, rest) = (&raw[..scheme_end], &raw[scheme_end + 3..]);
+    let http = matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https");
     let mut removed = Vec::new();
     let (rest, tail) = match rest.find(['?', '#']) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
     for part in tail.split(['?', '&', '#']).filter(|p| !p.is_empty()) {
-        let value = part.split_once('=').map(|(_, v)| v).unwrap_or(part);
-        removed.push(value.to_string());
+        if let Some((key, value)) = part.split_once('=') {
+            if is_credential_key(key) {
+                removed.push(value.to_string());
+            }
+        }
     }
     let authority_end = rest.find('/').unwrap_or(rest.len());
     let (authority, path) = (&rest[..authority_end], &rest[authority_end..]);
     let host = match authority.rfind('@') {
         Some(at) => {
+            let host = &authority[at + 1..];
             match authority[..at].split_once(':') {
                 // `user:password@`: the password is the secret
-                Some((_, password)) => removed.push(password.to_string()),
-                // `token@`: a lone user component is commonly an access token
-                None => removed.push(authority[..at].to_string()),
+                Some((user, password)) => {
+                    removed.push(password.to_string());
+                    if http {
+                        host.to_string()
+                    } else {
+                        format!("{user}@{host}")
+                    }
+                }
+                // `token@`: a lone user component of an HTTP(S) URL is commonly an access token
+                None if http => {
+                    removed.push(authority[..at].to_string());
+                    host.to_string()
+                }
+                // `deploy@` of an SSH/Git URL is a login
+                None => authority.to_string(),
             }
-            &authority[at + 1..]
         }
-        None => authority,
+        None => authority.to_string(),
     };
     // Git messages can show either the percent-encoded or the decoded form; mask both.
     let decoded: Vec<String> = removed
@@ -253,6 +275,16 @@ pub fn sanitize_remote_url(raw: &str) -> SanitizedRemoteUrl {
         url: format!("{scheme}://{host}{path}"),
         removed_secrets: removed,
     }
+}
+
+/// Whether a URL query key names a credential (`token`, `private_token`, `password`, `sig`...).
+fn is_credential_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [
+        "token", "pass", "secret", "key", "sig", "auth", "cred", "session",
+    ]
+    .iter()
+    .any(|m| k.contains(m))
 }
 
 fn percent_decode(s: &str) -> Option<String> {
@@ -840,9 +872,20 @@ mod plumbing_tests {
         assert!(s.removed_secrets.contains(&"p@ss/word".to_string()));
         assert!(s.removed_secrets.contains(&"tok_123".to_string()));
 
+        // F5: an SSH/Git login is no secret: it stays in the URL and is never registered with
+        // the store-wide redactor; neither are query values of non-credential keys.
+        let s = sanitize_remote_url("ssh://deploy:hunter22@git.example.com/acme/ws.git");
+        assert_eq!(s.url, "ssh://deploy@git.example.com/acme/ws.git");
+        assert_eq!(s.removed_secrets, vec!["hunter22".to_string()]);
+        let s = sanitize_remote_url("https://host/r.git?ref=main&sig=abcd1234#readme");
+        assert_eq!(s.url, "https://host/r.git");
+        assert_eq!(s.removed_secrets, vec!["abcd1234".to_string()]);
+
         for kept in [
             "git@github.com:acme/ws.git",
             "ssh://github.com/acme/ws.git",
+            "ssh://deploy@git.example.com/acme/ws.git",
+            "git://deploy@git.example.com/acme/ws.git",
             "/srv/git/ws.git",
             "file:///srv/git/ws.git",
         ] {

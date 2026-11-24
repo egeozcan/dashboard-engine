@@ -53,7 +53,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -1049,6 +1049,7 @@ impl AutomationEngine {
                         false,
                     );
                     let ids = Arc::clone(&bridge.action_ids);
+                    let attempt = Arc::clone(&bridge);
                     let handler = if def.manifest.handler.is_empty() {
                         "run"
                     } else {
@@ -1064,8 +1065,10 @@ impl AutomationEngine {
                     match &last {
                         Ok(_) => break,
                         // Retrying cannot help: the breaker is open, or an action's outcome is
-                        // not known yet (re-invoking it would only return the same record).
-                        Err(e) if !is_retryable_run_error(e) => break,
+                        // not known yet (re-invoking it would only return the same record). The
+                        // host records that on the attempt itself, never in the error text,
+                        // which carries upstream and script messages.
+                        Err(_) if attempt.non_retryable.load(Ordering::SeqCst) => break,
                         Err(e) if attempts < max_attempts => {
                             self.telemetry.log(
                                 "warn",
@@ -1184,6 +1187,7 @@ impl AutomationEngine {
             call_ordinal: AtomicU32::new(0),
             action_ids: Arc::new(Mutex::new(Vec::new())),
             read_only,
+            non_retryable: AtomicBool::new(false),
         })
     }
 
@@ -1209,6 +1213,7 @@ impl AutomationEngine {
         // of this automation open it, and runs then fail fast instead of burning wall time.
         let admission = self.queries.breaker_admit(&inst.id);
         if let crate::query_engine::Admission::Rejected { .. } = admission {
+            bridge.non_retryable.store(true, Ordering::SeqCst);
             return Err(format!(
                 "{CIRCUIT_OPEN_CODE}: circuit breaker open for automation '{}' after repeated runtime faults",
                 inst.id
@@ -1249,11 +1254,6 @@ fn parse_cron(expr: &str) -> Result<cron::Schedule, String> {
     };
     cron::Schedule::from_str(&normalized)
         .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
-}
-
-/// Whether a failed run attempt may be retried (see the module docs).
-fn is_retryable_run_error(err: &str) -> bool {
-    !err.contains(CIRCUIT_OPEN_CODE) && !err.contains(ACTION_OUTCOME_PENDING_CODE)
 }
 
 /// Whether `inst` may emit Events of `event_type` under its contract in `g` (§7.2): its
@@ -1515,6 +1515,9 @@ struct AutomationHostBridge {
     action_ids: Arc<Mutex<Vec<String>>>,
     /// Predicates are read-only: no actions, no State writes.
     read_only: bool,
+    /// Set by the host when retrying this attempt cannot help: the circuit breaker refused it,
+    /// or an action it invoked has an outcome that is not known yet (see the module docs).
+    non_retryable: AtomicBool,
 }
 
 impl AutomationHostBridge {
@@ -1649,11 +1652,14 @@ impl HostBridge for AutomationHostBridge {
                 "action '{target_action}' execution {} ended {}: {reason}",
                 rec.execution_id, rec.status
             )),
-            other => Err(format!(
+            other => {
+                self.non_retryable.store(true, Ordering::SeqCst);
+                Err(format!(
                 "{ACTION_OUTCOME_PENDING_CODE}: action '{target_action}' execution {} is {other}; \
                  redrive once it is reconciled or resolved: {reason}",
                 rec.execution_id
-            )),
+            ))
+            }
         }
     }
 

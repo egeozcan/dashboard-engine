@@ -397,6 +397,19 @@ describe("CodeEditor keyboard (F7)", () => {
     expect(screen.getByText(/Esc then Tab/)).toBeInTheDocument();
   });
 
+  it("lets Shift+Tab leave the editor while the completion list is open (F7)", () => {
+    const onChange = vi.fn();
+    render(<Harness onChange={onChange} />);
+    const ta = screen.getByLabelText("runtime.luau") as HTMLTextAreaElement;
+    ta.setSelectionRange(7, 7);
+    fireEvent.keyDown(ta, { key: " ", ctrlKey: true });
+    expect(screen.getByRole("listbox")).toBeInTheDocument();
+    expect(fireEvent.keyDown(ta, { key: "Tab", shiftKey: true })).toBe(true); // not intercepted
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(ta.value).toBe("local x");
+  });
+
   it("never edits a read-only editor via completion (web-6)", () => {
     const onChange = vi.fn();
     render(<Harness readOnly onChange={onChange} />);

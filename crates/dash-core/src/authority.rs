@@ -470,6 +470,11 @@ fn input_closure(graph: &ConfiguredGraph, root: &str) -> std::collections::BTree
 ///   series, whose binding or anything in its input closure is new or changed, may only be
 ///   activated when the Service principal's ceiling (Administrator grant, or the requested ceiling
 ///   while pending) is a subset of each Principal's ceiling (`PENDING_SERVICE_PRINCIPAL_BINDING`).
+/// * **Reachable actions** — an Adapter or action Instance that is new or changed may only be
+///   activated when each Principal's ceiling allows every action it can reach through its input
+///   closure. An Adapter runs its bound actions as whoever clicks its widgets (typically the
+///   Administrator), so otherwise an Agent could wire up an action outside its own ceiling
+///   (`PENDING_ACTION_GRANT`, R7:SEC-1).
 ///
 /// Violations are validation errors: the Administrator must author such changes or extend the
 /// Agent's ceiling. Nothing here can be satisfied by editing Workspace files.
@@ -580,6 +585,44 @@ pub fn check_draft_activation_authority(
                         p.id
                     ),
                 });
+            }
+        }
+    }
+
+    // 3. Actions reachable from changed Adapters and action Instances.
+    for (id, inst) in &candidate.instances {
+        if !matches!(
+            inst.category,
+            DefinitionCategory::Adapter | DefinitionCategory::ActionProvider
+        ) || !instance_changed(active, candidate, id)
+        {
+            continue;
+        }
+        let reachable: Vec<String> = input_closure(candidate, id)
+            .into_iter()
+            .filter(|a| {
+                candidate
+                    .instances
+                    .get(a)
+                    .is_some_and(|i| i.category == DefinitionCategory::ActionProvider)
+            })
+            .collect();
+        for p in &restricted {
+            for action in &reachable {
+                if !p.ceiling.allows_action(action) {
+                    issues.push(ValidationIssue {
+                        severity: "error".into(),
+                        code: "PENDING_ACTION_GRANT".into(),
+                        target: id.clone(),
+                        message: format!(
+                            "{} '{}' changed {} '{id}', which can reach action '{action}' outside its ceiling; \
+                             an Administrator must make this change or grant the action (§5.1, §11.3)",
+                            p.kind.as_str(),
+                            p.id,
+                            inst.category.as_str()
+                        ),
+                    });
+                }
             }
         }
     }
@@ -1200,6 +1243,70 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         assert_eq!(a[0].operation, "provider.query");
         assert_eq!(a[0].outcome, "denied");
         assert_eq!(a[0].target, "open_prs");
+    }
+
+    // R7:SEC-1 (defence in depth): an Agent cannot activate an Adapter or action that reaches
+    // an action outside its ceiling; the clicking Administrator would run it.
+    #[test]
+    fn agent_cannot_wire_up_actions_outside_its_ceiling() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let with_actions = |adapter_runtime: &str| {
+            let mut g = base_graph();
+            g.definitions.insert(
+                "gh.merge".into(),
+                def(
+                    r#"local dash = require("dash")
+return dash.action_provider { id = "gh.merge", handler = "execute" }"#,
+                    "local R = {}; function R.execute(ctx) return {} end; return R",
+                ),
+            );
+            g.definitions.insert(
+                "gh.adapter".into(),
+                def(
+                    r#"local dash = require("dash")
+return dash.adapter { id = "gh.adapter", handler = "render", on_request = "on_request",
+  inputs = { merge = dash.action_ref("gh.merge") } }"#,
+                    adapter_runtime,
+                ),
+            );
+            g.instances.insert(
+                "merge_pr".into(),
+                inst("merge_pr", DefinitionCategory::ActionProvider, "gh.merge"),
+            );
+            let mut adapter = inst("pr_adapter", DefinitionCategory::Adapter, "gh.adapter");
+            adapter.inputs.insert("merge".into(), "merge_pr".into());
+            g.instances.insert(adapter.id.clone(), adapter);
+            g
+        };
+        let active = with_actions("return { v = 1 }");
+        let cand = with_actions("return { v = 2 }");
+        let ag = drafting_agent();
+        let issues =
+            check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.code == "PENDING_ACTION_GRANT" && i.target == "pr_adapter"),
+            "{issues:?}"
+        );
+        // Unchanged Adapters, the Administrator, and an Agent granted the action pass.
+        assert!(check_draft_activation_authority(
+            &store,
+            &active,
+            &active,
+            std::slice::from_ref(&ag)
+        )
+        .is_empty());
+        assert!(check_draft_activation_authority(
+            &store,
+            &active,
+            &cand,
+            &[Principal::administrator()]
+        )
+        .is_empty());
+        let mut granted = drafting_agent();
+        granted.ceiling.allowed_actions.insert("merge_pr".into());
+        assert!(check_draft_activation_authority(&store, &active, &cand, &[granted]).is_empty());
     }
 
     #[test]

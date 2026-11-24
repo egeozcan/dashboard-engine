@@ -142,6 +142,9 @@ export const CodeEditor: React.FC<{
                 ...suggest,
                 index: (suggest.index + delta + suggest.items.length) % suggest.items.length,
               });
+            } else if (e.key === "Tab" && e.shiftKey) {
+              // Shift+Tab is never intercepted: close the list and let focus move back.
+              setSuggest(null);
             } else if (e.key === "Enter" || e.key === "Tab") {
               e.preventDefault();
               accept(suggest.items[suggest.index]);

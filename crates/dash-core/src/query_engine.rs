@@ -53,7 +53,7 @@ const QUERY_CACHE_CAPACITY: usize = 2048;
 /// Bounded LRU capacity for cached Adapter renders.
 const RENDER_CACHE_CAPACITY: usize = 256;
 /// Consecutive failures before an Instance's circuit breaker opens.
-const BREAKER_THRESHOLD: u32 = 5;
+pub(crate) const BREAKER_THRESHOLD: u32 = 5;
 /// First open window; doubles per further failure up to `2^BREAKER_MAX_EXP` times this.
 const BREAKER_BASE_BACKOFF: Duration = Duration::from_secs(1);
 const BREAKER_MAX_EXP: u32 = 4;
@@ -754,11 +754,24 @@ impl QueryEngine {
                 let engine = engine.clone();
                 let job = Arc::clone(&job);
                 // A dependency query issued from inside a running execution stays nested
-                // although its flight runs detached: it rides on the caller's pool permit and
-                // inherits the caller's remaining deadline (no permit starvation).
-                dash_luau::inherit_execution_scope(async move {
-                    engine.run_query_leader(job, tick, cancel).await
-                })
+                // although its flight runs detached: it rides on the caller's pool permit (no
+                // permit starvation). The flight is shared, though, so it runs under the
+                // provider's own wall timeout, not the creating caller's remaining deadline: a
+                // nested caller with little time left must not time out the top-level queries
+                // and subscription recomputes that join the flight, nor charge its deadline to
+                // the provider's circuit breaker. Each waiter stays bounded by its own WaitCtx.
+                let own_deadline = dash_luau::current_execution_deadline().map(|_| {
+                    Instant::now() + engine.pool.effective_budget(&job.inst.id).wall_timeout
+                });
+                async move {
+                    let leader = Box::pin(engine.run_query_leader(job, tick, cancel));
+                    match own_deadline {
+                        Some(deadline) => {
+                            dash_luau::with_execution_deadline(deadline, leader).await
+                        }
+                        None => leader.await,
+                    }
+                }
             },
         )
         .await
@@ -1601,8 +1614,23 @@ impl QueryEngine {
             }
         };
 
-        // Validate output contract at boundary
+        // Validate output contract at boundary. When a projection was pushed to the provider
+        // (`pushdown = { projection = true }`), its rows carry only the projected fields: they
+        // are checked against the contract restricted to those fields.
         if let Some(ref out_schema) = def.manifest.output {
+            let pushed_fields: Option<Vec<String>> = job
+                .params
+                .get(PUSHDOWN_PARAM)
+                .and_then(|p| p.get("fields"))
+                .and_then(|f| serde_json::from_value(f.clone()).ok());
+            let projected;
+            let out_schema = match &pushed_fields {
+                Some(fields) => {
+                    projected = out_schema.projected(fields);
+                    &projected
+                }
+                None => out_schema,
+            };
             out_schema.normalize_empty_lists(&mut val);
             if let Err(e) = out_schema.validate_value(&val) {
                 return Err(ProviderFailure {
@@ -1886,6 +1914,30 @@ impl QueryEngine {
         }
     }
 
+    /// [`QueryEngine::record_runtime_outcome`] for an execution started at `started` under the
+    /// caller's `inherited` deadline (`None` at top level). A timeout that the caller's deadline
+    /// caused (it fell before the callee's own wall timeout and has passed) is the caller's
+    /// budget running out, not a fault of the callee: it does not count against its breaker.
+    pub(crate) fn record_runtime_outcome_within(
+        &self,
+        breaker_key: &str,
+        admission: Admission,
+        res: &Result<serde_json::Value, RuntimeError>,
+        inherited: Option<Instant>,
+        started: Instant,
+    ) {
+        if let (Err(RuntimeError::Timeout(_)), Some(deadline)) = (res, inherited) {
+            let own = started + self.pool.effective_budget(breaker_key).wall_timeout;
+            if deadline < own && Instant::now() >= deadline {
+                if admission == Admission::Probe {
+                    self.breaker_release_probe(breaker_key);
+                }
+                return;
+            }
+        }
+        self.record_runtime_outcome(breaker_key, admission, res, false);
+    }
+
     /// Push a direct update (or simulated push) for an instance's cached queries and compute keyed delta.
     pub fn push_query_value(
         &self,
@@ -2125,9 +2177,12 @@ impl QueryEngine {
                 resolved_libraries: graph.resolved_libraries(),
             };
             let started = Instant::now();
+            // The hook may wait on upstream events for most of its budget: it runs in its own
+            // fresh VM, outside the provider's per-Instance admission and VM lock, so the
+            // provider's queries never queue behind it.
             let res = engine
                 .pool
-                .execute_handler(
+                .execute_handler_isolated(
                     &bundle,
                     "subscribe",
                     ExecutionContextConfig {
@@ -4390,6 +4445,63 @@ return R
     }
 
     #[tokio::test]
+    async fn shared_flight_created_by_a_nested_caller_runs_under_its_own_deadline() {
+        const BUSY_RT: &str = r#"
+local R = {}
+function R.query(ctx)
+    local x = 0
+    for i = 1, 4000000 do x = (x + i) % 1000003 end
+    return { x = x }
+end
+return R
+"#;
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        provider(&mut g, "busy", "test.busy", &[], BUSY_RT);
+        let budget = ResourceBudget {
+            max_interrupts: 50_000_000,
+            wall_timeout: Duration::from_secs(20),
+            ..ResourceBudget::default()
+        };
+        let (_e, q) = engine_for(g, budget);
+        let admin = Principal::administrator();
+        // Calibrate one run (other params: its cached value is not reused below).
+        let t0 = Instant::now();
+        let expected = q
+            .query("busy", json!({ "calibrate": true }), &admin, true)
+            .await
+            .unwrap()
+            .value;
+        let short = (t0.elapsed() / 5).max(Duration::from_millis(1));
+
+        // A nested caller (e.g. a parent provider) with far less time left than one run creates
+        // the flight; a top-level query joins it.
+        let (q1, a1) = (q.clone(), admin.clone());
+        let nested = tokio::spawn(async move {
+            dash_luau::with_execution_deadline(
+                Instant::now() + short,
+                q1.query("busy", json!({}), &a1, false),
+            )
+            .await
+        });
+        tokio::time::sleep(short / 4).await;
+        let top = q.query("busy", json!({}), &admin, false).await.unwrap();
+        assert_eq!(top.status, QueryStatus::Fresh, "{top:?}");
+        assert_eq!(
+            top.value, expected,
+            "the joining top-level query gets the value"
+        );
+        let _ = nested.await;
+        assert_eq!(
+            q.breaker_admit("busy"),
+            Admission::Closed,
+            "the caller's deadline is not charged to the provider"
+        );
+    }
+
+    #[tokio::test]
     async fn flight_without_waiters_is_cancelled_after_grace() {
         let (_e, mut q) = engine_for(ConfiguredGraph::default(), ResourceBudget::default());
         q.cancel_grace = Duration::from_millis(30);
@@ -6152,6 +6264,58 @@ end
 return R
 "#;
 
+    // F1b: a long-running subscribe hook does not hold the provider's VM or admission, so the
+    // provider's queries do not queue behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn long_running_subscribe_hook_does_not_block_the_providers_queries() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions.insert(
+            "test.waiting".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.data_provider { id = "test.waiting", updates = { subscribe = true } }"#,
+                r#"local R = {}
+function R.query(ctx) return { { id = "1" } } end
+function R.subscribe(ctx) while true do end end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "waiting".into(),
+            instance(
+                "waiting",
+                DefinitionCategory::DataProvider,
+                "test.waiting",
+                &[],
+                json!({}),
+            ),
+        );
+        let budget = ResourceBudget {
+            wall_timeout: Duration::from_secs(3),
+            max_interrupts: u64::MAX / 2,
+            queue_timeout: Duration::from_secs(10),
+            ..ResourceBudget::default()
+        };
+        let (e, q) = engine_for(g, budget);
+        let admin = Principal::administrator();
+        let first = q.query("waiting", json!({}), &admin, false).await.unwrap();
+        let _rx = e.signals.subscribe_stream(&first.query_key);
+        q.query("waiting", json!({}), &admin, false).await.unwrap();
+        assert!(q.provider_subscription_active(&first.query_key));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t0 = Instant::now();
+        let again = q.query("waiting", json!({}), &admin, true).await.unwrap();
+        assert_eq!(again.status, QueryStatus::Fresh);
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "the query queued behind the subscribe hook ({:?})",
+            t0.elapsed()
+        );
+    }
+
     // SC-6: provider subscribe hooks run for subscribed queries and push sequence-checked keyed
     // deltas through ctx:push_delta.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6411,6 +6575,82 @@ return R"#;
             out["plain"],
             json!([{ "id": "a", "n": 3 }, { "id": "c", "n": 2 }])
         );
+    }
+
+    // F1b: a provider declaring `projection = true` and a record output contract with
+    // required fields may honour a pushed projection without failing its own contract; fields
+    // it does return are still checked.
+    #[tokio::test]
+    async fn pushed_projection_is_checked_against_the_projected_contract() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions.insert(
+            "test.typed".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.data_provider { id = "test.typed", pushdown = { projection = true },
+  output = dash.list(dash.object { id = dash.string(), n = dash.number(), title = dash.string() }) }"#,
+                r#"local ROWS = { { id = "a", n = 1, title = "A" }, { id = "b", n = 2, title = "B" } }
+local R = {}
+function R.query(ctx)
+    local pd = ctx.query._pushdown
+    if pd == nil or pd.fields == nil then return ROWS end
+    local out = {}
+    for _, r in ipairs(ROWS) do
+        local row = {}
+        for _, f in ipairs(pd.fields) do row[f] = r[f] end
+        if ctx.query.corrupt then row.n = "not a number" end
+        table.insert(out, row)
+    end
+    return out
+end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "typed".into(),
+            instance(
+                "typed",
+                DefinitionCategory::DataProvider,
+                "test.typed",
+                &[],
+                json!({}),
+            ),
+        );
+        provider(
+            &mut g,
+            "consumer",
+            "test.consumer",
+            &[("typed", "typed")],
+            r#"local R = {}
+function R.query(ctx)
+    return ctx:await(ctx.inputs.typed:query({ corrupt = ctx.query.corrupt, _pushdown = { fields = ctx.query.fields } }))
+end
+return R"#,
+        );
+        let (_e, q) = engine_for(g, ResourceBudget::default());
+        let admin = Principal::administrator();
+        let out = q
+            .query("consumer", json!({ "fields": ["id"] }), &admin, false)
+            .await
+            .unwrap();
+        assert_eq!(out.status, QueryStatus::Fresh, "{out:?}");
+        assert_eq!(out.value.unwrap(), json!([{ "id": "a" }, { "id": "b" }]));
+        let bad = q
+            .query(
+                "consumer",
+                json!({ "fields": ["id", "n"], "corrupt": true }),
+                &admin,
+                false,
+            )
+            .await;
+        let msg = match bad {
+            Ok(env) => env.error.unwrap_or_default(),
+            Err(e) => e,
+        };
+        assert!(msg.contains("output contract violation"), "{msg}");
     }
 
     #[test]

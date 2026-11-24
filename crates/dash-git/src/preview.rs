@@ -1177,7 +1177,7 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
             }
             let rec = engine
                 .actions
-                .dispatch_widget_request_outcome(
+                .dispatch_widget_request_scripted(
                     WidgetRequestEnvelope {
                         protocol: "dash.widget/1".into(),
                         dashboard_id: req.dashboard.clone(),
@@ -1188,6 +1188,7 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                         kind: "request".into(),
                         request: req.request.clone(),
                         payload: req.payload.clone(),
+                        dry_run_token: None,
                     },
                     &admin,
                 )

@@ -278,6 +278,45 @@ async fn draft_graph_masks_secret_names_outside_the_agent_ceiling() {
     assert!(!active["instances"].to_string().contains("github-work"));
 }
 
+/// F6: capability_explain (MCP, any authenticated Principal) masks secret names outside the
+/// caller's ceiling like the other instance views.
+#[tokio::test]
+async fn capability_explain_masks_secret_names_outside_the_ceiling() {
+    let srv = boot().await;
+    let g = srv.services.graph();
+    let (target, slot) = g
+        .instances
+        .iter()
+        .find_map(|(id, i)| {
+            i.secrets
+                .iter()
+                .find(|(_, v)| v.contains("github-work"))
+                .map(|(k, _)| (id.clone(), k.clone()))
+        })
+        .expect("an Instance bound to secret://github-work");
+    let agent = dash_core::Principal {
+        id: "agt_explain".into(),
+        kind: dash_core::PrincipalKind::Agent,
+        ceiling: CapabilityCeiling {
+            allowed_secrets: ["jira-work".to_string()].into_iter().collect(),
+            ..Default::default()
+        },
+    };
+    let out = srv.services.capability_explain(&target, &agent);
+    assert!(
+        !out.to_string().contains("github-work"),
+        "out-of-ceiling secret name leaked: {out}"
+    );
+    assert_eq!(out["instance"]["secrets"][&slot], "secret://[hidden]");
+    let admin = srv
+        .services
+        .capability_explain(&target, &dash_core::Principal::administrator());
+    assert!(admin["instance"]["secrets"][&slot]
+        .as_str()
+        .unwrap()
+        .contains("github-work"));
+}
+
 // ---- R5:SRV-6 -------------------------------------------------------------------------------
 
 #[tokio::test]

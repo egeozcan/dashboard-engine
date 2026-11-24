@@ -721,3 +721,58 @@ async fn repeated_automation_timeouts_trip_the_circuit_breaker() {
         .unwrap_or("")
         .contains("circuit_open"));
 }
+
+/// F2: whether an attempt is retried is decided by the host (open breaker, action outcome not
+/// known yet), never by matching tokens in error text that upstream systems or scripts control.
+#[tokio::test]
+async fn retries_do_not_depend_on_error_text() {
+    // An upstream failure whose message happens to contain the non-retryable codes.
+    let store = granted_store();
+    let mut g = test_graph();
+    g.definitions.insert(
+        "test.failing".into(),
+        load_def(
+            FAILING_ACT,
+            r#"local R = {}
+function R.execute(ctx) error("remote API said circuit_open / action_outcome_pending") end
+return R"#,
+        ),
+    );
+    let engine = engine_with(g, &store, ResourceBudget::default());
+    engine
+        .events
+        .emit("src", "test.fail_me", "1", "tr", true, json!({ "n": 1 }))
+        .unwrap();
+    engine.automations.drain_durable_events().await;
+    let runs = engine
+        .automations
+        .list_executions(Some("failing_auto"), 10)
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "failed");
+    assert_eq!(runs[0].attempts, 3, "{:?}", runs[0].error);
+
+    // A handler cannot skip its retries by raising a forged code either.
+    let store = granted_store();
+    let mut g = test_graph();
+    g.definitions.insert(
+        "test.failing_auto".into(),
+        load_def(
+            FAILING_AUTO,
+            r#"local R = {}
+function R.run(ctx) error("action_outcome_pending: forged") end
+return R"#,
+        ),
+    );
+    let engine = engine_with(g, &store, ResourceBudget::default());
+    engine
+        .events
+        .emit("src", "test.fail_me", "1", "tr", true, json!({ "n": 2 }))
+        .unwrap();
+    engine.automations.drain_durable_events().await;
+    let runs = engine
+        .automations
+        .list_executions(Some("failing_auto"), 10)
+        .unwrap();
+    assert_eq!(runs[0].attempts, 3, "{:?}", runs[0].error);
+}

@@ -99,23 +99,32 @@ pub struct VaultKeySource {
     /// Explicit Administrator opt-in to a plaintext key co-located with the ciphertext
     /// (`DASH_ALLOW_COLOCATED_VAULT_KEY`). Without it such a key is refused (§5.2).
     pub allow_colocated: bool,
+    /// The same opt-in limited to key files inside the system temporary directory
+    /// (`DASH_ALLOW_COLOCATED_VAULT_KEY_IN_TEMP`): set by the repository's `.cargo/config.toml`
+    /// for throwaway test data directories, so a `cargo run -- serve` on a real data directory
+    /// still gets the §5.2 refusal.
+    pub allow_colocated_in_temp: bool,
 }
 
 impl VaultKeySource {
     pub fn from_env() -> Self {
         let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let flag = |k: &str| {
+            non_empty(k).is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        };
         Self {
             master_key: non_empty("DASH_MASTER_KEY"),
             key_file: non_empty("DASH_MASTER_KEY_FILE").map(PathBuf::from),
             passphrase: std::env::var("DASH_VAULT_PASSPHRASE")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            allow_colocated: non_empty("DASH_ALLOW_COLOCATED_VAULT_KEY").is_some_and(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            }),
+            allow_colocated: flag("DASH_ALLOW_COLOCATED_VAULT_KEY"),
+            allow_colocated_in_temp: flag("DASH_ALLOW_COLOCATED_VAULT_KEY_IN_TEMP"),
         }
     }
 }
@@ -298,7 +307,9 @@ impl SecretVault {
         };
         let passphrase = source.passphrase.as_deref();
         let path_str = key_path.to_string_lossy().to_string();
-        if passphrase.is_none() && !external && !source.allow_colocated {
+        let allow_colocated = source.allow_colocated
+            || (source.allow_colocated_in_temp && path_is_within(&key_path, &std::env::temp_dir()));
+        if passphrase.is_none() && !external && !allow_colocated {
             // Neither create nor use a plaintext key next to the ciphertext (§5.2).
             return Err(VaultError::ColocatedKeyRefused { path: path_str });
         }
@@ -543,6 +554,36 @@ mod tests {
             allow_colocated: true,
             ..Default::default()
         }
+    }
+
+    // F3: the development/test opt-in (`.cargo/config.toml`) covers throwaway data directories
+    // in the system temporary directory only, never a real data directory served from source.
+    #[test]
+    fn temp_only_colocated_opt_in_is_limited_to_the_temp_dir() {
+        let src = VaultKeySource {
+            allow_colocated_in_temp: true,
+            ..Default::default()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let v = SecretVault::load_with(tmp.path(), &src).unwrap();
+        assert!(matches!(
+            v.key_protection(),
+            KeyProtection::UnprotectedColocated { .. }
+        ));
+        let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("vault-optin-{}", std::process::id()));
+        if !path_is_within(&real, &std::env::temp_dir()) {
+            let Err(err) = SecretVault::load_with(&real, &src) else {
+                panic!("a co-located key outside the temp dir must be refused");
+            };
+            assert!(
+                matches!(err, VaultError::ColocatedKeyRefused { .. }),
+                "{err}"
+            );
+            assert!(!real.join("vault.key").exists());
+        }
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     // R8:SC-10: without a key source that separates key and ciphertext, and without the explicit

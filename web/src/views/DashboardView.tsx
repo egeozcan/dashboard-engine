@@ -155,7 +155,9 @@ export const DashboardView: React.FC = () => {
     }
   };
 
-  const envelopeFor = (ctx: WidgetRequestContext) => ({
+  // `dryRunToken` binds the dispatch to the Dry run the user saw (or skipped confirming for a
+  // refresh): the server refuses a dispatch that resolves differently (R7:SEC-1).
+  const envelopeFor = (ctx: WidgetRequestContext, dryRunToken?: string | null) => ({
     protocol: "dash.widget/1",
     dashboard_id: activeId,
     adapter_instance: ctx.adapterInstance,
@@ -165,9 +167,10 @@ export const DashboardView: React.FC = () => {
     kind: "request",
     request: ctx.request,
     payload: ctx.payload,
+    ...(dryRunToken ? { dry_run_token: dryRunToken } : {}),
   });
 
-  const executeWidgetRequest = async (ctx: WidgetRequestContext) => {
+  const executeWidgetRequest = async (ctx: WidgetRequestContext, dryRunToken?: string | null) => {
     try {
       const exec = await apiFetch<{
         outcome?: "action" | "refreshed";
@@ -176,7 +179,7 @@ export const DashboardView: React.FC = () => {
         refreshed?: string[];
       }>("/api/widget-request", {
         method: "POST",
-        body: JSON.stringify(envelopeFor(ctx)),
+        body: JSON.stringify(envelopeFor(ctx, dryRunToken)),
       });
       setBanner(
         exec.outcome === "refreshed" || !exec.execution_id
@@ -204,7 +207,7 @@ export const DashboardView: React.FC = () => {
       return;
     }
     if (!dryRun.requires_confirmation) {
-      await executeWidgetRequest(ctx);
+      await executeWidgetRequest(ctx, dryRun.dry_run_token);
       return;
     }
     setPendingRequest({ ctx, dryRun });
@@ -528,7 +531,7 @@ export const DashboardView: React.FC = () => {
           const choice = dlg.returnValue;
           dlg.returnValue = "";
           if (choice === "confirm" && pendingRequest) {
-            void executeWidgetRequest(pendingRequest.ctx);
+            void executeWidgetRequest(pendingRequest.ctx, pendingRequest.dryRun.dry_run_token);
           }
           setPendingRequest(null);
         }}

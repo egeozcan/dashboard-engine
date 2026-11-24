@@ -251,6 +251,35 @@ impl SchemaSpec {
         self.validate_at("$", val)
     }
 
+    /// The schema of this (list or record) output after a projection to `fields`: record
+    /// fields outside the projection are dropped, so rows the provider projected itself
+    /// (`pushdown = { projection = true }`) are checked against what remains of the contract.
+    pub fn projected(&self, fields: &[String]) -> SchemaSpec {
+        match self {
+            Self::List { item } => Self::List {
+                item: Box::new(item.projected(fields)),
+            },
+            Self::Optional { inner } => Self::Optional {
+                inner: Box::new(inner.projected(fields)),
+            },
+            Self::Object { fields: declared } => Self::Object {
+                fields: declared
+                    .iter()
+                    .filter(|(k, _)| fields.iter().any(|f| f == *k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            },
+            Self::Semantic {
+                semantic_type,
+                shape,
+            } => Self::Semantic {
+                semantic_type: semantic_type.clone(),
+                shape: shape.as_ref().map(|s| Box::new(s.projected(fields))),
+            },
+            other => other.clone(),
+        }
+    }
+
     fn validate_at(&self, path: &str, val: &serde_json::Value) -> Result<(), String> {
         match self {
             Self::Any => Ok(()),

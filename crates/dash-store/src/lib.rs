@@ -359,12 +359,20 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Open or create a persistent SQLite database in WAL mode inside `data_dir`.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::open_with_key_source(data_dir, &vault::VaultKeySource::from_env())
+    }
+
+    /// [`SqliteStore::open`] with an explicit vault key source instead of the environment.
+    pub fn open_with_key_source(
+        data_dir: &Path,
+        key_source: &vault::VaultKeySource,
+    ) -> Result<Self, StoreError> {
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("dash.db");
         let conn = Connection::open(&db_path)?;
         migrations::run_migrations(&conn)?;
         Self::ensure_action_ledger_schema(&conn)?;
-        let vault = SecretVault::load_or_create(data_dir)?;
+        let vault = SecretVault::load_with(data_dir, key_source)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: Some(db_path),
@@ -531,95 +539,96 @@ impl SqliteStore {
             validate_credential_scheme(scheme).map_err(StoreError::InvalidInput)?;
         }
         let now = Utc::now().to_rfc3339();
-        let (key_version, created_at, prev) = self.with_conn_sync(|conn| {
-            let existing: Option<(i64, String, String, String, String, String)> = conn
-                .query_row(
-                    "SELECT key_version, created_at, allowed_hosts_json, credential_scheme,
-                            description, allowed_bindings_json
-                     FROM secret_metadata WHERE name = ?1",
-                    params![name],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            match existing {
-                Some((v, c, h, sc, d, b)) => Ok((
-                    v + 1,
-                    c,
-                    (
-                        serde_json::from_str::<Vec<String>>(&h).unwrap_or_default(),
-                        sc,
-                        d,
-                        serde_json::from_str::<Vec<String>>(&b).unwrap_or_default(),
-                    ),
-                )),
-                None => Ok((
-                    1_i64,
-                    now.clone(),
-                    (
-                        Vec::new(),
-                        default_credential_scheme(),
-                        String::new(),
-                        Vec::new(),
-                    ),
-                )),
-            }
-        })?;
-        let (prev_hosts, prev_scheme, prev_description, prev_bindings) = prev;
-        let hosts: Vec<String> = update
-            .allowed_hosts
-            .map(|h| h.to_vec())
-            .unwrap_or(prev_hosts);
-        let scheme: String = update
-            .credential_scheme
-            .map(str::to_string)
-            .unwrap_or(prev_scheme);
-        let description: String = update
-            .description
-            .map(str::to_string)
-            .unwrap_or(prev_description);
-        let allowed_bindings: Vec<String> = update
-            .allowed_bindings
-            .map(|b| b.to_vec())
-            .unwrap_or(prev_bindings);
-        let hosts_json = serde_json::to_string(&hosts)?;
-        let allowed_json = serde_json::to_string(&allowed_bindings)?;
-        let (nonce, ciphertext) = self.vault.encrypt(name, key_version, plaintext)?;
-        self.with_conn_sync(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute(
-                "INSERT INTO secret_metadata (name, description, key_version, allowed_bindings_json, created_at, updated_at, allowed_hosts_json, credential_scheme)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(name) DO UPDATE SET
-                    description = excluded.description,
-                    key_version = excluded.key_version,
-                    allowed_bindings_json = excluded.allowed_bindings_json,
-                    updated_at = excluded.updated_at,
-                    allowed_hosts_json = excluded.allowed_hosts_json,
-                    credential_scheme = excluded.credential_scheme",
-                params![name, description, key_version, allowed_json, created_at, now, hosts_json, scheme],
-            )?;
-            tx.execute(
-                "INSERT INTO encrypted_secret_blobs (name, key_version, nonce, ciphertext, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(name) DO UPDATE SET
-                    key_version = excluded.key_version,
-                    nonce = excluded.nonce,
-                    ciphertext = excluded.ciphertext,
-                    updated_at = excluded.updated_at",
-                params![name, key_version, nonce, ciphertext, now],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })?;
+        // Read the stored policy, compute the next key version and write, all in one immediate
+        // transaction under the connection lock: a concurrent rotation can neither undo a policy
+        // change committed in between nor reuse the same key version.
+        let (key_version, created_at, hosts, scheme, description, allowed_bindings) =
+            self.with_conn_sync(|conn| {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let existing: Option<(i64, String, String, String, String, String)> = tx
+                    .query_row(
+                        "SELECT key_version, created_at, allowed_hosts_json, credential_scheme,
+                                description, allowed_bindings_json
+                         FROM secret_metadata WHERE name = ?1",
+                        params![name],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let (key_version, created_at, prev_hosts, prev_scheme, prev_description, prev_bindings) =
+                    match existing {
+                        Some((v, c, h, sc, d, b)) => (
+                            v + 1,
+                            c,
+                            serde_json::from_str::<Vec<String>>(&h).unwrap_or_default(),
+                            sc,
+                            d,
+                            serde_json::from_str::<Vec<String>>(&b).unwrap_or_default(),
+                        ),
+                        None => (
+                            1_i64,
+                            now.clone(),
+                            Vec::new(),
+                            default_credential_scheme(),
+                            String::new(),
+                            Vec::new(),
+                        ),
+                    };
+                let hosts: Vec<String> = update
+                    .allowed_hosts
+                    .map(|h| h.to_vec())
+                    .unwrap_or(prev_hosts);
+                let scheme: String = update
+                    .credential_scheme
+                    .map(str::to_string)
+                    .unwrap_or(prev_scheme);
+                let description: String = update
+                    .description
+                    .map(str::to_string)
+                    .unwrap_or(prev_description);
+                let allowed_bindings: Vec<String> = update
+                    .allowed_bindings
+                    .map(|b| b.to_vec())
+                    .unwrap_or(prev_bindings);
+                let hosts_json = serde_json::to_string(&hosts)?;
+                let allowed_json = serde_json::to_string(&allowed_bindings)?;
+                let (nonce, ciphertext) = self.vault.encrypt(name, key_version, plaintext)?;
+                tx.execute(
+                    "INSERT INTO secret_metadata (name, description, key_version, allowed_bindings_json, created_at, updated_at, allowed_hosts_json, credential_scheme)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(name) DO UPDATE SET
+                        description = excluded.description,
+                        key_version = excluded.key_version,
+                        allowed_bindings_json = excluded.allowed_bindings_json,
+                        updated_at = excluded.updated_at,
+                        allowed_hosts_json = excluded.allowed_hosts_json,
+                        credential_scheme = excluded.credential_scheme",
+                    params![name, description, key_version, allowed_json, created_at, now, hosts_json, scheme],
+                )?;
+                tx.execute(
+                    "INSERT INTO encrypted_secret_blobs (name, key_version, nonce, ciphertext, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(name) DO UPDATE SET
+                        key_version = excluded.key_version,
+                        nonce = excluded.nonce,
+                        ciphertext = excluded.ciphertext,
+                        updated_at = excluded.updated_at",
+                    params![name, key_version, nonce, ciphertext, now],
+                )?;
+                tx.commit()?;
+                Ok((key_version, created_at, hosts, scheme, description, allowed_bindings))
+            })?;
         Ok(SecretMetadata {
             name: name.to_string(),
             description,
@@ -3235,6 +3244,49 @@ mod tests {
             .set_secret_value("new", "x", SecretPolicyUpdate::default())
             .unwrap();
         assert!(fresh.allowed_bindings.is_empty() && fresh.description.is_empty());
+    }
+
+    // F6: concurrent writes of one secret are serialized read-modify-writes: a plain rotation
+    // never undoes a policy tightening committed meanwhile, and no key version repeats.
+    #[test]
+    fn concurrent_rotations_do_not_lose_policy_changes_or_reuse_key_versions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .set_secret_value("gh", "v0", SecretPolicyUpdate::default())
+            .unwrap();
+        let rotations = 64;
+        let rotator = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                (0..rotations)
+                    .map(|i| {
+                        store
+                            .set_secret_value("gh", &format!("r{i}"), SecretPolicyUpdate::default())
+                            .unwrap()
+                            .key_version
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let tightened = vec!["github_reader".to_string()];
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let t = store
+            .set_secret_value(
+                "gh",
+                "tight",
+                SecretPolicyUpdate {
+                    allowed_bindings: Some(&tightened),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut versions = rotator.join().unwrap();
+        versions.push(t.key_version);
+        versions.sort();
+        let n = versions.len();
+        versions.dedup();
+        assert_eq!(versions.len(), n, "key versions repeated");
+        assert_eq!(store.list_secrets().unwrap()[0].allowed_bindings, tightened);
     }
 
     #[test]

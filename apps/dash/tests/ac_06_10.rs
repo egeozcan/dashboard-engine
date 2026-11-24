@@ -1357,19 +1357,18 @@ async fn ac08_dashboard_and_polling_merges_emit_the_same_event_type() {
 
     // Dashboard merge of #42 through the Table widget's Request.
     s.dashboard_get("engineering", &admin()).await.unwrap();
-    let rec = s
-        .dispatch_widget_request(
-            widget_request(
-                s,
-                "pr_table_adapter",
-                "pr_table_adapter_pr_table",
-                "merge_requested",
-                json!({"repository": PLATFORM, "number": 42, "jira_key": "DEV-123"}),
-            ),
-            &admin(),
-        )
-        .await
-        .unwrap();
+    let merge = confirmed(
+        s,
+        widget_request(
+            s,
+            "pr_table_adapter",
+            "pr_table_adapter_pr_table",
+            "merge_requested",
+            json!({"repository": PLATFORM, "number": 42, "jira_key": "DEV-123"}),
+        ),
+    )
+    .await;
+    let rec = s.dispatch_widget_request(merge, &admin()).await.unwrap();
     assert_eq!(rec.status, "succeeded", "{rec:?}");
     assert_eq!(up.merges(), vec!["acme/platform#42".to_string()]);
 
@@ -1544,7 +1543,21 @@ fn widget_request(
         kind: "request".into(),
         request: request.into(),
         payload,
+        dry_run_token: None,
     }
+}
+
+/// The UI flow: Dry run the Request, then dispatch it carrying the Dry run's token (R7:SEC-1).
+async fn confirmed(
+    s: &AppServices,
+    mut req: dash_core::WidgetRequestEnvelope,
+) -> dash_core::WidgetRequestEnvelope {
+    req.dry_run_token = s
+        .widget_request_dry_run(req.clone(), &admin())
+        .await
+        .unwrap()
+        .dry_run_token;
+    req
 }
 
 // =============================================================================================
@@ -2405,19 +2418,18 @@ async fn ac10_widget_requests_with_stale_generation_or_unbound_widget_are_reject
     assert!(executions(&app, "merge_pr").is_empty());
 
     // Positive control: the same Request on the current Generation and bound widget succeeds.
-    let ok = s
-        .dispatch_widget_request(
-            widget_request(
-                s,
-                "pr_table_adapter",
-                "pr_table_adapter_pr_table",
-                "merge_requested",
-                payload,
-            ),
-            &admin(),
-        )
-        .await
-        .unwrap();
+    let merge = confirmed(
+        s,
+        widget_request(
+            s,
+            "pr_table_adapter",
+            "pr_table_adapter_pr_table",
+            "merge_requested",
+            payload,
+        ),
+    )
+    .await;
+    let ok = s.dispatch_widget_request(merge, &admin()).await.unwrap();
     assert_eq!(ok.status, "succeeded");
     assert_eq!(up.merges(), vec!["acme/platform#42".to_string()]);
 }

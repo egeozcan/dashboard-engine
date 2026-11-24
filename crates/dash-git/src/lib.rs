@@ -326,7 +326,15 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
         assert!(!rel_ws.is_absolute() && !rel_data.is_absolute());
 
         copy_fixture_ws(&rel_ws);
-        let store = SqliteStore::open(&rel_data).unwrap();
+        // A throwaway data directory outside the system temp dir: opt in explicitly.
+        let store = SqliteStore::open_with_key_source(
+            &rel_data,
+            &dash_store::vault::VaultKeySource {
+                allow_colocated: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mgr = DraftManager::initialize_with_mocks(
             rel_ws,
             rel_data,

@@ -840,7 +840,12 @@ impl AppServices {
                 "ceiling": principal.ceiling,
             },
             "target": target,
-            "instance": inst,
+            "instance": inst.map(|i| {
+                // Secret names outside the caller's ceiling stay hidden (§5.2, §11.1).
+                let mut one = serde_json::json!({ target: i });
+                mask_instance_secrets(principal, &mut one);
+                one[target].take()
+            }),
         });
         let Some(i) = inst else {
             out["action_authority"] = serde_json::json!({

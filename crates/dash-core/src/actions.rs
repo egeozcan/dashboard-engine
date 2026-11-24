@@ -120,6 +120,11 @@ pub struct WidgetRequestEnvelope {
     pub kind: String, // "request"
     pub request: String,
     pub payload: serde_json::Value,
+    /// Token returned by this Request's Dry run (`dry_run_widget_request`). An Adapter with
+    /// `on_request` may resolve a dispatch to an action only under a token whose Dry run resolved
+    /// to that same action call, or whose unresolved Dry run the user confirmed (R7:SEC-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run_token: Option<String>,
 }
 
 /// Result of dispatching a widget Request: either a real, durable action execution, or a refresh
@@ -205,9 +210,11 @@ struct RenderedWidgets {
     widgets: HashMap<String, String>,
 }
 
-/// How a widget Request resolved in its Dry run (`dry_run_widget_request`). Remembered per
-/// Principal and Request so the real dispatch cannot diverge from what the UI showed: the UI skips
-/// the confirmation for a refresh, and confirms exactly one action call otherwise (R7:SEC-1).
+/// What a widget Request dispatch through an Adapter's `on_request` may resolve to (R7:SEC-1).
+///
+/// The dispatch is bound to the Dry run the UI showed through the single-use token that Dry run
+/// returned: the UI skips the confirmation for a refresh, and confirms exactly one action call
+/// otherwise. The binding fails closed: a dispatch without a valid token may only refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DryRunResolution {
     /// Dispatched without confirmation: the dispatch may not run any action or mutating
@@ -218,6 +225,8 @@ enum DryRunResolution {
         action_instance: String,
         args_digest: String,
     },
+    /// No Dry run token: nothing was confirmed, so the dispatch may only refresh.
+    Unconfirmed,
 }
 
 impl DryRunResolution {
@@ -227,19 +236,31 @@ impl DryRunResolution {
             Self::Action {
                 action_instance, ..
             } => format!("action '{action_instance}' with the confirmed arguments"),
+            Self::Unconfirmed => {
+                "nothing the user confirmed (the dispatch carries no dry_run_token)".into()
+            }
         }
     }
 }
 
+/// One Dry run of a widget Request, remembered under the token it returned.
 #[derive(Debug, Clone)]
 struct WidgetDryRunBinding {
-    resolution: DryRunResolution,
+    /// [`widget_dry_run_key`] of the Request the token was issued for.
+    key: String,
+    /// `None`: the Dry run could not resolve the Request, so the UI asked the user to confirm
+    /// it as is; the dispatch is then not constrained further.
+    resolution: Option<DryRunResolution>,
     at: Instant,
+    /// `sequence` of the dispatch that used the token; only a retransmission of that same
+    /// dispatch (deduplicated by its idempotency key) may present it again.
+    used_by: Option<u64>,
 }
 
-/// How long a widget Request's Dry-run resolution constrains its dispatch.
+/// How long a widget Request's Dry-run token stays valid.
 const WIDGET_DRY_RUN_BINDING_TTL: Duration = Duration::from_secs(15 * 60);
-/// Bound on remembered Dry-run resolutions (§20: no unbounded caches); oldest evicted first.
+/// Bound on remembered Dry-run tokens (§20: no unbounded caches); oldest evicted first. An
+/// evicted token is refused at dispatch (fail closed).
 const MAX_WIDGET_DRY_RUN_BINDINGS: usize = 4096;
 
 /// Built-in widget types whose host-rendered UI sends Requests; the Request name is the one the
@@ -272,7 +293,8 @@ pub struct ActionManager {
     rendered_widgets: Arc<DashMap<String, RenderedWidgets>>,
     /// Single-flight guard for reconcile attempts in this process.
     reconcile_inflight: Arc<DashMap<String, ()>>,
-    /// Dry-run resolution of recent widget Requests, keyed by [`widget_dry_run_key`].
+    /// Dry-run resolution of recent widget Requests, keyed by the single-use token each Dry run
+    /// returned.
     widget_dry_runs: Arc<DashMap<String, WidgetDryRunBinding>>,
 }
 
@@ -329,6 +351,8 @@ impl SideEffectTracker {
 enum RunError {
     Runtime(RuntimeError),
     Injected(String),
+    /// The Instance's circuit breaker is open: no Luau code ran (§15.2, ADR-0003).
+    CircuitOpen(String),
 }
 
 struct Classified {
@@ -386,13 +410,12 @@ impl ActionManager {
         }
     }
 
-    /// Remember how a widget Request resolved in its Dry run (`None` forgets: an unresolved Dry
-    /// run is always confirmed, so it does not constrain the dispatch).
-    fn remember_widget_dry_run(&self, key: String, resolution: Option<DryRunResolution>) {
-        let Some(resolution) = resolution else {
-            self.widget_dry_runs.remove(&key);
-            return;
-        };
+    /// Remember how a widget Request resolved in its Dry run and return the single-use token
+    /// its dispatch must present (`None`: unresolved, so the UI confirms it as is). Every Dry
+    /// run gets its own token, so a later Dry run of the same Request never changes what an
+    /// earlier one bound its dispatch to.
+    fn remember_widget_dry_run(&self, key: String, resolution: Option<DryRunResolution>) -> String {
+        let token = format!("wdr_{}", Uuid::new_v4().simple());
         if self.widget_dry_runs.len() >= MAX_WIDGET_DRY_RUN_BINDINGS {
             self.widget_dry_runs
                 .retain(|_, b| b.at.elapsed() < WIDGET_DRY_RUN_BINDING_TTL);
@@ -411,22 +434,97 @@ impl ActionManager {
             }
         }
         self.widget_dry_runs.insert(
-            key,
+            token.clone(),
             WidgetDryRunBinding {
+                key,
                 resolution,
                 at: Instant::now(),
+                used_by: None,
             },
         );
+        token
     }
 
-    /// The unexpired Dry-run resolution a dispatch of `key` must match, if any.
-    fn widget_dry_run_constraint(&self, key: &str) -> Option<DryRunResolution> {
-        let binding = self.widget_dry_runs.get(key)?.clone();
-        if binding.at.elapsed() >= WIDGET_DRY_RUN_BINDING_TTL {
-            self.widget_dry_runs.remove(key);
-            return None;
+    /// What the dispatch of `req` may resolve to (fails closed). The presented token is single
+    /// use (a retransmission of the dispatch that used it excepted); an unknown, expired,
+    /// evicted, used or foreign token is refused, and no token at all permits only a refresh.
+    /// `Ok(None)`: the user confirmed an unresolved Dry run.
+    fn widget_dispatch_constraint(
+        &self,
+        principal: &Principal,
+        req: &WidgetRequestEnvelope,
+    ) -> Result<Option<DryRunResolution>, String> {
+        let Some(token) = req.dry_run_token.as_deref() else {
+            return Ok(Some(DryRunResolution::Unconfirmed));
+        };
+        let refused = || {
+            format!(
+                "dry_run_token for widget Request '{}' from '{}' is unknown, expired, already used or \
+                 was issued for a different Request; run the Dry run again",
+                req.request, req.widget_id
+            )
+        };
+        let mut binding = self.widget_dry_runs.get_mut(token).ok_or_else(refused)?;
+        if binding.at.elapsed() >= WIDGET_DRY_RUN_BINDING_TTL
+            || binding.key != widget_dry_run_key(principal, req)
+            || binding.used_by.is_some_and(|seq| seq != req.sequence)
+        {
+            return Err(refused());
         }
-        Some(binding.resolution)
+        binding.used_by = Some(req.sequence);
+        Ok(binding.resolution.clone())
+    }
+
+    /// Run one handler of an action-path Instance (`execute`, `dry_run`, `reconcile`, an
+    /// Adapter's `on_request`) under that Instance's circuit breaker (§15.2, ADR-0003): repeated
+    /// timeouts or memory violations open it, and runs then fail fast instead of burning wall
+    /// time. `isolated` runs in a fresh, uncached VM (see [`VmPool::execute_handler_isolated`]).
+    async fn execute_guarded(
+        &self,
+        breaker_key: &str,
+        bundle: &CompiledInstanceBundle,
+        handler: &str,
+        cfg: ExecutionContextConfig,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        isolated: bool,
+    ) -> Result<serde_json::Value, RunError> {
+        let admission = self.queries.breaker_admit(breaker_key);
+        if let crate::query_engine::Admission::Rejected { .. } = admission {
+            return Err(RunError::CircuitOpen(format!(
+                "{}: circuit breaker open for '{breaker_key}' after repeated runtime faults \
+                 (timeouts or memory violations); not executed",
+                crate::automations::CIRCUIT_OPEN_CODE
+            )));
+        }
+        let inherited = dash_luau::current_execution_deadline();
+        let started = Instant::now();
+        // Boxed: the handler future is large, and action paths nest (nested actions, widget
+        // Requests), so keep it off the polling task's stack.
+        let res = if isolated {
+            Box::pin(
+                self.pool
+                    .execute_handler_isolated(bundle, handler, cfg, cancel_flag),
+            )
+            .await
+        } else {
+            Box::pin(self.pool.execute_handler(bundle, handler, cfg, cancel_flag)).await
+        };
+        self.queries.record_runtime_outcome_within(
+            breaker_key,
+            admission,
+            &res,
+            inherited,
+            started,
+        );
+        res.map_err(RunError::Runtime)
+    }
+
+    /// Redacted message of a failed handler run.
+    fn run_error_message(&self, e: RunError) -> String {
+        match e {
+            RunError::Runtime(e) => self.store.redactor().redact_str(&e.to_string()),
+            RunError::Injected(m) | RunError::CircuitOpen(m) => m,
+        }
     }
 
     /// Refuse a dispatch whose resolution diverges from its Dry run (audited).
@@ -438,7 +536,7 @@ impl ActionManager {
         got: &str,
     ) -> String {
         let reason = format!(
-            "widget Request '{}' from '{}' resolved to {got} at dispatch, but its Dry run resolved to {}; \
+            "widget Request '{}' from '{}' resolved to {got} at dispatch, but what was confirmed is {}; \
              refusing to run what the user did not confirm (run the Dry run again)",
             req.request,
             req.widget_id,
@@ -576,8 +674,8 @@ impl ActionManager {
                 resolved_libraries: g.resolved_libraries(),
             };
             let run = self
-                .pool
-                .execute_handler(
+                .execute_guarded(
+                    &inst.id,
                     &bundle,
                     dry_handler,
                     ExecutionContextConfig {
@@ -594,9 +692,10 @@ impl ActionManager {
                         bridge,
                     },
                     None,
+                    false,
                 )
                 .await
-                .map_err(|e| self.store.redactor().redact_str(&e.to_string()));
+                .map_err(|e| self.run_error_message(e));
             let val = match run {
                 Ok(v) => v,
                 Err(e) => {
@@ -827,7 +926,13 @@ impl ActionManager {
                 cancel_flag,
             };
             let this = self.clone();
-            let handle = tokio::spawn(async move { this.run_admitted(job).await });
+            // The run is detached, but a nested invocation (an action invoking an `action_ref`)
+            // stays nested: it rides on the parent's pool permit and inherits the parent's
+            // remaining deadline instead of queueing for a permit the waiting parent holds. The
+            // scope is captured here, in the caller's task, before the spawn.
+            let handle = tokio::spawn(dash_luau::inherit_execution_scope(Box::pin(async move {
+                this.run_admitted(job).await
+            })));
             match handle.await {
                 Ok(res) => res,
                 Err(join_err) => {
@@ -947,27 +1052,27 @@ impl ActionManager {
                 .map(|e| e.semantic_type.clone())
                 .collect();
 
-            self.pool
-                .execute_handler(
-                    &bundle,
-                    handler,
-                    ExecutionContextConfig {
-                        category: DefinitionCategory::ActionProvider,
-                        instance_id: inst.id.clone(),
-                        input_names: inst.inputs.keys().cloned().collect(),
-                        config: inst.config.clone(),
-                        payload: args.clone(),
-                        operation: None,
-                        idempotency_key: idempotency_key.clone(),
-                        allowed_emits,
-                        now_iso: Utc::now().to_rfc3339(),
-                        trace_id: trace_id.clone(),
-                        bridge,
-                    },
-                    Some(Arc::clone(&cancel_flag)),
-                )
-                .await
-                .map_err(RunError::Runtime)
+            self.execute_guarded(
+                &inst.id,
+                &bundle,
+                handler,
+                ExecutionContextConfig {
+                    category: DefinitionCategory::ActionProvider,
+                    instance_id: inst.id.clone(),
+                    input_names: inst.inputs.keys().cloned().collect(),
+                    config: inst.config.clone(),
+                    payload: args.clone(),
+                    operation: None,
+                    idempotency_key: idempotency_key.clone(),
+                    allowed_emits,
+                    now_iso: Utc::now().to_rfc3339(),
+                    trace_id: trace_id.clone(),
+                    bridge,
+                },
+                Some(Arc::clone(&cancel_flag)),
+                false,
+            )
+            .await
         };
 
         let classified = self.classify(&def, run_res, &tracker);
@@ -1095,7 +1200,7 @@ impl ActionManager {
                     retry_safe: false,
                 }
             }
-            Err(RunError::Injected(msg)) => Classified {
+            Err(RunError::Injected(msg)) | Err(RunError::CircuitOpen(msg)) => Classified {
                 status: "failed",
                 result: None,
                 reason: Some(msg),
@@ -1419,8 +1524,8 @@ impl ActionManager {
         };
 
         let val = self
-            .pool
-            .execute_handler(
+            .execute_guarded(
+                &inst.id,
                 &bundle,
                 reconcile_handler,
                 ExecutionContextConfig {
@@ -1437,9 +1542,10 @@ impl ActionManager {
                     bridge,
                 },
                 None,
+                false,
             )
             .await
-            .map_err(|e| self.store.redactor().redact_str(&e.to_string()));
+            .map_err(|e| self.run_error_message(e));
 
         let (next_status, attempt_error): (&str, Option<String>) = match &val {
             Ok(v) => match v.get("status").and_then(|s| s.as_str()) {
@@ -2062,6 +2168,27 @@ impl ActionManager {
         req: WidgetRequestEnvelope,
         principal: &Principal,
     ) -> Result<WidgetRequestOutcome, String> {
+        // Boxed: the dispatch future is large and callers (Preview steps, HTTP, WS) are deep.
+        Box::pin(self.dispatch_widget_request_mode(req, principal, false)).await
+    }
+
+    /// Dispatch a widget Request scripted by a Definition or Scenario test step (Preview), not
+    /// sent by a browser or API client: no user confirms anything there, so the dispatch is not
+    /// bound to a Dry run token. Never use this for Requests a Client sends.
+    pub async fn dispatch_widget_request_scripted(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+    ) -> Result<WidgetRequestOutcome, String> {
+        Box::pin(self.dispatch_widget_request_mode(req, principal, true)).await
+    }
+
+    async fn dispatch_widget_request_mode(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+        scripted: bool,
+    ) -> Result<WidgetRequestOutcome, String> {
         let (g, adapter_inst, adapter_def) = self
             .validate_widget_request_binding(&req, principal)
             .await?;
@@ -2080,6 +2207,7 @@ impl ActionManager {
                 &trace_id,
                 &span_id,
                 derived_key,
+                scripted,
             )
             .await;
         self.telemetry.record_span_with_id(
@@ -2113,6 +2241,7 @@ impl ActionManager {
         trace_id: &str,
         span_id: &str,
         derived_key: String,
+        scripted: bool,
     ) -> Result<WidgetRequestOutcome, String> {
         let child_ctx = || InvocationContext {
             parent_execution_id: None,
@@ -2147,8 +2276,31 @@ impl ActionManager {
         };
 
         // The Adapter translates the Request into an authorized action call or a refresh (Luau).
-        // When this Request was Dry-run, the dispatch must resolve the same way (R7:SEC-1).
-        let constraint = self.widget_dry_run_constraint(&widget_dry_run_key(principal, req));
+        // The dispatch must resolve the way the Dry run the user saw did; without a valid token
+        // it may only refresh (R7:SEC-1, fail closed).
+        let constraint = if scripted {
+            None
+        } else {
+            match self.widget_dispatch_constraint(principal, req) {
+                Ok(c) => c,
+                Err(reason) => {
+                    let _ = self.store.append_audit(
+                        &principal.id,
+                        principal.kind.as_str(),
+                        "widget_request.dispatch",
+                        &req.adapter_instance,
+                        "denied",
+                        serde_json::json!({
+                            "dashboard_id": req.dashboard_id,
+                            "widget_id": req.widget_id,
+                            "request": req.request,
+                            "reason": reason,
+                        }),
+                    );
+                    return Err(reason);
+                }
+            }
+        };
         let tracker = Arc::new(SideEffectTracker::default());
         let mut bridge = self.bridge(
             g,
@@ -2170,9 +2322,11 @@ impl ActionManager {
             config_digest: adapter_inst.config_digest(),
             resolved_libraries: g.resolved_libraries(),
         };
+        // Dry run and dispatch both evaluate `on_request` in a fresh VM, so no module-local
+        // state (e.g. a call counter or a flag set by `render`) tells the two apart.
         let val = self
-            .pool
-            .execute_handler(
+            .execute_guarded(
+                &adapter_inst.id,
                 &bundle,
                 on_req,
                 ExecutionContextConfig {
@@ -2196,9 +2350,10 @@ impl ActionManager {
                     bridge,
                 },
                 None,
+                true,
             )
             .await
-            .map_err(|e| self.store.redactor().redact_str(&e.to_string()))?;
+            .map_err(|e| self.run_error_message(e))?;
 
         if let Some(exec_id) = val.get("execution_id").and_then(|v| v.as_str()) {
             // Only an execution this Request itself created may be reported as its result.
@@ -2537,6 +2692,10 @@ pub struct WidgetRequestDryRun {
     pub dry_run_error: Option<String>,
     /// Whether the UI should ask the Administrator to confirm before dispatching the Request.
     pub requires_confirmation: bool,
+    /// Single-use token the dispatch of this Request must carry (`dry_run_token`) when the
+    /// Adapter resolves Requests through `on_request`: it binds the dispatch to this Dry run.
+    #[serde(default)]
+    pub dry_run_token: Option<String>,
 }
 
 impl ActionManager {
@@ -2565,6 +2724,7 @@ impl ActionManager {
             dry_run: None,
             dry_run_error: None,
             requires_confirmation: true,
+            dry_run_token: None,
         };
 
         let binding_key = widget_dry_run_key(principal, &req);
@@ -2584,16 +2744,17 @@ impl ActionManager {
             );
             bridge.dashboard_id = Some(req.dashboard_id.clone());
             let bridge = Arc::new(bridge);
+            // Same bundle, and a fresh VM like the dispatch's: nothing distinguishes the two.
             let bundle = CompiledInstanceBundle {
-                instance_id: format!("dryrun:{}", adapter_inst.id),
+                instance_id: adapter_inst.id.clone(),
                 manifest: adapter_def.manifest.clone(),
                 runtime_source: adapter_def.runtime_source.clone(),
                 config_digest: adapter_inst.config_digest(),
                 resolved_libraries: g.resolved_libraries(),
             };
             let evaluated = self
-                .pool
-                .execute_handler(
+                .execute_guarded(
+                    &adapter_inst.id,
                     &bundle,
                     on_req,
                     ExecutionContextConfig {
@@ -2617,13 +2778,14 @@ impl ActionManager {
                         bridge,
                     },
                     None,
+                    true,
                 )
                 .await
-                .map_err(|e| self.store.redactor().redact_str(&e.to_string()));
+                .map_err(|e| self.run_error_message(e));
             let val = match evaluated {
                 Ok(v) => v,
                 Err(e) => {
-                    self.remember_widget_dry_run(binding_key, None);
+                    out.dry_run_token = Some(self.remember_widget_dry_run(binding_key, None));
                     out.dry_run_error = Some(format!(
                         "adapter on_request could not be evaluated without side effects: {e}"
                     ));
@@ -2633,7 +2795,7 @@ impl ActionManager {
             if tracker.read_only_refusals.load(Ordering::SeqCst) > 0 {
                 // A side effect was attempted (and refused) while evaluating read-only: whatever
                 // the handler returned after that does not describe the dispatch.
-                self.remember_widget_dry_run(binding_key, None);
+                out.dry_run_token = Some(self.remember_widget_dry_run(binding_key, None));
                 out.dry_run_error = Some(
                     "adapter on_request attempted a side effect (nested action or mutating connector operation) during its read-only evaluation; the Request cannot be resolved without running it"
                         .into(),
@@ -2646,29 +2808,32 @@ impl ActionManager {
                     match resolve_bound_action(&adapter_inst, &adapter_def, &g, action_slot) {
                         Ok(t) => t,
                         Err(e) => {
-                            self.remember_widget_dry_run(binding_key, None);
+                            out.dry_run_token =
+                                Some(self.remember_widget_dry_run(binding_key, None));
                             out.dry_run_error = Some(e);
                             return Ok(out);
                         }
                     };
                 let args = val.get("args").cloned().unwrap_or(req.payload.clone());
-                self.remember_widget_dry_run(
+                out.dry_run_token = Some(self.remember_widget_dry_run(
                     binding_key,
                     Some(DryRunResolution::Action {
                         action_instance: target.clone(),
                         args_digest: args_digest(&args),
                     }),
-                );
+                ));
                 (target, args)
             } else if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
                 || val.get("invalidate").is_some()
             {
-                self.remember_widget_dry_run(binding_key, Some(DryRunResolution::Refresh));
+                out.dry_run_token = Some(
+                    self.remember_widget_dry_run(binding_key, Some(DryRunResolution::Refresh)),
+                );
                 out.resolution = "refresh".into();
                 out.requires_confirmation = false;
                 return Ok(out);
             } else {
-                self.remember_widget_dry_run(binding_key, None);
+                out.dry_run_token = Some(self.remember_widget_dry_run(binding_key, None));
                 out.dry_run_error =
                     Some("adapter on_request handler did not specify an action".into());
                 return Ok(out);
@@ -3287,6 +3452,16 @@ function R.dry_run(ctx)
 end
 return R
 "#;
+    const SPIN_DECL: &str = r#"
+local dash = require("dash")
+return dash.action_provider { id = "t.spin", handler = "execute", dry_run = "dry_run" }
+"#;
+    const SPIN_RT: &str = r#"
+local R = {}
+function R.execute(ctx) while true do end end
+function R.dry_run(ctx) while true do end end
+return R
+"#;
     const NODRY_DECL: &str = r#"
 local dash = require("dash")
 return dash.action_provider { id = "t.nodry", handler = "execute" }
@@ -3343,12 +3518,16 @@ return dash.adapter {
         flip_args = dash.any(),
         probe_ro = dash.any(),
         probe_write = dash.any(),
+        count = dash.any(),
     },
 }
 "#;
     const ADAPTER_RT: &str = r#"
 local R = {}
+-- Module-local state: tells the n-th evaluation of this VM apart (R7:SEC-1 probe).
+local evaluations = 0
 function R.render(ctx)
+    evaluations = evaluations + 1
     return {
         key = "root",
         widget_type = "dash.container",
@@ -3387,10 +3566,20 @@ function R.on_request(ctx)
         end
         return { action = "act", args = { id = "probe" } }
     elseif r == "flip" then
-        if ctx:await(ctx.dashboard_state:get("sel")) == "safe" then
+        local sel = ctx:await(ctx.dashboard_state:get("sel"))
+        if sel == "safe" then
             return { refresh = true }
+        elseif sel == "boom" then
+            error("unresolvable on purpose")
         end
         return { action = "act", args = { id = "flip" } }
+    elseif r == "count" then
+        -- Harmless on a fresh VM, an action on a VM that already rendered or evaluated.
+        evaluations = evaluations + 1
+        if evaluations == 1 then
+            return { refresh = true }
+        end
+        return { action = "act", args = { id = "count" } }
     elseif r == "flip_args" then
         return { action = "act", args = { id = tostring(ctx:await(ctx.dashboard_state:get("sel"))) } }
     elseif r == "probe_ro" then
@@ -3420,6 +3609,7 @@ return R
             ("t", WRITE_DECL, WRITE_RT),
             ("t", NESTED_DECL, NESTED_RT),
             ("t", NODRY_DECL, NODRY_RT),
+            ("t", SPIN_DECL, SPIN_RT),
             ("t", DATA_DECL, DATA_RT),
             ("t", ADAPTER_DECL, ADAPTER_RT),
             ("t", BADGE_DECL, ""),
@@ -3449,6 +3639,7 @@ return R
                 &[("child", "write")],
             ),
             instance("nodry", DefinitionCategory::ActionProvider, "t.nodry", &[]),
+            instance("spin", DefinitionCategory::ActionProvider, "t.spin", &[]),
             instance("data_inst", DefinitionCategory::DataProvider, "t.data", &[]),
             instance(
                 "adapter",
@@ -3479,10 +3670,13 @@ return R
     }
 
     fn engine() -> RuntimeEngine {
-        let budget = ResourceBudget {
+        engine_with_budget(ResourceBudget {
             wall_timeout: Duration::from_secs(20),
             ..ResourceBudget::default()
-        };
+        })
+    }
+
+    fn engine_with_budget(budget: ResourceBudget) -> RuntimeEngine {
         RuntimeEngine::new(
             build_graph(),
             SqliteStore::open_in_memory().unwrap(),
@@ -3507,7 +3701,26 @@ return R
             kind: "request".into(),
             request: request.into(),
             payload,
+            dry_run_token: None,
         }
+    }
+
+    /// The UI flow: Dry run the Request and carry the Dry run's token on its dispatch.
+    async fn confirmed(
+        a: &ActionManager,
+        mut r: WidgetRequestEnvelope,
+        p: &Principal,
+    ) -> WidgetRequestEnvelope {
+        r.dry_run_token = a
+            .dry_run_widget_request(r.clone(), p)
+            .await
+            .unwrap()
+            .dry_run_token;
+        assert!(
+            r.dry_run_token.is_some(),
+            "on_request Dry runs return a token"
+        );
+        r
     }
 
     fn audits(e: &RuntimeEngine, op: &str) -> Vec<dash_store::AuditRecord> {
@@ -4248,6 +4461,39 @@ return R
         assert_eq!(pspan.attributes["children"]["total"], 1);
     }
 
+    // F4: a nested action (an action invoking an `action_ref`) rides on its parent's pool
+    // permit, so it never waits for a permit the waiting parent holds, and it inherits the
+    // parent's remaining deadline.
+    #[tokio::test]
+    async fn nested_action_does_not_need_its_own_pool_permit() {
+        let e = engine_with_budget(ResourceBudget {
+            wall_timeout: Duration::from_secs(20),
+            max_concurrent_executions: 1,
+            queue_timeout: Duration::from_millis(300),
+            ..ResourceBudget::default()
+        });
+        let admin = Principal::administrator();
+        let t0 = Instant::now();
+        let parent = e
+            .actions
+            .invoke("nested", json!({"id": "n1"}), &admin, None, None)
+            .await
+            .unwrap();
+        assert_eq!(parent.status, "succeeded", "{parent:?}");
+        let child = e
+            .store
+            .list_action_executions(20)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.parent_execution_id.as_deref() == Some(parent.execution_id.as_str()))
+            .expect("child record");
+        assert_eq!(child.status, "succeeded", "{child:?}");
+        assert!(
+            t0.elapsed() < Duration::from_millis(300),
+            "child never queued"
+        );
+    }
+
     // act-11 / auth-17 / act-12 / act-14: resolution is conditional, authorized and finalized.
     #[tokio::test]
     async fn resolution_is_conditional_authorized_and_finalized() {
@@ -4491,11 +4737,9 @@ return R
             .unwrap_err();
         assert!(schema.contains("invalid payload"), "{schema}");
 
+        let go = confirmed(a, req("go", "adapter_btn", 1, json!({"id": "w1"})), &admin).await;
         let ok = a
-            .dispatch_widget_request_outcome(
-                req("go", "adapter_btn", 1, json!({"id": "w1"})),
-                &admin,
-            )
+            .dispatch_widget_request_outcome(go.clone(), &admin)
             .await
             .unwrap();
         let WidgetRequestOutcome::Action(rec) = ok else {
@@ -4504,13 +4748,8 @@ return R
         assert_eq!(rec.status, "succeeded");
         assert_eq!(rec.action_instance, "write");
         // A retransmission of the same Request does not run the action twice.
-        let WidgetRequestOutcome::Action(rec2) = a
-            .dispatch_widget_request_outcome(
-                req("go", "adapter_btn", 1, json!({"id": "w1"})),
-                &admin,
-            )
-            .await
-            .unwrap()
+        let WidgetRequestOutcome::Action(rec2) =
+            a.dispatch_widget_request_outcome(go, &admin).await.unwrap()
         else {
             panic!("expected action outcome")
         };
@@ -4571,9 +4810,15 @@ return R
                 None,
             )
             .unwrap();
+        let state = confirmed(
+            &e.actions,
+            req("state", "adapter_btn", 1, json!({})),
+            &admin,
+        )
+        .await;
         let WidgetRequestOutcome::Action(rec) = e
             .actions
-            .dispatch_widget_request_outcome(req("state", "adapter_btn", 1, json!({})), &admin)
+            .dispatch_widget_request_outcome(state, &admin)
             .await
             .unwrap()
         else {
@@ -4599,13 +4844,14 @@ return R
         let admin = Principal::administrator();
         let a = &e.actions;
         // A custom widget sends what it declares (`accepts_requests` and `requests` keys).
-        let WidgetRequestOutcome::Action(rec) = a
-            .dispatch_widget_request_outcome(
-                req("go", "adapter_badge", 1, json!({"id": "b1"})),
-                &admin,
-            )
-            .await
-            .unwrap()
+        let go = confirmed(
+            a,
+            req("go", "adapter_badge", 1, json!({"id": "b1"})),
+            &admin,
+        )
+        .await;
+        let WidgetRequestOutcome::Action(rec) =
+            a.dispatch_widget_request_outcome(go, &admin).await.unwrap()
         else {
             panic!("expected action outcome")
         };
@@ -4689,9 +4935,9 @@ return R
         assert_eq!(dry.action_instance.as_deref(), Some("write"));
     }
 
-    // R7:SEC-1: a dispatch is bound to its Dry run's resolution. A Request shown as a refresh
-    // (no confirmation) cannot run an action, and a confirmed action cannot change its target or
-    // arguments; with no Dry run on record the dispatch is unconstrained.
+    // R7:SEC-1: a dispatch is bound, through its single-use token, to the resolution of the Dry
+    // run the user saw. A Request shown as a refresh (no confirmation) cannot run an action, and
+    // a confirmed action cannot change its target or arguments.
     #[tokio::test]
     async fn widget_request_dispatch_cannot_diverge_from_its_dry_run() {
         let e = engine();
@@ -4711,18 +4957,15 @@ return R
         };
 
         set_sel("safe");
-        let dry = a
-            .dry_run_widget_request(req("flip", "adapter_btn", 10, json!({})), &admin)
-            .await
-            .unwrap();
-        assert_eq!(dry.resolution, "refresh");
-        assert!(!dry.requires_confirmation);
+        let flip = confirmed(a, req("flip", "adapter_btn", 10, json!({})), &admin).await;
         set_sel("evil");
+        let mut d = flip.clone();
+        d.sequence = 11;
         let err = a
-            .dispatch_widget_request_outcome(req("flip", "adapter_btn", 11, json!({})), &admin)
+            .dispatch_widget_request_outcome(d, &admin)
             .await
             .unwrap_err();
-        assert!(err.contains("Dry run resolved to a refresh"), "{err}");
+        assert!(err.contains("what was confirmed is a refresh"), "{err}");
         assert!(!ran("flip"), "the unconfirmed action must not run");
         assert!(audits(&e, "widget_request.dispatch")
             .iter()
@@ -4730,17 +4973,11 @@ return R
 
         // Imperative invocation is refused as well when the Dry run showed a refresh.
         set_sel("safe");
-        let dry = a
-            .dry_run_widget_request(req("probe_write", "adapter_btn", 12, json!({})), &admin)
-            .await
-            .unwrap();
-        assert!(!dry.requires_confirmation);
+        let mut d = confirmed(a, req("probe_write", "adapter_btn", 12, json!({})), &admin).await;
         set_sel("evil");
+        d.sequence = 13;
         let err = a
-            .dispatch_widget_request_outcome(
-                req("probe_write", "adapter_btn", 13, json!({})),
-                &admin,
-            )
+            .dispatch_widget_request_outcome(d, &admin)
             .await
             .unwrap_err();
         assert!(
@@ -4751,14 +4988,10 @@ return R
 
         // A confirmed action call must keep its target and arguments.
         set_sel("one");
-        let dry = a
-            .dry_run_widget_request(req("flip_args", "adapter_btn", 14, json!({})), &admin)
-            .await
-            .unwrap();
-        assert_eq!(dry.args, Some(json!({"id": "one"})));
+        let d = confirmed(a, req("flip_args", "adapter_btn", 14, json!({})), &admin).await;
         set_sel("two");
         let err = a
-            .dispatch_widget_request_outcome(req("flip_args", "adapter_btn", 15, json!({})), &admin)
+            .dispatch_widget_request_outcome(d, &admin)
             .await
             .unwrap_err();
         assert!(
@@ -4767,30 +5000,173 @@ return R
         );
         assert!(!ran("two"));
         // After a fresh Dry run (and confirmation) the same Request dispatches.
-        a.dry_run_widget_request(req("flip_args", "adapter_btn", 16, json!({})), &admin)
-            .await
-            .unwrap();
+        let d = confirmed(a, req("flip_args", "adapter_btn", 16, json!({})), &admin).await;
         let WidgetRequestOutcome::Action(rec) = a
-            .dispatch_widget_request_outcome(req("flip_args", "adapter_btn", 17, json!({})), &admin)
+            .dispatch_widget_request_outcome(d.clone(), &admin)
             .await
             .unwrap()
         else {
             panic!("expected action outcome")
         };
         assert_eq!(rec.args["id"], "two");
-
-        // The binding is per Principal: another Principal's dispatch is not constrained by it.
-        set_sel("safe");
-        a.dry_run_widget_request(req("flip", "adapter_btn", 18, json!({})), &admin)
+        // The token is single use: only a retransmission of that dispatch may present it again.
+        let mut reuse = d.clone();
+        reuse.sequence = 17;
+        let err = a
+            .dispatch_widget_request_outcome(reuse, &admin)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(err.contains("already used"), "{err}");
+
+        // The token is bound to its Principal and Request.
         set_sel("evil");
+        let d = confirmed(a, req("flip", "adapter_btn", 18, json!({})), &admin).await;
         let mut other = Principal::administrator();
         other.id = "admin2".into();
+        let err = a
+            .dispatch_widget_request_outcome(d.clone(), &other)
+            .await
+            .unwrap_err();
+        assert!(err.contains("issued for a different Request"), "{err}");
+        let mut forged = d;
+        forged.dry_run_token = Some("wdr_forged".into());
         assert!(a
-            .dispatch_widget_request_outcome(req("flip", "adapter_btn", 19, json!({})), &other)
+            .dispatch_widget_request_outcome(forged, &admin)
+            .await
+            .unwrap_err()
+            .contains("unknown"));
+    }
+
+    // R7:SEC-1: the binding fails closed. A dispatch without a token may only refresh, and an
+    // unresolved Dry run of the same Request (e.g. a double click, where the Adapter errors on
+    // the second Dry run) does not lift the binding of the first one.
+    #[tokio::test]
+    async fn widget_request_binding_fails_closed() {
+        let e = engine();
+        let admin = Principal::administrator();
+        let a = &e.actions;
+        let set_sel = |v: &str| {
+            e.store
+                .set_state("dashboard", "main", "sel", 1, 7, json!(v), None)
+                .unwrap();
+        };
+        let ran = |id: &str| {
+            e.store
+                .list_action_executions(50)
+                .unwrap()
+                .iter()
+                .any(|r| r.args["id"] == id)
+        };
+
+        // No Dry run token: refresh only.
+        set_sel("evil");
+        let err = a
+            .dispatch_widget_request_outcome(req("flip", "adapter_btn", 1, json!({})), &admin)
+            .await
+            .unwrap_err();
+        assert!(err.contains("carries no dry_run_token"), "{err}");
+        let err = a
+            .dispatch_widget_request_outcome(
+                req("probe_write", "adapter_btn", 2, json!({})),
+                &admin,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not part of this widget Request's Dry run"),
+            "{err}"
+        );
+        assert!(a
+            .dispatch_widget_request_outcome(req("refresh", "adapter_btn", 3, json!({})), &admin)
             .await
             .is_ok());
+
+        // Double click: DR1 shows a refresh (dispatched without confirmation), DR2 of the same
+        // Request is unresolved. D1 still carries DR1's binding.
+        set_sel("safe");
+        let d1 = confirmed(a, req("flip", "adapter_btn", 4, json!({})), &admin).await;
+        set_sel("boom");
+        let dr2 = a
+            .dry_run_widget_request(req("flip", "adapter_btn", 5, json!({})), &admin)
+            .await
+            .unwrap();
+        assert_eq!(dr2.resolution, "unresolved");
+        assert!(dr2.requires_confirmation);
+        set_sel("evil");
+        let err = a
+            .dispatch_widget_request_outcome(d1, &admin)
+            .await
+            .unwrap_err();
+        assert!(err.contains("what was confirmed is a refresh"), "{err}");
+        assert!(!ran("flip"));
+
+        // The user confirming an unresolved Dry run lets that dispatch run as evaluated.
+        let mut d2 = req("flip", "adapter_btn", 5, json!({}));
+        d2.dry_run_token = dr2.dry_run_token;
+        let WidgetRequestOutcome::Action(rec) =
+            a.dispatch_widget_request_outcome(d2, &admin).await.unwrap()
+        else {
+            panic!("expected action outcome")
+        };
+        assert_eq!(rec.args["id"], "flip");
+    }
+
+    // R7:SEC-1: Dry run and dispatch evaluate on_request in fresh VMs, so module-local state
+    // (a counter, or a flag set by `render`) cannot tell them apart.
+    #[tokio::test]
+    async fn widget_request_dry_run_and_dispatch_share_no_module_state() {
+        let e = engine();
+        let admin = Principal::administrator();
+        let a = &e.actions;
+        e.queries.render_dashboard("main", &admin).await.unwrap();
+        for seq in [1, 3] {
+            let d = confirmed(a, req("count", "adapter_btn", seq, json!({})), &admin).await;
+            let out = a.dispatch_widget_request_outcome(d, &admin).await.unwrap();
+            assert!(
+                matches!(out, WidgetRequestOutcome::Refreshed { .. }),
+                "dispatch saw state left by an earlier evaluation: {out:?}"
+            );
+        }
+    }
+
+    // R8:SC-9: action handlers (execute, Dry run, widget on_request) run under the per-Instance
+    // circuit breaker: repeated timeouts open it and later runs fail fast without executing.
+    #[tokio::test]
+    async fn repeatedly_timing_out_action_trips_the_circuit_breaker() {
+        let e = engine_with_budget(ResourceBudget {
+            wall_timeout: Duration::from_millis(100),
+            ..ResourceBudget::default()
+        });
+        let admin = Principal::administrator();
+        let a = &e.actions;
+        for _ in 0..crate::query_engine::BREAKER_THRESHOLD {
+            let rec = a
+                .invoke("spin", json!({}), &admin, None, None)
+                .await
+                .unwrap();
+            assert_eq!(rec.status, "failed", "{rec:?}");
+            assert!(
+                rec.reason.as_deref().unwrap().contains("deadline_exceeded"),
+                "{rec:?}"
+            );
+        }
+        let t0 = Instant::now();
+        let rec = a
+            .invoke("spin", json!({}), &admin, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.status, "failed");
+        assert!(rec.retry_safe);
+        assert!(
+            rec.reason.as_deref().unwrap().contains("circuit_open"),
+            "{rec:?}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(80),
+            "no wall time is burnt"
+        );
+        let err = a.dry_run("spin", json!({}), &admin).await.unwrap_err();
+        assert!(err.contains("circuit_open"), "{err}");
     }
 
     // R7:SEC-1: probing the read-only Dry run bridge taints the Dry run (always confirmed).

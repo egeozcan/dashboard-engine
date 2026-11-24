@@ -326,9 +326,22 @@ async fn vet_restricted_fetch(
     let addrs = dash_core::http_broker::vet_outbound_host(&host, port, network_ceiling)
         .await
         .map_err(|e| {
-            GitError::Package(format!(
-                "package source '{host}:{port}' is not reachable for this principal: {e}"
-            ))
+            use dash_core::http_broker::HttpBrokerError as E;
+            match e {
+                // Policy facts about the URL the Principal supplied: safe to explain.
+                E::PolicyDenied(..) | E::InvalidUrl(..) => GitError::Package(format!(
+                    "package source '{host}:{port}' is not reachable for this principal: {e}"
+                )),
+                // DNS results and the addresses a name resolves to would let the Principal map
+                // internal names to private addresses: kept for the Administrator's daemon log.
+                other => {
+                    tracing::warn!("restricted package fetch of '{host}:{port}' refused: {other}");
+                    GitError::Package(format!(
+                        "package source '{host}:{port}' is not reachable for this principal \
+                         (details are in the daemon log)"
+                    ))
+                }
+            }
         })?;
     if !url.starts_with("https://") || host.parse::<std::net::IpAddr>().is_ok() {
         return Ok(None);
@@ -368,6 +381,7 @@ fn git_command(policy: &PackageFetchPolicy) -> tokio::process::Command {
         )
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
         .env(
             "GIT_SSH_COMMAND",
             format!(
@@ -386,10 +400,6 @@ fn git_command(policy: &PackageFetchPolicy) -> tokio::process::Command {
         // Only plain transports; never `ext::` or other remote helpers.
         .env("GIT_ALLOW_PROTOCOL", protocols);
     cmd
-}
-
-async fn run_pkg_git(cwd: Option<&Path>, args: &[&str]) -> Result<String, GitError> {
-    run_pkg_git_with(cwd, args, &PackageFetchPolicy::Trusted, &[]).await
 }
 
 /// Run `git <config...> <args>` under `policy` (`config` are `-c key=value` pairs).
@@ -416,6 +426,21 @@ async fn run_pkg_git_with(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// `-c` settings of every Git command a restricted Principal's fetch runs: no credentials,
+/// redirects, proxies or file transport, and no LFS filter drivers or hooks on its tree.
+const RESTRICTED_GIT_CONFIG: [&str; 10] = [
+    "credential.helper=",
+    "core.askPass=",
+    "http.followRedirects=false",
+    "protocol.file.allow=never",
+    "http.proxy=",
+    "filter.lfs.process=",
+    "filter.lfs.smudge=",
+    "filter.lfs.clean=",
+    "filter.lfs.required=false",
+    "core.hooksPath=/dev/null",
+];
+
 /// Clone `url` into `dest` and check out `rev` (a branch, tag or commit) detached.
 /// Returns the checked-out commit hash.
 async fn clone_checkout(
@@ -428,23 +453,21 @@ async fn clone_checkout(
         return Err(GitError::Package(format!("invalid revision '{rev}'")));
     }
     // A clone steered by a restricted Principal is subject to the Administrator network ceiling
-    // (§14.2) and runs without the daemon's Git credentials (R7:SEC-5).
+    // (§14.2) and runs without the daemon's Git credentials (R7:SEC-5). Every Git command on the
+    // fetched (Principal-chosen) tree runs under the same policy: the checkout applies the
+    // tree's `.gitattributes`, so it must not see filter drivers (e.g. a globally installed
+    // git-lfs, which would contact hosts named by the tree) or hooks from the daemon's setup.
     let mut config: Vec<String> = Vec::new();
     if let PackageFetchPolicy::Restricted { network_ceiling } = policy {
         if let Some(pin) = vet_restricted_fetch(url, network_ceiling.as_ref()).await? {
             config.push(format!("http.curloptResolve={pin}"));
         }
-        config.extend(
-            [
-                "credential.helper=",
-                "core.askPass=",
-                "http.followRedirects=false",
-                "protocol.file.allow=never",
-                "http.proxy=",
-            ]
-            .map(String::from),
-        );
+        config.extend(RESTRICTED_GIT_CONFIG.map(String::from));
     }
+    let on_tree = |args: Vec<String>| {
+        let config = &config;
+        async move { fetched_tree_git(dest, &args, policy, config, url).await }
+    };
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
@@ -473,12 +496,8 @@ async fn clone_checkout(
         format!("{rev}^{{commit}}"),
         format!("origin/{rev}^{{commit}}"),
     ] {
-        if let Ok(c) = run_pkg_git(
-            Some(dest),
-            &["rev-parse", "--verify", "--quiet", &candidate],
-        )
-        .await
-        {
+        let args = ["rev-parse", "--verify", "--quiet", &candidate].map(String::from);
+        if let Ok(c) = on_tree(args.to_vec()).await {
             if !c.is_empty() {
                 commit = Some(c);
                 break;
@@ -487,8 +506,34 @@ async fn clone_checkout(
     }
     let commit = commit
         .ok_or_else(|| GitError::Package(format!("revision '{rev}' not found in '{url}'")))?;
-    run_pkg_git(Some(dest), &["checkout", "--quiet", "--detach", &commit]).await?;
+    on_tree(
+        ["checkout", "--quiet", "--detach", &commit]
+            .map(String::from)
+            .to_vec(),
+    )
+    .await?;
     Ok(commit)
+}
+
+/// Run a Git command on a tree fetched under `policy` (with the fetch's `config`); a
+/// restricted Principal gets a generic error instead of Git's stderr.
+async fn fetched_tree_git(
+    dest: &Path,
+    args: &[String],
+    policy: &PackageFetchPolicy,
+    config: &[String],
+    url: &str,
+) -> Result<String, GitError> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_pkg_git_with(Some(dest), &args, policy, config).await {
+        Err(GitError::Command { stderr, .. }) if policy.is_restricted() => {
+            tracing::warn!("restricted package checkout of '{url}' failed: {stderr}");
+            Err(GitError::Package(format!(
+                "checking out '{url}' failed (details are in the daemon log)"
+            )))
+        }
+        other => other,
+    }
 }
 
 /// Resolve all external Git dependencies declared in `packages.toml` (transitively),
@@ -1595,6 +1640,49 @@ mod tests {
         }
     }
 
+    // F3: the Git commands run on a tree a restricted Principal chose (rev-parse, checkout) run
+    // under the restricted policy and config (no LFS filter drivers, no hooks), and their
+    // failures reveal no Git stderr.
+    #[tokio::test]
+    async fn restricted_checkout_commands_run_under_the_restricted_policy() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("a");
+        make_pkg_repo(&repo, "alpha", "a1").await;
+        let policy = PackageFetchPolicy::Restricted {
+            network_ceiling: None,
+        };
+        let config: Vec<String> = RESTRICTED_GIT_CONFIG.map(String::from).to_vec();
+        let url = "https://packages.example.com/alpha.git";
+        let get = |key: &str| ["config", "--get", key].map(String::from).to_vec();
+        assert_eq!(
+            fetched_tree_git(&repo, &get("core.hooksPath"), &policy, &config, url)
+                .await
+                .unwrap(),
+            "/dev/null"
+        );
+        assert_eq!(
+            fetched_tree_git(&repo, &get("filter.lfs.required"), &policy, &config, url)
+                .await
+                .unwrap(),
+            "false"
+        );
+        let err = fetched_tree_git(
+            &repo,
+            &["checkout", "--quiet", "--detach", "no-such-revision"].map(String::from),
+            &policy,
+            &config,
+            url,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("details are in the daemon log"), "{err}");
+        assert!(
+            !err.contains("no-such-revision") && !err.contains("pathspec"),
+            "{err}"
+        );
+    }
+
     // R7:SEC-5: a restricted Principal's dependency fetch is held to the Administrator network
     // ceiling and the SSRF address rules before any Git I/O, never fetches local repositories,
     // and a failed fetch reveals nothing of Git's (connection) errors.
@@ -1620,6 +1708,8 @@ mod tests {
 
         // Internal addresses: refused before Git runs, under any ceiling.
         for (url, ceiling) in [
+            // A name resolving to a private address: refused without revealing the address.
+            ("https://localhost:8443/x.git", Some(false)),
             ("https://10.0.0.12:8443/x.git", Some(false)),
             ("ssh://git@127.0.0.1:22/secret/repo", Some(false)),
             ("https://169.254.169.254/latest", Some(true)),
@@ -1635,6 +1725,13 @@ mod tests {
                 err.contains("not reachable for this principal"),
                 "{url}: {err}"
             );
+            if url.contains("localhost") {
+                assert!(
+                    !err.contains("127.0.0.1") && !err.contains("::1"),
+                    "resolved address leaked: {err}"
+                );
+                assert!(err.contains("details are in the daemon log"), "{err}");
+            }
         }
         // A host outside the ceiling.
         add_dep("beta", "https://internal-scm/x.git");

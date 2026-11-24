@@ -238,6 +238,34 @@ describe("DiagnosticsView read-only execution graph and traces", () => {
   });
 });
 
+describe("DiagnosticsView secret form", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("rotates a secret without sending policy fields, so the stored binding policy is kept", async () => {
+    const calls = mockFetch([
+      ["/api/diagnostics/traces", "GET", () => ({ execution_graph: { nodes: [], edges: [] }, spans: [] })],
+      ["/api/diagnostics/metrics", "GET", () => ({})],
+      ["/api/executions", "GET", () => []],
+      ["/api/diagnostics/logs", "GET", () => []],
+      ["/api/secrets", "GET", () => []],
+      ["/api/secrets", "POST", () => ({ name: "github-work", key_version: 2 })],
+      ["/api/agents", "GET", () => []],
+      ["/api/service-principals", "GET", () => []],
+      ["/api/diagnostics/audits", "GET", () => []],
+    ]);
+    render(<DiagnosticsView />);
+    fireEvent.change(await screen.findByPlaceholderText("Secret name (e.g. github-work)"), {
+      target: { value: "github-work" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Secret plaintext"), { target: { value: "ghp_v2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Store Secret" }));
+    await waitFor(() => expect(calls.some((c) => c.url === "/api/secrets" && c.method === "POST")).toBe(true));
+    const post = calls.find((c) => c.url === "/api/secrets" && c.method === "POST");
+    expect(post?.body).toEqual({ name: "github-work", plaintext: "ghp_v2" });
+    expect(post?.body as Record<string, unknown>).not.toHaveProperty("allowed_bindings");
+  });
+});
+
 describe("SandboxedWidgetFrame message validation", () => {
   it("accepts only well-formed Requests from its own frame for its own widget_id", () => {
     const onReq = vi.fn().mockResolvedValue(undefined);
