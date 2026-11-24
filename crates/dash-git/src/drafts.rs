@@ -29,7 +29,8 @@ use crate::git_cli::{
 };
 use crate::packages::{
     fetch_locked_packages, missing_locked_packages, read_packages_lock, read_packages_toml,
-    update_package_lock, write_packages_toml, PackageDependencySpec, PackagesLock, PackagesToml,
+    update_package_lock_with_policy, write_packages_toml, PackageDependencySpec,
+    PackageFetchPolicy, PackagesLock, PackagesToml,
 };
 use crate::preview::{
     run_preview_and_scenarios, run_workspace_definition_tests, validate_graph_with_contracts,
@@ -663,7 +664,11 @@ impl DraftManager {
         let mut cfg = read_packages_toml(wt)?;
         cfg.dependencies.insert(pkg_name.to_string(), spec);
         write_packages_toml(wt, &cfg)?;
-        let lock = update_package_lock(wt, &self.data_dir, pkg_name).await?;
+        // The fetch is steered by `principal`: restricted Principals are held to the
+        // Administrator network ceiling and get no ambient Git credentials (R7:SEC-5).
+        let fetch_policy = PackageFetchPolicy::for_principal(principal, &self.store);
+        let lock =
+            update_package_lock_with_policy(wt, &self.data_dir, pkg_name, &fetch_policy).await?;
         let rec =
             self.record_draft_mutation(draft_id, principal, format!("dependency:{pkg_name}"))?;
         Ok((rec, lock))

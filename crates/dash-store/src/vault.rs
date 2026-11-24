@@ -9,9 +9,12 @@
 //! 3. `DASH_VAULT_PASSPHRASE` — `<data_dir>/vault.key` is stored *wrapped*: an Argon2id KEK
 //!    derived from the passphrase encrypts the data key with AES-256-GCM, so a copy of the data
 //!    directory alone cannot decrypt secrets. A legacy plaintext key file is re-wrapped in place.
-//! 4. Fallback for unattended single-host use: plaintext `<data_dir>/vault.key` (`0600`,
-//!    created atomically). This co-locates key and ciphertext, so the vault reports
-//!    [`KeyProtection::UnprotectedColocated`] and `dash doctor` warns about it.
+//! 4. Only with the explicit opt-in `DASH_ALLOW_COLOCATED_VAULT_KEY=1`: plaintext
+//!    `<data_dir>/vault.key` (`0600`, created atomically) for unattended single-host or throwaway
+//!    use. This co-locates key and ciphertext without an additional protection boundary, which
+//!    §5.2 forbids by default, so without the opt-in the vault refuses to start
+//!    ([`VaultError::ColocatedKeyRefused`]) instead of creating or using such a key. With it, the
+//!    vault reports [`KeyProtection::UnprotectedColocated`] and `dash doctor` warns about it.
 //!
 //! Plaintext secrets never appear in Git, API responses, MCP outputs, widget messages, logs,
 //! or traces.
@@ -46,6 +49,14 @@ pub enum VaultError {
     PassphraseRequired,
     #[error("vault passphrase is wrong or the wrapped key file is corrupted")]
     UnwrapFailed,
+    /// No key source keeps the data key apart from the ciphertext (§5.2).
+    #[error(
+        "refusing to keep the vault master key unprotected next to the encrypted secrets ('{path}'): \
+         set DASH_VAULT_PASSPHRASE (wraps the key with Argon2id; an existing plaintext key file is \
+         re-wrapped in place), DASH_MASTER_KEY, or DASH_MASTER_KEY_FILE pointing outside the data \
+         directory; or accept the risk explicitly with DASH_ALLOW_COLOCATED_VAULT_KEY=1"
+    )]
+    ColocatedKeyRefused { path: String },
 }
 
 /// How the vault master key is protected at rest (reported by `dash doctor`).
@@ -69,9 +80,10 @@ impl KeyProtection {
     pub fn warning(&self) -> Option<String> {
         match self {
             Self::UnprotectedColocated { path } => Some(format!(
-                "vault master key '{path}' is stored unwrapped next to the encrypted secrets; set \
-                 DASH_VAULT_PASSPHRASE (wraps the key with Argon2id), DASH_MASTER_KEY, or \
-                 DASH_MASTER_KEY_FILE pointing outside the data directory"
+                "vault master key '{path}' is stored unwrapped next to the encrypted secrets \
+                 (allowed only by DASH_ALLOW_COLOCATED_VAULT_KEY); set DASH_VAULT_PASSPHRASE \
+                 (wraps the key with Argon2id), DASH_MASTER_KEY, or DASH_MASTER_KEY_FILE pointing \
+                 outside the data directory"
             )),
             _ => None,
         }
@@ -84,6 +96,9 @@ pub struct VaultKeySource {
     pub master_key: Option<String>,
     pub key_file: Option<PathBuf>,
     pub passphrase: Option<String>,
+    /// Explicit Administrator opt-in to a plaintext key co-located with the ciphertext
+    /// (`DASH_ALLOW_COLOCATED_VAULT_KEY`). Without it such a key is refused (§5.2).
+    pub allow_colocated: bool,
 }
 
 impl VaultKeySource {
@@ -95,6 +110,12 @@ impl VaultKeySource {
             passphrase: std::env::var("DASH_VAULT_PASSPHRASE")
                 .ok()
                 .filter(|v| !v.is_empty()),
+            allow_colocated: non_empty("DASH_ALLOW_COLOCATED_VAULT_KEY").is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
         }
     }
 }
@@ -277,6 +298,10 @@ impl SecretVault {
         };
         let passphrase = source.passphrase.as_deref();
         let path_str = key_path.to_string_lossy().to_string();
+        if passphrase.is_none() && !external && !source.allow_colocated {
+            // Neither create nor use a plaintext key next to the ciphertext (§5.2).
+            return Err(VaultError::ColocatedKeyRefused { path: path_str });
+        }
 
         let key = if key_path.exists() {
             let raw = std::fs::read_to_string(&key_path)?;
@@ -513,10 +538,54 @@ mod tests {
         v.encrypt("s", 1, "plain-value").unwrap()
     }
 
+    fn colocated_opt_in() -> VaultKeySource {
+        VaultKeySource {
+            allow_colocated: true,
+            ..Default::default()
+        }
+    }
+
+    // R8:SC-10: without a key source that separates key and ciphertext, and without the explicit
+    // opt-in, the vault refuses to create (or use) a plaintext key in the data directory.
+    #[test]
+    fn colocated_plaintext_key_is_refused_without_explicit_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = SecretVault::load_with(tmp.path(), &VaultKeySource::default())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, VaultError::ColocatedKeyRefused { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("DASH_VAULT_PASSPHRASE"));
+        assert!(
+            !tmp.path().join("vault.key").exists(),
+            "no plaintext key may be written"
+        );
+        // An existing plaintext key is not used either...
+        SecretVault::load_with(tmp.path(), &colocated_opt_in()).unwrap();
+        assert!(matches!(
+            SecretVault::load_with(tmp.path(), &VaultKeySource::default())
+                .err()
+                .unwrap(),
+            VaultError::ColocatedKeyRefused { .. }
+        ));
+        // ... nor a key file configured inside the data directory.
+        let inside = VaultKeySource {
+            key_file: Some(tmp.path().join("other.key")),
+            ..Default::default()
+        };
+        assert!(matches!(
+            SecretVault::load_with(tmp.path(), &inside).err().unwrap(),
+            VaultError::ColocatedKeyRefused { .. }
+        ));
+        assert!(!tmp.path().join("other.key").exists());
+    }
+
     #[test]
     fn default_key_file_is_created_0600_and_reported_unprotected() {
         let tmp = tempfile::tempdir().unwrap();
-        let v = SecretVault::load_with(tmp.path(), &VaultKeySource::default()).unwrap();
+        let v = SecretVault::load_with(tmp.path(), &colocated_opt_in()).unwrap();
         assert!(matches!(
             v.key_protection(),
             KeyProtection::UnprotectedColocated { .. }
@@ -533,7 +602,7 @@ mod tests {
         }
         // Reload yields the same key.
         let (n, ct) = roundtrip(&v);
-        let v2 = SecretVault::load_with(tmp.path(), &VaultKeySource::default()).unwrap();
+        let v2 = SecretVault::load_with(tmp.path(), &colocated_opt_in()).unwrap();
         assert_eq!(v2.decrypt("s", 1, &n, &ct).unwrap(), "plain-value");
     }
 
@@ -555,7 +624,7 @@ mod tests {
         let (n, ct) = roundtrip(&v);
 
         // Without the passphrase the key file is useless.
-        let err = SecretVault::load_with(tmp.path(), &VaultKeySource::default())
+        let err = SecretVault::load_with(tmp.path(), &colocated_opt_in())
             .err()
             .unwrap();
         assert!(matches!(err, VaultError::PassphraseRequired));
@@ -574,7 +643,7 @@ mod tests {
     #[test]
     fn legacy_plaintext_key_is_rewrapped_when_passphrase_is_set() {
         let tmp = tempfile::tempdir().unwrap();
-        let legacy = SecretVault::load_with(tmp.path(), &VaultKeySource::default()).unwrap();
+        let legacy = SecretVault::load_with(tmp.path(), &colocated_opt_in()).unwrap();
         let (n, ct) = roundtrip(&legacy);
         let src = VaultKeySource {
             passphrase: Some("pw".into()),
@@ -606,6 +675,7 @@ mod tests {
         // A key file configured *inside* the data dir is still co-located.
         let inside = VaultKeySource {
             key_file: Some(data.path().join("other.key")),
+            allow_colocated: true,
             ..Default::default()
         };
         let v2 = SecretVault::load_with(data.path(), &inside).unwrap();

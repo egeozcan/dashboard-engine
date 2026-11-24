@@ -76,11 +76,11 @@ impl RuntimeEngine {
     ) -> Result<Self, HttpBrokerError> {
         let graph = Arc::new(ArcSwap::from_pointee(initial_graph));
         let pool = VmPool::new(budget);
-        let http = HttpBroker::new(store.clone())?;
+        let telemetry = Telemetry::new(store.clone());
+        let http = HttpBroker::new(store.clone())?.with_telemetry(telemetry.clone());
         let signals = SignalHub::new(256);
         let events = EventBus::new(store.clone(), 512);
         let state = StateManager::new(store.clone(), signals.clone());
-        let telemetry = Telemetry::new(store.clone());
         // Per-Instance Luau budgets from the live graph's `[resources]` (§2.1), and VM-level
         // trace spans for startup, memory, interrupts, queue and execution time (§15.1).
         {

@@ -205,6 +205,59 @@ struct RenderedWidgets {
     widgets: HashMap<String, String>,
 }
 
+/// How a widget Request resolved in its Dry run (`dry_run_widget_request`). Remembered per
+/// Principal and Request so the real dispatch cannot diverge from what the UI showed: the UI skips
+/// the confirmation for a refresh, and confirms exactly one action call otherwise (R7:SEC-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DryRunResolution {
+    /// Dispatched without confirmation: the dispatch may not run any action or mutating
+    /// connector operation.
+    Refresh,
+    /// Confirmed as this action call; the dispatch may run exactly this action with these args.
+    Action {
+        action_instance: String,
+        args_digest: String,
+    },
+}
+
+impl DryRunResolution {
+    fn describe(&self) -> String {
+        match self {
+            Self::Refresh => "a refresh (dispatched without confirmation)".into(),
+            Self::Action {
+                action_instance, ..
+            } => format!("action '{action_instance}' with the confirmed arguments"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WidgetDryRunBinding {
+    resolution: DryRunResolution,
+    at: Instant,
+}
+
+/// How long a widget Request's Dry-run resolution constrains its dispatch.
+const WIDGET_DRY_RUN_BINDING_TTL: Duration = Duration::from_secs(15 * 60);
+/// Bound on remembered Dry-run resolutions (§20: no unbounded caches); oldest evicted first.
+const MAX_WIDGET_DRY_RUN_BINDINGS: usize = 4096;
+
+/// Built-in widget types whose host-rendered UI sends Requests; the Request name is the one the
+/// Adapter configured in the widget's props (`request`, `row_action.request`) or its default.
+const BUILTIN_REQUEST_WIDGETS: &[&str] = &["dash.button", "dash.form", "dash.table"];
+
+/// Built-in widget types that never send Requests (they only render, or change Dashboard State).
+const BUILTIN_SILENT_WIDGETS: &[&str] = &[
+    "dash.chart",
+    "dash.container",
+    "dash.counter",
+    "dash.filter",
+    "dash.grid",
+    "dash.map",
+    "dash.tabs",
+    "dash.text",
+];
+
 #[derive(Clone)]
 pub struct ActionManager {
     graph: Arc<ArcSwap<ConfiguredGraph>>,
@@ -219,6 +272,8 @@ pub struct ActionManager {
     rendered_widgets: Arc<DashMap<String, RenderedWidgets>>,
     /// Single-flight guard for reconcile attempts in this process.
     reconcile_inflight: Arc<DashMap<String, ()>>,
+    /// Dry-run resolution of recent widget Requests, keyed by [`widget_dry_run_key`].
+    widget_dry_runs: Arc<DashMap<String, WidgetDryRunBinding>>,
 }
 
 /// Host-observed side effects of one handler run.
@@ -231,6 +286,9 @@ struct SideEffectTracker {
     nested_started: AtomicU64,
     /// Nested actions that returned a record not proven effect-free (not `failed`/`cancelled`).
     nested_effective: AtomicU64,
+    /// Side effects a read-only (Dry run / reconcile) bridge refused. A widget-Request Dry run
+    /// that tried one is never reported as resolved, whatever the handler returned afterwards.
+    read_only_refusals: AtomicU64,
     uncertain: Mutex<Option<String>>,
     children: Mutex<Vec<String>>,
 }
@@ -324,7 +382,82 @@ impl ActionManager {
             cancel_flags: Arc::new(DashMap::new()),
             rendered_widgets: Arc::new(DashMap::new()),
             reconcile_inflight: Arc::new(DashMap::new()),
+            widget_dry_runs: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Remember how a widget Request resolved in its Dry run (`None` forgets: an unresolved Dry
+    /// run is always confirmed, so it does not constrain the dispatch).
+    fn remember_widget_dry_run(&self, key: String, resolution: Option<DryRunResolution>) {
+        let Some(resolution) = resolution else {
+            self.widget_dry_runs.remove(&key);
+            return;
+        };
+        if self.widget_dry_runs.len() >= MAX_WIDGET_DRY_RUN_BINDINGS {
+            self.widget_dry_runs
+                .retain(|_, b| b.at.elapsed() < WIDGET_DRY_RUN_BINDING_TTL);
+        }
+        while self.widget_dry_runs.len() >= MAX_WIDGET_DRY_RUN_BINDINGS {
+            let oldest = self
+                .widget_dry_runs
+                .iter()
+                .min_by_key(|e| e.value().at)
+                .map(|e| e.key().clone());
+            match oldest {
+                Some(k) => {
+                    self.widget_dry_runs.remove(&k);
+                }
+                None => break,
+            }
+        }
+        self.widget_dry_runs.insert(
+            key,
+            WidgetDryRunBinding {
+                resolution,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// The unexpired Dry-run resolution a dispatch of `key` must match, if any.
+    fn widget_dry_run_constraint(&self, key: &str) -> Option<DryRunResolution> {
+        let binding = self.widget_dry_runs.get(key)?.clone();
+        if binding.at.elapsed() >= WIDGET_DRY_RUN_BINDING_TTL {
+            self.widget_dry_runs.remove(key);
+            return None;
+        }
+        Some(binding.resolution)
+    }
+
+    /// Refuse a dispatch whose resolution diverges from its Dry run (audited).
+    fn widget_dispatch_diverged(
+        &self,
+        req: &WidgetRequestEnvelope,
+        principal: &Principal,
+        expected: &DryRunResolution,
+        got: &str,
+    ) -> String {
+        let reason = format!(
+            "widget Request '{}' from '{}' resolved to {got} at dispatch, but its Dry run resolved to {}; \
+             refusing to run what the user did not confirm (run the Dry run again)",
+            req.request,
+            req.widget_id,
+            expected.describe()
+        );
+        let _ = self.store.append_audit(
+            &principal.id,
+            principal.kind.as_str(),
+            "widget_request.dispatch",
+            &req.adapter_instance,
+            "denied",
+            serde_json::json!({
+                "dashboard_id": req.dashboard_id,
+                "widget_id": req.widget_id,
+                "request": req.request,
+                "reason": reason,
+            }),
+        );
+        reason
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -349,6 +482,7 @@ impl ActionManager {
             parent_execution_id: None,
             dashboard_id: None,
             is_read_only,
+            dispatch_constraint: None,
             cancel_flag: None,
             step_counter: Arc::new(AtomicI64::new(0)),
             tracker,
@@ -1908,6 +2042,7 @@ impl ActionManager {
         }
 
         let widget_type = self.ensure_widget_bound(req, principal).await?;
+        widget_may_send_request(&g, widget_type.as_deref(), req)?;
         if let Some(wdef) = widget_type.as_ref().and_then(|t| g.definitions.get(t)) {
             if let Some(schema) = wdef.manifest.request_schemas.get(&req.request) {
                 schema.validate_value(&req.payload).map_err(|e| {
@@ -2012,6 +2147,8 @@ impl ActionManager {
         };
 
         // The Adapter translates the Request into an authorized action call or a refresh (Luau).
+        // When this Request was Dry-run, the dispatch must resolve the same way (R7:SEC-1).
+        let constraint = self.widget_dry_run_constraint(&widget_dry_run_key(principal, req));
         let tracker = Arc::new(SideEffectTracker::default());
         let mut bridge = self.bridge(
             g,
@@ -2024,6 +2161,7 @@ impl ActionManager {
         );
         bridge.dashboard_id = Some(req.dashboard_id.clone());
         bridge.span_id = Some(span_id.to_string());
+        bridge.dispatch_constraint = constraint.clone();
         let bridge = Arc::new(bridge);
         let bundle = CompiledInstanceBundle {
             instance_id: adapter_inst.id.clone(),
@@ -2082,6 +2220,20 @@ impl ActionManager {
                 .get("args")
                 .cloned()
                 .unwrap_or_else(|| req.payload.clone());
+            if let Some(expected) = &constraint {
+                let got = DryRunResolution::Action {
+                    action_instance: target.clone(),
+                    args_digest: args_digest(&args),
+                };
+                if &got != expected {
+                    return Err(self.widget_dispatch_diverged(
+                        req,
+                        principal,
+                        expected,
+                        &format!("action '{target}'"),
+                    ));
+                }
+            }
             let ikey = val
                 .get("idempotency_key")
                 .and_then(|v| v.as_str())
@@ -2268,6 +2420,85 @@ fn widget_request_idempotency_key(req: &WidgetRequestEnvelope) -> String {
     )
 }
 
+/// Key of a widget Request's remembered Dry-run resolution: the Principal and everything the
+/// Adapter sees except the per-message `sequence` (the UI numbers Dry run and dispatch apart).
+fn widget_dry_run_key(principal: &Principal, req: &WidgetRequestEnvelope) -> String {
+    let mut h = Sha256::new();
+    for part in [
+        principal.id.as_str(),
+        req.dashboard_id.as_str(),
+        req.adapter_instance.as_str(),
+        req.widget_id.as_str(),
+        &req.generation.to_string(),
+        req.request.as_str(),
+        &canonical_json(&req.payload),
+    ] {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
+/// Digest of an action call's arguments (canonical JSON), to compare Dry run and dispatch.
+fn args_digest(args: &serde_json::Value) -> String {
+    hex::encode(Sha256::digest(canonical_json(args).as_bytes()))
+}
+
+/// Whether the bound widget may send `req.request` (§3 "Requests it can send", §10.1). Deny by
+/// default: a custom widget provider must list the Request in `accepts_requests`/`requests`; the
+/// built-in widgets that send Requests are fixed host code sending the names the Adapter
+/// configured; every other widget type sends none.
+fn widget_may_send_request(
+    g: &ConfiguredGraph,
+    widget_type: Option<&str>,
+    req: &WidgetRequestEnvelope,
+) -> Result<(), String> {
+    let Some(wt) = widget_type else {
+        return Err(format!(
+            "widget '{}' has no widget_type, so it cannot send Requests",
+            req.widget_id
+        ));
+    };
+    let def = g.definitions.get(wt);
+    let builtin = def.is_none_or(|d| {
+        d.package_name == "dash" && d.manifest.widget_asset.as_deref() == Some("builtin")
+    });
+    if !builtin {
+        let def = def.expect("non-builtin widget has a Definition");
+        if def.manifest.category != DefinitionCategory::WidgetProvider {
+            return Err(format!(
+                "widget '{}' has type '{wt}', which is not a widget provider",
+                req.widget_id
+            ));
+        }
+        if !def
+            .manifest
+            .accepts_requests
+            .iter()
+            .any(|r| r == &req.request)
+        {
+            return Err(format!(
+                "widget provider '{wt}' (widget '{}') does not declare request '{}' in accepts_requests/requests",
+                req.widget_id, req.request
+            ));
+        }
+        return Ok(());
+    }
+    if BUILTIN_REQUEST_WIDGETS.contains(&wt) {
+        return Ok(());
+    }
+    if BUILTIN_SILENT_WIDGETS.contains(&wt) || def.is_some() {
+        return Err(format!(
+            "built-in widget type '{wt}' (widget '{}') does not send Requests",
+            req.widget_id
+        ));
+    }
+    Err(format!(
+        "widget '{}' has unknown widget type '{wt}'; it cannot send Requests",
+        req.widget_id
+    ))
+}
+
 /// Whether `operation` of connector Instance `conn` is a read (`read_only = true`, `mode = "read"`,
 /// or read-only capabilities) per its Definition; undeclared operations are mutating.
 fn connector_operation_is_read_only(
@@ -2336,8 +2567,12 @@ impl ActionManager {
             requires_confirmation: true,
         };
 
+        let binding_key = widget_dry_run_key(principal, &req);
         let (target_action, args) = if let Some(ref on_req) = adapter_def.manifest.request_handler {
-            let trace_id = format!("reqdry_{}", Uuid::now_v7().simple());
+            // Same trace id shape as a dispatch: `on_request` must not be able to tell the two
+            // apart (R7:SEC-1). Whatever it does, the dispatch is bound to this resolution.
+            let trace_id = format!("tr_{}", Uuid::now_v7().simple());
+            let tracker = Arc::new(SideEffectTracker::default());
             let mut bridge = self.bridge(
                 &g,
                 &adapter_inst,
@@ -2345,7 +2580,7 @@ impl ActionManager {
                 principal,
                 &trace_id,
                 true,
-                Arc::new(SideEffectTracker::default()),
+                Arc::clone(&tracker),
             );
             bridge.dashboard_id = Some(req.dashboard_id.clone());
             let bridge = Arc::new(bridge);
@@ -2388,31 +2623,52 @@ impl ActionManager {
             let val = match evaluated {
                 Ok(v) => v,
                 Err(e) => {
+                    self.remember_widget_dry_run(binding_key, None);
                     out.dry_run_error = Some(format!(
                         "adapter on_request could not be evaluated without side effects: {e}"
                     ));
                     return Ok(out);
                 }
             };
+            if tracker.read_only_refusals.load(Ordering::SeqCst) > 0 {
+                // A side effect was attempted (and refused) while evaluating read-only: whatever
+                // the handler returned after that does not describe the dispatch.
+                self.remember_widget_dry_run(binding_key, None);
+                out.dry_run_error = Some(
+                    "adapter on_request attempted a side effect (nested action or mutating connector operation) during its read-only evaluation; the Request cannot be resolved without running it"
+                        .into(),
+                );
+                return Ok(out);
+            }
             if let Some(action_slot) = val.get("action").and_then(|v| v.as_str()) {
                 // Same resolution as dispatch: only the Adapter's own bound action inputs.
                 let target =
                     match resolve_bound_action(&adapter_inst, &adapter_def, &g, action_slot) {
                         Ok(t) => t,
                         Err(e) => {
+                            self.remember_widget_dry_run(binding_key, None);
                             out.dry_run_error = Some(e);
                             return Ok(out);
                         }
                     };
                 let args = val.get("args").cloned().unwrap_or(req.payload.clone());
+                self.remember_widget_dry_run(
+                    binding_key,
+                    Some(DryRunResolution::Action {
+                        action_instance: target.clone(),
+                        args_digest: args_digest(&args),
+                    }),
+                );
                 (target, args)
             } else if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
                 || val.get("invalidate").is_some()
             {
+                self.remember_widget_dry_run(binding_key, Some(DryRunResolution::Refresh));
                 out.resolution = "refresh".into();
                 out.requires_confirmation = false;
                 return Ok(out);
             } else {
+                self.remember_widget_dry_run(binding_key, None);
                 out.dry_run_error =
                     Some("adapter on_request handler did not specify an action".into());
                 return Ok(out);
@@ -2507,6 +2763,10 @@ struct ActionHostBridge {
     /// Dashboard of the widget Request being handled (Adapters read Dashboard State only).
     dashboard_id: Option<String>,
     is_read_only: bool,
+    /// Set while dispatching a widget Request whose Dry run resolved (refresh or one confirmed
+    /// action call): the Adapter's evaluation may then start no nested action and no mutating
+    /// connector operation itself, because its Dry run did neither (R7:SEC-1).
+    dispatch_constraint: Option<DryRunResolution>,
     cancel_flag: Option<Arc<AtomicBool>>,
     step_counter: Arc<AtomicI64>,
     tracker: Arc<SideEffectTracker>,
@@ -2581,10 +2841,19 @@ impl HostBridge for ActionHostBridge {
                 check_connector_operation_read_only(&self.principal, target, operation, &self.graph),
             )
             .map_err(|e| {
+                self.tracker
+                    .read_only_refusals
+                    .fetch_add(1, Ordering::SeqCst);
                 format!(
                     "dry_run/reconcile is read-only; connector operation '{operation}' on '{target_id}' is not declared read_only: {e}"
                 )
             })?;
+        }
+        if let (Some(expected), false) = (&self.dispatch_constraint, read_only_op) {
+            return Err(format!(
+                "connector operation '{operation}' on '{target_id}' was not part of this widget Request's Dry run, which resolved to {}; run the Dry run again",
+                expected.describe()
+            ));
         }
         if self.cancelled() {
             return Err(format!(
@@ -2635,7 +2904,16 @@ impl HostBridge for ActionHostBridge {
         idempotency_key: Option<String>,
     ) -> Result<serde_json::Value, String> {
         if self.is_read_only {
+            self.tracker
+                .read_only_refusals
+                .fetch_add(1, Ordering::SeqCst);
             return Err("nested action invocation is forbidden during dry_run/reconcile".into());
+        }
+        if let Some(expected) = &self.dispatch_constraint {
+            return Err(format!(
+                "nested action invocation through '{input_name}' was not part of this widget Request's Dry run, which resolved to {}; run the Dry run again",
+                expected.describe()
+            ));
         }
         let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
             format!(
@@ -3018,6 +3296,20 @@ local R = {}
 function R.execute(ctx) return { ok = true } end
 return R
 "#;
+    const BADGE_DECL: &str = r#"
+local dash = require("dash")
+return dash.widget_provider {
+    id = "t.badge",
+    asset = "assets/index.html",
+    props = dash.any(),
+    accepts_requests = { "go" },
+    requests = { refresh = dash.any() },
+}
+"#;
+    const MUTE_DECL: &str = r#"
+local dash = require("dash")
+return dash.widget_provider { id = "t.mute", asset = "assets/index.html", props = dash.any() }
+"#;
     const DATA_DECL: &str = r#"
 local dash = require("dash")
 return dash.data_provider { id = "t.data", handler = "query" }
@@ -3046,6 +3338,11 @@ return dash.adapter {
         exec_steal = dash.any(),
         state = dash.any(),
         undeclared_state = dash.any(),
+        probe = dash.any(),
+        flip = dash.any(),
+        flip_args = dash.any(),
+        probe_ro = dash.any(),
+        probe_write = dash.any(),
     },
 }
 "#;
@@ -3055,7 +3352,13 @@ function R.render(ctx)
     return {
         key = "root",
         widget_type = "dash.container",
-        children = { { key = "btn", widget_type = "dash.button", props = {} } },
+        children = {
+            { key = "btn", widget_type = "dash.button", props = {} },
+            { key = "badge", widget_type = "t.badge", props = {} },
+            { key = "mute", widget_type = "t.mute", props = {} },
+            { key = "label", widget_type = "dash.text", props = {} },
+            { key = "stray", widget_type = "t.not_a_widget", props = {} },
+        },
     }
 end
 function R.on_request(ctx)
@@ -3077,6 +3380,30 @@ function R.on_request(ctx)
     elseif r == "undeclared_state" then
         local v = ctx:await(ctx.dashboard_state:get("secret_key"))
         return { action = "act", args = { id = tostring(v) } }
+    elseif r == "probe" then
+        -- The R7:SEC-1 exploit: look harmless in the Dry run, act in the dispatch.
+        if string.sub(ctx.trace_id, 1, 7) == "reqdry_" then
+            return { refresh = true }
+        end
+        return { action = "act", args = { id = "probe" } }
+    elseif r == "flip" then
+        if ctx:await(ctx.dashboard_state:get("sel")) == "safe" then
+            return { refresh = true }
+        end
+        return { action = "act", args = { id = "flip" } }
+    elseif r == "flip_args" then
+        return { action = "act", args = { id = tostring(ctx:await(ctx.dashboard_state:get("sel"))) } }
+    elseif r == "probe_ro" then
+        -- Probe for the read-only Dry run bridge, then pretend to be a refresh.
+        local ok = pcall(function()
+            return ctx:await(ctx.inputs.act:invoke({ id = "probe_ro" }))
+        end)
+        return { refresh = true, probed = ok }
+    elseif r == "probe_write" then
+        if ctx:await(ctx.dashboard_state:get("sel")) == "safe" then
+            return { refresh = true }
+        end
+        return ctx:await(ctx.inputs.act:invoke({ id = "probe_write" }))
     end
     error("unsupported")
 end
@@ -3095,6 +3422,8 @@ return R
             ("t", NODRY_DECL, NODRY_RT),
             ("t", DATA_DECL, DATA_RT),
             ("t", ADAPTER_DECL, ADAPTER_RT),
+            ("t", BADGE_DECL, ""),
+            ("t", MUTE_DECL, ""),
         ] {
             let d = load_def(pkg, decl, rt);
             g.definitions.insert(d.manifest.id.clone(), d);
@@ -4203,7 +4532,7 @@ return R
 
         // A refresh is reported as a refresh, not as a fabricated execution record.
         let refreshed = a
-            .dispatch_widget_request_outcome(req("refresh", "adapter_root", 2, json!({})), &admin)
+            .dispatch_widget_request_outcome(req("refresh", "adapter_btn", 2, json!({})), &admin)
             .await
             .unwrap();
         let v = serde_json::to_value(&refreshed).unwrap();
@@ -4261,6 +4590,205 @@ return R
             .await
             .unwrap_err();
         assert!(err.contains("dashboard_state_reads"), "{err}");
+    }
+
+    // R7:SEC-2: a widget may only send the Requests its type declares (deny by default).
+    #[tokio::test]
+    async fn widgets_may_only_send_the_requests_they_declare() {
+        let e = engine();
+        let admin = Principal::administrator();
+        let a = &e.actions;
+        // A custom widget sends what it declares (`accepts_requests` and `requests` keys).
+        let WidgetRequestOutcome::Action(rec) = a
+            .dispatch_widget_request_outcome(
+                req("go", "adapter_badge", 1, json!({"id": "b1"})),
+                &admin,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected action outcome")
+        };
+        assert_eq!(rec.status, "succeeded");
+        a.dispatch_widget_request_outcome(req("refresh", "adapter_badge", 2, json!({})), &admin)
+            .await
+            .unwrap();
+        // ... but nothing else the Adapter accepts.
+        let err = a
+            .dispatch_widget_request_outcome(req("state", "adapter_badge", 3, json!({})), &admin)
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not declare request 'state'"), "{err}");
+        // A custom widget declaring nothing sends nothing, Dry run included.
+        let err = a
+            .dispatch_widget_request_outcome(
+                req("go", "adapter_mute", 1, json!({"id": "m1"})),
+                &admin,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("t.mute"), "{err}");
+        let err = a
+            .dry_run_widget_request(req("go", "adapter_mute", 1, json!({"id": "m1"})), &admin)
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not declare"), "{err}");
+        // Built-in widgets that only render, and unknown widget types, send no Requests.
+        for (wid, needle) in [
+            ("adapter_label", "does not send Requests"),
+            ("adapter_root", "does not send Requests"),
+            ("adapter_stray", "unknown widget type"),
+        ] {
+            let err = a
+                .dispatch_widget_request_outcome(req("refresh", wid, 1, json!({})), &admin)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{wid}: {err}");
+        }
+        assert!(e
+            .store
+            .list_action_executions(20)
+            .unwrap()
+            .iter()
+            .all(|r| r.args["id"] != "m1"));
+    }
+
+    // R7:SEC-1: on_request cannot tell its Dry run from the dispatch by the trace id.
+    #[tokio::test]
+    async fn widget_request_dry_run_is_indistinguishable_by_trace_id() {
+        let e = engine();
+        let admin = Principal::administrator();
+        let dry = e
+            .actions
+            .dry_run_widget_request(req("probe", "adapter_btn", 1, json!({})), &admin)
+            .await
+            .unwrap();
+        assert_eq!(dry.resolution, "action", "{dry:?}");
+        assert!(dry.requires_confirmation);
+        assert_eq!(dry.action_instance.as_deref(), Some("write"));
+    }
+
+    // R7:SEC-1: a dispatch is bound to its Dry run's resolution. A Request shown as a refresh
+    // (no confirmation) cannot run an action, and a confirmed action cannot change its target or
+    // arguments; with no Dry run on record the dispatch is unconstrained.
+    #[tokio::test]
+    async fn widget_request_dispatch_cannot_diverge_from_its_dry_run() {
+        let e = engine();
+        let admin = Principal::administrator();
+        let a = &e.actions;
+        let set_sel = |v: &str| {
+            e.store
+                .set_state("dashboard", "main", "sel", 1, 7, json!(v), None)
+                .unwrap();
+        };
+        let ran = |id: &str| {
+            e.store
+                .list_action_executions(50)
+                .unwrap()
+                .iter()
+                .any(|r| r.args["id"] == id)
+        };
+
+        set_sel("safe");
+        let dry = a
+            .dry_run_widget_request(req("flip", "adapter_btn", 10, json!({})), &admin)
+            .await
+            .unwrap();
+        assert_eq!(dry.resolution, "refresh");
+        assert!(!dry.requires_confirmation);
+        set_sel("evil");
+        let err = a
+            .dispatch_widget_request_outcome(req("flip", "adapter_btn", 11, json!({})), &admin)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Dry run resolved to a refresh"), "{err}");
+        assert!(!ran("flip"), "the unconfirmed action must not run");
+        assert!(audits(&e, "widget_request.dispatch")
+            .iter()
+            .any(|r| r.outcome == "denied"));
+
+        // Imperative invocation is refused as well when the Dry run showed a refresh.
+        set_sel("safe");
+        let dry = a
+            .dry_run_widget_request(req("probe_write", "adapter_btn", 12, json!({})), &admin)
+            .await
+            .unwrap();
+        assert!(!dry.requires_confirmation);
+        set_sel("evil");
+        let err = a
+            .dispatch_widget_request_outcome(
+                req("probe_write", "adapter_btn", 13, json!({})),
+                &admin,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("was not part of this widget Request's Dry run"),
+            "{err}"
+        );
+        assert!(!ran("probe_write"));
+
+        // A confirmed action call must keep its target and arguments.
+        set_sel("one");
+        let dry = a
+            .dry_run_widget_request(req("flip_args", "adapter_btn", 14, json!({})), &admin)
+            .await
+            .unwrap();
+        assert_eq!(dry.args, Some(json!({"id": "one"})));
+        set_sel("two");
+        let err = a
+            .dispatch_widget_request_outcome(req("flip_args", "adapter_btn", 15, json!({})), &admin)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("resolved to action 'write' at dispatch"),
+            "{err}"
+        );
+        assert!(!ran("two"));
+        // After a fresh Dry run (and confirmation) the same Request dispatches.
+        a.dry_run_widget_request(req("flip_args", "adapter_btn", 16, json!({})), &admin)
+            .await
+            .unwrap();
+        let WidgetRequestOutcome::Action(rec) = a
+            .dispatch_widget_request_outcome(req("flip_args", "adapter_btn", 17, json!({})), &admin)
+            .await
+            .unwrap()
+        else {
+            panic!("expected action outcome")
+        };
+        assert_eq!(rec.args["id"], "two");
+
+        // The binding is per Principal: another Principal's dispatch is not constrained by it.
+        set_sel("safe");
+        a.dry_run_widget_request(req("flip", "adapter_btn", 18, json!({})), &admin)
+            .await
+            .unwrap();
+        set_sel("evil");
+        let mut other = Principal::administrator();
+        other.id = "admin2".into();
+        assert!(a
+            .dispatch_widget_request_outcome(req("flip", "adapter_btn", 19, json!({})), &other)
+            .await
+            .is_ok());
+    }
+
+    // R7:SEC-1: probing the read-only Dry run bridge taints the Dry run (always confirmed).
+    #[tokio::test]
+    async fn widget_request_dry_run_that_probes_for_read_only_requires_confirmation() {
+        let e = engine();
+        let admin = Principal::administrator();
+        let dry = e
+            .actions
+            .dry_run_widget_request(req("probe_ro", "adapter_btn", 1, json!({})), &admin)
+            .await
+            .unwrap();
+        assert_eq!(dry.resolution, "unresolved", "{dry:?}");
+        assert!(dry.requires_confirmation);
+        assert!(dry
+            .dry_run_error
+            .as_deref()
+            .unwrap()
+            .contains("attempted a side effect"));
     }
 
     // act-21: invalidates may name a Definition; unmatched entries are reported.
