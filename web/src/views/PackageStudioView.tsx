@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   apiFetch,
   type DefinitionSources,
@@ -35,6 +35,16 @@ const NEW_DEFINITION_TEMPLATE = {
     'local dash = require("dash")\nlocal Runtime = require("runtime")\n\ndash.test("smoke", function(make_ctx)\n    local res = Runtime.query(make_ctx({}))\n    dash.assert(res.ok == true, "expected ok")\nend)\n',
 };
 
+/** Validation issues as (file-less) diagnostics. */
+function validationDiagnostics(report: ValidationReport | null | undefined): Diagnostic[] {
+  return (report?.issues ?? []).map((i) => ({
+    file: null,
+    line: null,
+    message: `${i.code} ${i.target}: ${i.message}`,
+    severity: i.severity === "error" ? "error" : "warning",
+  }));
+}
+
 type Results =
   | { kind: "tests"; report: DefinitionTestReport }
   | { kind: "preview"; report: PreviewTestReport }
@@ -60,6 +70,8 @@ export const PackageStudioView: React.FC = () => {
   const [diff, setDiff] = useState<DraftDiff | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [focus, setFocus] = useState<{ line: number; seq: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const draftRef = useRef<Promise<string> | null>(null);
 
   const loadAll = async () => {
     try {
@@ -120,11 +132,25 @@ export const PackageStudioView: React.FC = () => {
     setDirty(true);
   };
 
-  const ensureDraft = async (): Promise<string> => {
-    if (draftId) return draftId;
-    const d = await apiFetch<{ draft_id: string }>("/api/drafts", { method: "POST" });
-    setDraftId(d.draft_id);
-    return d.draft_id;
+  /**
+   * The open Draft, begun at most once: concurrent callers share the in-flight creation, so
+   * overlapping saves/previews never open (and orphan) a second Draft.
+   */
+  const ensureDraft = (): Promise<string> => {
+    if (draftRef.current) return draftRef.current;
+    const p = apiFetch<{ draft_id: string }>("/api/drafts", { method: "POST" }).then((d) => {
+      setDraftId(d.draft_id);
+      return d.draft_id;
+    });
+    draftRef.current = p;
+    p.catch(() => {
+      if (draftRef.current === p) draftRef.current = null;
+    });
+    return p;
+  };
+  const forgetDraft = () => {
+    draftRef.current = null;
+    setDraftId(null);
   };
 
   const refreshDiff = async (id: string) => {
@@ -140,21 +166,28 @@ export const PackageStudioView: React.FC = () => {
     try {
       const report = await apiFetch<ValidationReport>(`/api/drafts/${id}/validate`, { method: "POST" });
       setResults({ kind: "validation", report });
-      setDiagnostics(
-        report.issues.map((i) => ({
-          file: null,
-          line: null,
-          message: `${i.code} ${i.target}: ${i.message}`,
-          severity: i.severity === "error" ? "error" : "warning",
-        }))
-      );
+      setDiagnostics(validationDiagnostics(report));
     } catch (e) {
       setDiagnostics(parseLuauDiagnostics(String(e)));
       setResults({ kind: "message", text: String(e) });
     }
   };
 
-  const saveDefinitionToDraft = async () => {
+  /** Run one Draft operation at a time; the Draft buttons stay disabled meanwhile. */
+  const busyRef = useRef(false);
+  const exclusive = (fn: () => Promise<void>) => async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await fn();
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const saveDefinitionToDraft = exclusive(async () => {
     setError(null);
     try {
       const did = await ensureDraft();
@@ -174,15 +207,23 @@ export const PackageStudioView: React.FC = () => {
     } catch (e) {
       setError(String(e));
     }
-  };
+  });
 
-  const runPreviewTests = async () => {
+  const runPreviewTests = exclusive(async () => {
     setError(null);
     try {
       const did = await ensureDraft();
       const rep = await apiFetch<PreviewTestReport>(`/api/drafts/${did}/preview`, { method: "POST" });
       setResults({ kind: "preview", report: rep });
-      const diags: Diagnostic[] = [];
+      // Validation failures skip tests and renders, so their issues are the only reason given.
+      const diags: Diagnostic[] = validationDiagnostics(rep.validation);
+      for (const [dash, err] of Object.entries(rep.preview_render_errors ?? {})) {
+        diags.push(
+          ...parseLuauDiagnostics(err).map((d) =>
+            d.file === null ? { ...d, message: `Dashboard '${dash}' failed to render: ${d.message}` } : d
+          )
+        );
+      }
       for (const t of rep.definition_tests ?? []) {
         for (const c of t.cases ?? []) {
           if (!c.passed && c.error) {
@@ -200,7 +241,7 @@ export const PackageStudioView: React.FC = () => {
       setDiagnostics(parseLuauDiagnostics(String(e)));
       setError(String(e));
     }
-  };
+  });
 
   const runSingleDefTest = async () => {
     if (!selectedId) return;
@@ -222,7 +263,7 @@ export const PackageStudioView: React.FC = () => {
     }
   };
 
-  const activateDraft = async () => {
+  const activateDraft = exclusive(async () => {
     if (!draftId) return;
     setError(null);
     try {
@@ -230,7 +271,7 @@ export const PackageStudioView: React.FC = () => {
         `/api/drafts/${draftId}/activate`,
         { method: "POST" }
       );
-      setDraftId(null);
+      forgetDraft();
       setDiff(null);
       setResults({
         kind: "message",
@@ -240,21 +281,21 @@ export const PackageStudioView: React.FC = () => {
     } catch (e) {
       setError(String(e));
     }
-  };
+  });
 
-  const discardDraft = async () => {
+  const discardDraft = exclusive(async () => {
     if (!draftId) return;
     setError(null);
     try {
       await apiFetch(`/api/drafts/${draftId}`, { method: "DELETE" });
-      setDraftId(null);
+      forgetDraft();
       setDiff(null);
       setResults(null);
       if (selectedId) await openDefinition(selectedId, null);
     } catch (e) {
       setError(String(e));
     }
-  };
+  });
 
   const syncGit = async () => {
     setError(null);
@@ -422,23 +463,23 @@ export const PackageStudioView: React.FC = () => {
             <button
               type="button"
               className="btn"
-              disabled={readOnly || customRuntimeFile}
+              disabled={busy || readOnly || customRuntimeFile}
               title={customRuntimeFile ? `declares runtime = "${sources?.runtime_file}"; edit it in an external IDE` : undefined}
               onClick={() => void saveDefinitionToDraft()}
             >
               Save to Draft &amp; Check
             </button>
-            <button type="button" className="btn" onClick={() => void runPreviewTests()}>
+            <button type="button" className="btn" disabled={busy} onClick={() => void runPreviewTests()}>
               Preview &amp; Scenario Tests
             </button>
             <button type="button" className="btn" disabled={!draftId} onClick={() => draftId && void refreshDiff(draftId)}>
               Show Diff
             </button>
-            <button type="button" className="btn primary" disabled={!draftId} onClick={() => void activateDraft()}>
+            <button type="button" className="btn primary" disabled={busy || !draftId} onClick={() => void activateDraft()}>
               Commit &amp; Activate
             </button>
             {draftId && (
-              <button type="button" className="btn danger" onClick={() => void discardDraft()}>
+              <button type="button" className="btn danger" disabled={busy} onClick={() => void discardDraft()}>
                 Discard Draft
               </button>
             )}
@@ -612,6 +653,30 @@ const ResultsCard: React.FC<{ results: Results }> = ({ results }) => {
                   <span className={`badge ${s.passed ? "ok" : "danger"}`}>{s.passed ? "pass" : "fail"}</span>
                 </td>
                 <td style={{ fontSize: 11 }}>{s.error ?? ""}</td>
+              </tr>
+            ))}
+          {results.kind === "preview" &&
+            Object.entries(results.report.preview_render_errors ?? {}).map(([dash, err]) => (
+              <tr key={`render:${dash}`}>
+                <td>
+                  render <code>{dash}</code>
+                </td>
+                <td>
+                  <span className="badge danger">fail</span>
+                </td>
+                <td style={{ fontSize: 11 }}>{err}</td>
+              </tr>
+            ))}
+          {results.kind === "preview" &&
+            (results.report.validation?.issues ?? []).map((i, idx) => (
+              <tr key={`issue:${idx}`}>
+                <td>
+                  validation <code>{i.code}</code> {i.target}
+                </td>
+                <td>
+                  <span className={`badge ${i.severity === "error" ? "danger" : "warn"}`}>{i.severity}</span>
+                </td>
+                <td style={{ fontSize: 11 }}>{i.message}</td>
               </tr>
             ))}
         </tbody>

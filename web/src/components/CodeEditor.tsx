@@ -21,6 +21,9 @@ export const CodeEditor: React.FC<{
   const gutterRef = useRef<HTMLDivElement>(null);
   const listId = useId();
   const [suggest, setSuggest] = useState<{ items: string[]; start: number; index: number } | null>(null);
+  /** Set by Escape (no completion list open): the next Tab leaves the editor (WCAG 2.1.2). */
+  const escapedRef = useRef(false);
+  const hintId = useId();
 
   const lines = useMemo(() => Math.max(minRows, value.split("\n").length), [value, minRows]);
   const diagByLine = useMemo(() => {
@@ -54,7 +57,7 @@ export const CodeEditor: React.FC<{
 
   const accept = (item: string) => {
     const ta = taRef.current;
-    if (!ta || !suggest) return;
+    if (!ta || !suggest || readOnly) return;
     const cursor = ta.selectionStart;
     const next = value.slice(0, suggest.start) + item + value.slice(cursor);
     onChange(next);
@@ -92,6 +95,7 @@ export const CodeEditor: React.FC<{
           aria-controls={suggest ? listId : undefined}
           aria-expanded={Boolean(suggest)}
           aria-invalid={diagnostics.length > 0 || undefined}
+          aria-describedby={readOnly ? undefined : hintId}
           spellCheck={false}
           readOnly={readOnly}
           rows={lines}
@@ -100,18 +104,29 @@ export const CodeEditor: React.FC<{
             if (gutterRef.current) gutterRef.current.scrollTop = e.currentTarget.scrollTop;
           }}
           onChange={(e) => {
+            escapedRef.current = false;
             onChange(e.target.value);
             refreshSuggest(e.target.value, e.target.selectionStart);
           }}
-          onBlur={() => setTimeout(() => setSuggest(null), 150)}
+          onBlur={() => {
+            escapedRef.current = false;
+            setTimeout(() => setSuggest(null), 150);
+          }}
           onKeyDown={(e) => {
+            if (e.key !== "Tab" && e.key !== "Shift" && e.key !== "Escape") escapedRef.current = false;
             if (e.key === " " && e.ctrlKey) {
               e.preventDefault();
-              refreshSuggest(value, e.currentTarget.selectionStart, true);
+              if (!readOnly) refreshSuggest(value, e.currentTarget.selectionStart, true);
               return;
             }
             if (!suggest) {
-              if (e.key === "Tab" && !readOnly) {
+              if (e.key === "Escape") {
+                // Release keyboard focus: the next Tab moves on instead of indenting.
+                escapedRef.current = true;
+                return;
+              }
+              // Shift+Tab always moves focus back; Tab indents unless the user pressed Escape.
+              if (e.key === "Tab" && !e.shiftKey && !readOnly && !escapedRef.current) {
                 e.preventDefault();
                 const ta = e.currentTarget;
                 const s = ta.selectionStart;
@@ -137,6 +152,11 @@ export const CodeEditor: React.FC<{
           }}
         />
       </div>
+      {!readOnly && (
+        <div id={hintId} className="code-editor-hint" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+          Tab indents; press Esc then Tab (or Shift+Tab) to leave the editor.
+        </div>
+      )}
       {suggest && (
         <ul id={listId} role="listbox" aria-label={`${label} completions`} className="completion-list">
           {suggest.items.map((item, i) => (

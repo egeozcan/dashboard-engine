@@ -40,6 +40,8 @@ export const GraphEditorView: React.FC = () => {
   const [edges, setEdges] = useState<EdgeGeom[]>([]);
   const [layoutTick, setLayoutTick] = useState(0);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const draftRef = useRef<Promise<string> | null>(null);
+  const chainRef = useRef<Promise<void>>(Promise.resolve());
 
   const loadGraph = async () => {
     try {
@@ -79,25 +81,42 @@ export const GraphEditorView: React.FC = () => {
     return g;
   };
 
-  const ensureDraft = async (): Promise<{ id: string; graph: GraphInspectResponse }> => {
-    if (draftId && draftGraph) return { id: draftId, graph: draftGraph };
-    const d = await apiFetch<{ draft_id: string }>("/api/drafts", { method: "POST" });
-    setDraftId(d.draft_id);
-    const graph = await loadDraftGraph(d.draft_id);
-    return { id: d.draft_id, graph };
+  /**
+   * The open Draft, begun at most once: concurrent callers share the in-flight creation so
+   * overlapping edits never open (and orphan) a second Draft.
+   */
+  const ensureDraft = (): Promise<string> => {
+    if (draftRef.current) return draftRef.current;
+    const p = apiFetch<{ draft_id: string }>("/api/drafts", { method: "POST" }).then((d) => {
+      setDraftId(d.draft_id);
+      return d.draft_id;
+    });
+    draftRef.current = p;
+    p.catch(() => {
+      if (draftRef.current === p) draftRef.current = null;
+    });
+    return p;
   };
 
-  /** Run one Draft mutation, then reload the Draft graph (and its validation). */
-  const mutate = async (fn: (id: string, graph: GraphInspectResponse) => Promise<void>) => {
-    setError(null);
-    try {
-      const { id, graph } = await ensureDraft();
+  /** Queue one Draft operation behind every earlier one (they never interleave). */
+  const serialize = (op: () => Promise<void>): Promise<void> => {
+    const next = chainRef.current.then(op).catch((e) => setError(String(e)));
+    chainRef.current = next;
+    return next;
+  };
+
+  /**
+   * Run one Draft mutation against the Draft graph as it is now (read after every earlier
+   * mutation finished, never a render-time snapshot), then reload it and its validation.
+   */
+  const mutate = (fn: (id: string, graph: GraphInspectResponse) => Promise<void>) =>
+    serialize(async () => {
+      setError(null);
+      const id = await ensureDraft();
+      const graph = await apiFetch<GraphInspectResponse>(`/api/drafts/${id}/graph`);
       await fn(id, graph);
       await loadDraftGraph(id);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+    });
 
   const upsertInstance = (inst: InstanceConfig) =>
     mutate(async (id) => {
@@ -145,35 +164,36 @@ export const GraphEditorView: React.FC = () => {
       if (selectedId === instId) setSelectedId(null);
     });
 
-  const discardDraft = async () => {
-    if (!draftId) return;
-    setError(null);
-    try {
-      await apiFetch(`/api/drafts/${draftId}`, { method: "DELETE" });
-      setDraftId(null);
-      setDraftGraph(null);
-      setStatusMsg(null);
-    } catch (e) {
-      setError(String(e));
-    }
+  const forgetDraft = () => {
+    draftRef.current = null;
+    setDraftId(null);
+    setDraftGraph(null);
   };
 
-  const activateDraft = async () => {
-    if (!draftId) return;
-    setError(null);
-    try {
+  // Discard and activate wait for queued edits so none lands on a closed Draft.
+  const discardDraft = () =>
+    serialize(async () => {
+      const id = draftRef.current ? await draftRef.current : null;
+      if (!id) return;
+      setError(null);
+      await apiFetch(`/api/drafts/${id}`, { method: "DELETE" });
+      forgetDraft();
+      setStatusMsg(null);
+    });
+
+  const activateDraft = () =>
+    serialize(async () => {
+      const id = draftRef.current ? await draftRef.current : null;
+      if (!id) return;
+      setError(null);
       const res = await apiFetch<{ revision_commit: string; generation_id: number }>(
-        `/api/drafts/${draftId}/activate`,
+        `/api/drafts/${id}/activate`,
         { method: "POST" }
       );
-      setDraftId(null);
-      setDraftGraph(null);
+      forgetDraft();
       setStatusMsg(`Activated Generation #${res.generation_id} (${res.revision_commit.slice(0, 8)})`);
       await loadGraph();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+    });
 
   // Draw configured edges (source -> consumer input) between node cards.
   useLayoutEffect(() => {

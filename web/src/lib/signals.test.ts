@@ -120,7 +120,7 @@ describe("SignalClient", () => {
     client.close();
   });
 
-  it("resubscribes a query for a fresh snapshot on a sequence gap", () => {
+  it("requests a fresh snapshot with resync_query on a sequence gap", () => {
     const client = makeClient();
     const states: unknown[] = [];
     client.subscribeQuery("open_prs", { repository: "acme/platform" }, (s) => states.push(s.value));
@@ -129,6 +129,7 @@ describe("SignalClient", () => {
     const subscribe = { type: "subscribe_query", instance: "open_prs", params: { repository: "acme/platform" } };
     expect(ws.sent.filter((m) => m.type === "subscribe_query")).toEqual([subscribe]);
 
+    ws.receive({ type: "subscribed", query_key: "qk1", instance: "open_prs" });
     ws.receive({ type: "query_signal", envelope: snap(1, [{ id: "x", n: 1 }]) });
     ws.receive({
       type: "query_signal",
@@ -138,9 +139,14 @@ describe("SignalClient", () => {
 
     ws.receive({ type: "query_signal", envelope: delta(5, 6, [{ op: "delete", key: "x" }]) });
     expect(states).toHaveLength(2);
-    expect(ws.sent.filter((m) => m.type === "subscribe_query")).toEqual([subscribe, subscribe]);
+    // The server keeps its forwarder; the client asks it for a snapshot instead of resubscribing.
+    expect(ws.sent.filter((m) => m.type === "subscribe_query")).toEqual([subscribe]);
+    expect(ws.sent.filter((m) => m.type === "resync_query")).toEqual([{ type: "resync_query", query_key: "qk1" }]);
+    // Deltas before the resync snapshot are ignored without asking again.
+    ws.receive({ type: "query_signal", envelope: delta(6, 7, [{ op: "delete", key: "x" }]) });
+    expect(ws.sent.filter((m) => m.type === "resync_query")).toHaveLength(1);
 
-    ws.receive({ type: "query_signal", envelope: snap(6, [{ id: "y", n: 1 }]) });
+    ws.receive({ type: "query_signal", envelope: snap(7, [{ id: "y", n: 1 }]) });
     expect(states[2]).toEqual([{ id: "y", n: 1 }]);
     client.close();
   });
@@ -170,6 +176,69 @@ describe("SignalClient", () => {
     client.close();
   });
 
+  it("binds query subscriptions by the server's query_key, not by Instance (web-5)", () => {
+    const client = makeClient();
+    const a: unknown[] = [];
+    const b: unknown[] = [];
+    client.subscribeQuery("open_prs", { repo: "a" }, (s) => a.push(s.value));
+    client.subscribeQuery("open_prs", { repo: "b" }, (s) => b.push(s.value));
+    const ws = MockWebSocket.latest();
+    ws.open();
+    // Replies arrive in request order.
+    ws.receive({ type: "subscribed", query_key: "qk_a", instance: "open_prs" });
+    ws.receive({ type: "subscribed", query_key: "qk_b", instance: "open_prs" });
+    // b's snapshot arrives first: it must reach b only.
+    ws.receive({ type: "query_signal", envelope: snap(1, ["rows of b"], { query_key: "qk_b" }) });
+    ws.receive({ type: "query_signal", envelope: snap(1, ["rows of a"], { query_key: "qk_a" }) });
+    expect(a).toEqual([["rows of a"]]);
+    expect(b).toEqual([["rows of b"]]);
+    client.close();
+  });
+
+  it("skips a refused subscribe_query when binding later replies (web-5)", () => {
+    const client = makeClient();
+    const onError = vi.fn();
+    client.onError(onError);
+    const a: unknown[] = [];
+    const b: unknown[] = [];
+    client.subscribeQuery("open_prs", { repo: "a" }, (s) => a.push(s.value));
+    client.subscribeQuery("open_prs", { repo: "b" }, (s) => b.push(s.value));
+    const ws = MockWebSocket.latest();
+    ws.open();
+    ws.receive({ type: "error", code: "query_denied", instance: "open_prs", message: "denied" });
+    ws.receive({ type: "subscribed", query_key: "qk_b", instance: "open_prs" });
+    ws.receive({ type: "query_signal", envelope: snap(1, ["rows of b"], { query_key: "qk_b" }) });
+    expect(a).toEqual([]);
+    expect(b).toEqual([["rows of b"]]);
+    expect(onError).toHaveBeenCalledWith("denied", undefined, expect.objectContaining({ code: "query_denied" }));
+    client.close();
+  });
+
+  it("unsubscribes server-side when the last listener goes, including late-bound ones (web-5)", () => {
+    const client = makeClient();
+    const off1 = client.subscribeQuery("open_prs", { repo: "a" }, vi.fn());
+    const off2 = client.subscribeQuery("open_prs", { repo: "a" }, vi.fn());
+    const sock = MockWebSocket.latest();
+    sock.open();
+    sock.receive({ type: "subscribed", query_key: "qk_a", instance: "open_prs" });
+    off1();
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toEqual([]);
+    off2();
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toEqual([
+      { type: "unsubscribe_query", query_key: "qk_a" },
+    ]);
+
+    // Unsubscribed before the server replied: released as soon as the reply arrives.
+    const off3 = client.subscribeQuery("open_prs", { repo: "c" }, vi.fn());
+    off3();
+    sock.receive({ type: "subscribed", query_key: "qk_c", instance: "open_prs" });
+    expect(sock.sent.filter((m) => m.type === "unsubscribe_query")).toContainEqual({
+      type: "unsubscribe_query",
+      query_key: "qk_c",
+    });
+    client.close();
+  });
+
   it("forwards Dashboard State Signals and errors", () => {
     const client = makeClient();
     const onState = vi.fn();
@@ -185,7 +254,11 @@ describe("SignalClient", () => {
     });
     ws.receive({ type: "error", dashboard_id: "engineering", message: "boom" });
     expect(onState).toHaveBeenCalledWith(expect.objectContaining({ value: "acme/payments" }));
-    expect(onError).toHaveBeenCalledWith("boom", "engineering");
+    expect(onError).toHaveBeenCalledWith(
+      "boom",
+      "engineering",
+      expect.objectContaining({ code: "error", message: "boom", dashboardId: "engineering" })
+    );
     client.close();
   });
 });
