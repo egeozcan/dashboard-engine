@@ -292,6 +292,44 @@ CREATE TABLE IF NOT EXISTS git_sync_state (
 );
 "#;
 
+/// Idempotent event-log / automation schema extensions (§7.2, §7.3): automation execution
+/// records (replay safety, traceability) and persisted trigger state (cron catch-up, Signal
+/// predicates). Applied on every open with `IF NOT EXISTS`, so it is safe on existing databases.
+const EVENT_LOG_EXTENSIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS automation_executions (
+    execution_id TEXT PRIMARY KEY,
+    automation_id TEXT NOT NULL,
+    trigger_kind TEXT NOT NULL,
+    trigger_ref TEXT NOT NULL,
+    event_id TEXT,
+    run_as TEXT,
+    status TEXT NOT NULL, -- running | succeeded | failed
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    result_json TEXT,
+    action_executions_json TEXT,
+    trace_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_automation_exec_trigger
+    ON automation_executions(automation_id, trigger_ref, status);
+CREATE INDEX IF NOT EXISTS idx_automation_exec_started
+    ON automation_executions(started_at);
+
+CREATE TABLE IF NOT EXISTS automation_trigger_state (
+    automation_id TEXT NOT NULL,
+    trigger_key TEXT NOT NULL,
+    last_fired_at TEXT,
+    last_fingerprint TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (automation_id, trigger_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_emitted_at ON events(emitted_at);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_event ON dead_letters(event_id, resolved);
+"#;
+
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -324,6 +362,8 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         tx.commit()?;
     }
+
+    conn.execute_batch(EVENT_LOG_EXTENSIONS)?;
 
     Ok(())
 }

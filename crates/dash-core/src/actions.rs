@@ -407,20 +407,17 @@ impl ActionManager {
             );
 
             // Automatic completion event & query invalidation (§9.1 step 6)
-            if final_status == "succeeded" {
-                let _ = self.events.emit(
+            if final_status == "succeeded" || final_status == "failed" {
+                self.emit_completion(
                     action_instance,
-                    "dash.action_completed",
-                    "1",
+                    &execution_id,
+                    &final_status,
+                    final_reason.as_deref(),
                     &trace_id,
-                    true,
-                    serde_json::json!({
-                        "execution_id": execution_id,
-                        "action_instance": action_instance,
-                        "status": "succeeded",
-                    }),
+                    None,
                 );
-
+            }
+            if final_status == "succeeded" {
                 let to_invalidate = resolve_invalidations(&inst, &def, &g);
                 if !to_invalidate.is_empty() {
                     self.queries.invalidate_instances(&to_invalidate).await;
@@ -536,6 +533,16 @@ impl ActionManager {
             )
             .map_err(|e| e.to_string())?;
 
+        if next_status == "succeeded" || next_status == "failed" {
+            self.emit_completion(
+                &rec.action_instance,
+                execution_id,
+                &next_status,
+                next_reason.as_deref(),
+                &rec.trace_id,
+                Some("reconciled"),
+            );
+        }
         if next_status == "succeeded" {
             let to_invalidate = resolve_invalidations(&inst, &def, &g);
             if !to_invalidate.is_empty() {
@@ -609,6 +616,15 @@ impl ActionManager {
             )
             .map_err(|e| e.to_string())?;
 
+        self.emit_completion(
+            &rec.action_instance,
+            execution_id,
+            resolved_status,
+            Some(reason),
+            &rec.trace_id,
+            Some("manual"),
+        );
+
         if resolved_status == "succeeded" {
             let g = self.graph.load_full();
             if let (Some(inst), Some(def)) = (
@@ -628,6 +644,34 @@ impl ActionManager {
             .get_action_execution(execution_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "execution disappeared".into())
+    }
+
+    /// Durable `dash.action_completed` Event for a terminal execution status (§7.2: action
+    /// executions emit completion Events automatically), including outcomes that became known
+    /// later through `reconcile` or audited manual resolution.
+    fn emit_completion(
+        &self,
+        action_instance: &str,
+        execution_id: &str,
+        status: &str,
+        reason: Option<&str>,
+        trace_id: &str,
+        resolution: Option<&str>,
+    ) {
+        let _ = self.events.emit(
+            action_instance,
+            "dash.action_completed",
+            "1",
+            trace_id,
+            true,
+            serde_json::json!({
+                "execution_id": execution_id,
+                "action_instance": action_instance,
+                "status": status,
+                "reason": reason,
+                "resolution": resolution,
+            }),
+        );
     }
 
     /// Graceful drain on shutdown: incomplete in-flight actions become `unknown` (§15.2).
@@ -973,10 +1017,10 @@ impl HostBridge for ActionHostBridge {
         }
         self.manager
             .events
-            .emit(
+            .emit_declared(
                 &self.caller_inst.id,
+                &self.caller_def.manifest.emits,
                 event_type,
-                "1",
                 &self.trace_id,
                 durable,
                 payload,

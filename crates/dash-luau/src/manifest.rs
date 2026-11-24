@@ -372,6 +372,18 @@ pub struct TriggerDeclSpec {
     pub source_input: Option<String>,
     #[serde(default)]
     pub catch_up: Option<String>, // skip | catch_up
+    /// Signal triggers: query parameters for the watched `source_input` data provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// Signal triggers: State key to watch instead of a Query result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_key: Option<String>,
+    /// Signal triggers: optional read-only Luau predicate function in the runtime module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// Bounded retry attempts before dead-lettering (engine default: 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

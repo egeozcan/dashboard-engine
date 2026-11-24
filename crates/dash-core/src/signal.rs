@@ -307,6 +307,21 @@ impl SignalHub {
         self.state_tx.subscribe()
     }
 
+    /// Live subscribers (stream + watch receivers) of one query key (§6.2 active queries).
+    pub fn subscriber_count(&self, query_key: &str) -> usize {
+        let streams = self
+            .query_streams
+            .get(query_key)
+            .map(|s| s.receiver_count())
+            .unwrap_or(0);
+        let watches = self
+            .query_watches
+            .get(query_key)
+            .map(|w| w.receiver_count())
+            .unwrap_or(0);
+        streams + watches
+    }
+
     pub fn total_subscribers(&self) -> usize {
         self.query_streams
             .iter()

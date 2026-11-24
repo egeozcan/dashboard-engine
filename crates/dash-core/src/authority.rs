@@ -516,6 +516,9 @@ pub fn validate_configured_graph(
         }
     }
 
+    // Background work: automation triggers, history series and keep-warm polling (§7.3, §7.4)
+    issues.extend(crate::automations::validate_background_work(graph, store));
+
     let valid = !issues.iter().any(|i| i.severity == "error");
     ValidationReport { valid, issues }
 }

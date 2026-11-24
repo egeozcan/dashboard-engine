@@ -67,6 +67,58 @@ pub struct DurableEventRecord {
     pub payload: serde_json::Value,
 }
 
+/// A durable Event that a consumer could not process after bounded retries (§7.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterRecord {
+    pub dlq_id: String,
+    pub consumer_id: String,
+    pub event_id: String,
+    pub attempts: i64,
+    pub last_error: String,
+    pub failed_at: String,
+    pub resolved: bool,
+}
+
+/// One Automation run: which trigger caused it, under which Service principal, its outcome and
+/// the action executions it produced (§7.3 execution records).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationExecutionRecord {
+    pub execution_id: String,
+    pub automation_id: String,
+    /// `event` | `cron` | `signal` | `manual`
+    pub trigger_kind: String,
+    /// Stable identity of the triggering occurrence, e.g. `event:<event_id>`,
+    /// `cron:<index>:<scheduled_for>` or `signal:<index>:<fingerprint>`.
+    pub trigger_ref: String,
+    pub event_id: Option<String>,
+    pub run_as: Option<String>,
+    /// `running` | `succeeded` | `failed`
+    pub status: String,
+    pub attempts: i64,
+    pub error: Option<String>,
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub action_executions: Vec<String>,
+    pub trace_id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Persisted per-trigger state for cron catch-up and Signal predicate change detection (§7.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationTriggerState {
+    pub automation_id: String,
+    pub trigger_key: String,
+    pub last_fired_at: Option<String>,
+    pub last_fingerprint: Option<String>,
+    pub updated_at: String,
+}
+
+/// Upper bound on history samples returned by one query (§7.4 query budget).
+pub const HISTORY_QUERY_BUDGET: usize = 10_000;
+/// Upper bound on durable Events returned by one consumer log read.
+pub const EVENT_READ_BUDGET: usize = 1_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionExecutionRecord {
     pub execution_id: String,
@@ -563,6 +615,31 @@ impl SqliteStore {
         durable: bool,
         payload: serde_json::Value,
     ) -> Result<DurableEventRecord, StoreError> {
+        self.append_event_min_sequence(
+            source_instance,
+            semantic_type,
+            schema_version,
+            trace_id,
+            durable,
+            payload,
+            1,
+        )
+    }
+
+    /// Append an Event whose source-local sequence is `max(MAX(sequence) + 1, min_sequence)`.
+    /// The EventBus uses `min_sequence` to keep ephemeral and durable Events of one source in a
+    /// single monotonic sequence space (§7.2); the durable log may therefore contain gaps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_min_sequence(
+        &self,
+        source_instance: &str,
+        semantic_type: &str,
+        schema_version: &str,
+        trace_id: &str,
+        durable: bool,
+        payload: serde_json::Value,
+        min_sequence: i64,
+    ) -> Result<DurableEventRecord, StoreError> {
         let safe_payload = self.redactor().redact_json(&payload);
         let payload_json = serde_json::to_string(&safe_payload)?;
         let event_id = format!("evt_{}", Uuid::now_v7().simple());
@@ -574,7 +651,7 @@ impl SqliteStore {
                 params![source_instance],
                 |r| r.get(0),
             )?;
-            let next_seq = max_seq + 1;
+            let next_seq = (max_seq + 1).max(min_sequence);
             tx.execute(
                 "INSERT INTO events (event_id, source_instance, sequence, emitted_at, semantic_type, schema_version, trace_id, durable, payload_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -610,30 +687,183 @@ impl SqliteStore {
         source_instance: &str,
         after_sequence: i64,
     ) -> Result<Vec<DurableEventRecord>, StoreError> {
+        self.list_events_since_limited(source_instance, after_sequence, usize::MAX)
+    }
+
+    /// Read at most `limit` durable Events of one source after `after_sequence`, in sequence order.
+    pub fn list_events_since_limited(
+        &self,
+        source_instance: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<DurableEventRecord>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_conn_sync(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, source_instance, sequence, emitted_at, semantic_type, schema_version, trace_id, durable, payload_json
-                 FROM events WHERE source_instance = ?1 AND sequence > ?2 ORDER BY sequence ASC",
+                 FROM events WHERE source_instance = ?1 AND sequence > ?2 ORDER BY sequence ASC LIMIT ?3",
             )?;
-            let rows = stmt.query_map(params![source_instance, after_sequence], |r| {
-                let raw: String = r.get(8)?;
-                Ok(DurableEventRecord {
-                    event_id: r.get(0)?,
-                    source_instance: r.get(1)?,
-                    sequence: r.get(2)?,
-                    emitted_at: r.get(3)?,
-                    semantic_type: r.get(4)?,
-                    schema_version: r.get(5)?,
-                    trace_id: r.get(6)?,
-                    durable: r.get::<_, i64>(7)? != 0,
-                    payload: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![source_instance, after_sequence, limit],
+                Self::map_event_row,
+            )?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
             }
             Ok(out)
+        })
+    }
+
+    fn map_event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DurableEventRecord> {
+        let raw: String = r.get(8)?;
+        Ok(DurableEventRecord {
+            event_id: r.get(0)?,
+            source_instance: r.get(1)?,
+            sequence: r.get(2)?,
+            emitted_at: r.get(3)?,
+            semantic_type: r.get(4)?,
+            schema_version: r.get(5)?,
+            trace_id: r.get(6)?,
+            durable: r.get::<_, i64>(7)? != 0,
+            payload: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+        })
+    }
+
+    pub fn get_event(&self, event_id: &str) -> Result<Option<DurableEventRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT event_id, source_instance, sequence, emitted_at, semantic_type, schema_version, trace_id, durable, payload_json
+                 FROM events WHERE event_id = ?1",
+                params![event_id],
+                Self::map_event_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// Highest durable sequence of one source (0 when it has no Events).
+    pub fn max_event_sequence(&self, source_instance: &str) -> Result<i64, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE source_instance = ?1",
+                params![source_instance],
+                |r| r.get(0),
+            )
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// Highest durable sequence of one source among Events emitted strictly before `cutoff`
+    /// (RFC 3339). Used to start a newly registered consumer at the log head (§7.3 catch-up: skip).
+    pub fn max_event_sequence_before(
+        &self,
+        source_instance: &str,
+        cutoff: &str,
+    ) -> Result<i64, StoreError> {
+        let cutoff_dt = DateTime::parse_from_rfc3339(cutoff)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence, emitted_at FROM events WHERE source_instance = ?1 ORDER BY sequence DESC",
+            )?;
+            let rows = stmt.query_map(params![source_instance], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (seq, at) = row?;
+                let before = DateTime::parse_from_rfc3339(&at)
+                    .map(|d| d.with_timezone(&Utc) < cutoff_dt)
+                    .unwrap_or(true);
+                if before {
+                    return Ok(seq);
+                }
+            }
+            Ok(0)
+        })
+    }
+
+    /// Distinct source Instances that have durable Events in the log.
+    pub fn list_event_sources(&self) -> Result<Vec<String>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT DISTINCT source_instance FROM events ORDER BY source_instance")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Retention (§7.2): delete durable Events emitted before `cutoff` (RFC 3339) that every
+    /// registered consumer of their source has acknowledged and that no unresolved dead letter
+    /// still references, together with finished automation execution records older than
+    /// `cutoff` whose Event is gone. Returns the number of deleted Events.
+    pub fn prune_events_before(&self, cutoff: &str) -> Result<usize, StoreError> {
+        let cutoff_dt = DateTime::parse_from_rfc3339(cutoff)
+            .map(|d| d.with_timezone(&Utc))
+            .map_err(|e| StoreError::NotFound(format!("invalid retention cutoff '{cutoff}': {e}")))?;
+        self.with_conn_sync(|conn| {
+            let candidates: Vec<(String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT e.event_id, e.emitted_at FROM events e
+                     WHERE e.sequence <= COALESCE(
+                            (SELECT MIN(c.last_sequence) FROM event_consumer_checkpoints c
+                              WHERE c.source_instance = e.source_instance),
+                            e.sequence)
+                       AND NOT EXISTS (SELECT 1 FROM dead_letters d
+                                        WHERE d.event_id = e.event_id AND d.resolved = 0)",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let mut v = Vec::new();
+                for row in rows {
+                    v.push(row?);
+                }
+                v
+            };
+            let tx = conn.unchecked_transaction()?;
+            let mut deleted = 0;
+            for (event_id, at) in candidates {
+                let old = DateTime::parse_from_rfc3339(&at)
+                    .map(|d| d.with_timezone(&Utc) < cutoff_dt)
+                    .unwrap_or(false);
+                if old {
+                    deleted += tx.execute("DELETE FROM events WHERE event_id = ?1", params![event_id])?;
+                }
+            }
+            // Automation execution records older than the cutoff whose Event is gone (or that had
+            // no Event) can no longer guard a replay; drop them with the same retention.
+            let stale_runs: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT a.execution_id, a.started_at FROM automation_executions a
+                     WHERE a.status != 'running'
+                       AND (a.event_id IS NULL
+                            OR NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id = a.event_id))",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let mut v = Vec::new();
+                for row in rows {
+                    v.push(row?);
+                }
+                v
+            };
+            for (execution_id, at) in stale_runs {
+                let old = DateTime::parse_from_rfc3339(&at)
+                    .map(|d| d.with_timezone(&Utc) < cutoff_dt)
+                    .unwrap_or(false);
+                if old {
+                    tx.execute(
+                        "DELETE FROM automation_executions WHERE execution_id = ?1",
+                        params![execution_id],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(deleted)
         })
     }
 
@@ -655,6 +885,26 @@ impl SqliteStore {
         })
     }
 
+    /// Consumer checkpoint, or `None` when the consumer was never registered for the source.
+    pub fn find_consumer_checkpoint(
+        &self,
+        consumer_id: &str,
+        source_instance: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT last_sequence FROM event_consumer_checkpoints
+                 WHERE consumer_id = ?1 AND source_instance = ?2",
+                params![consumer_id, source_instance],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// Advance a consumer checkpoint. Checkpoints never move backwards: acknowledging an older
+    /// sequence (for example while replaying) keeps the higher value.
     pub fn set_consumer_checkpoint(
         &self,
         consumer_id: &str,
@@ -667,7 +917,7 @@ impl SqliteStore {
                 "INSERT INTO event_consumer_checkpoints (consumer_id, source_instance, last_sequence, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(consumer_id, source_instance) DO UPDATE SET
-                    last_sequence = excluded.last_sequence,
+                    last_sequence = MAX(last_sequence, excluded.last_sequence),
                     updated_at = excluded.updated_at",
                 params![consumer_id, source_instance, last_sequence, now],
             )?;
@@ -692,6 +942,271 @@ impl SqliteStore {
                 params![dlq_id, consumer_id, event_id, attempts, safe_err, failed_at],
             )?;
             Ok(dlq_id)
+        })
+    }
+
+    fn map_dead_letter_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRecord> {
+        Ok(DeadLetterRecord {
+            dlq_id: r.get(0)?,
+            consumer_id: r.get(1)?,
+            event_id: r.get(2)?,
+            attempts: r.get(3)?,
+            last_error: r.get(4)?,
+            failed_at: r.get(5)?,
+            resolved: r.get::<_, i64>(6)? != 0,
+        })
+    }
+
+    pub fn list_dead_letters(
+        &self,
+        include_resolved: bool,
+        limit: usize,
+    ) -> Result<Vec<DeadLetterRecord>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT dlq_id, consumer_id, event_id, attempts, last_error, failed_at, resolved
+                 FROM dead_letters WHERE (?1 = 1 OR resolved = 0)
+                 ORDER BY failed_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![if include_resolved { 1_i64 } else { 0_i64 }, limit],
+                Self::map_dead_letter_row,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_dead_letter(&self, dlq_id: &str) -> Result<Option<DeadLetterRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT dlq_id, consumer_id, event_id, attempts, last_error, failed_at, resolved
+                 FROM dead_letters WHERE dlq_id = ?1",
+                params![dlq_id],
+                Self::map_dead_letter_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// Mark a dead letter resolved. Returns false when it does not exist or was already resolved.
+    pub fn resolve_dead_letter(&self, dlq_id: &str) -> Result<bool, StoreError> {
+        self.with_conn_sync(|conn| {
+            let n = conn.execute(
+                "UPDATE dead_letters SET resolved = 1 WHERE dlq_id = ?1 AND resolved = 0",
+                params![dlq_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    // ---- Automation executions & trigger state (§7.3) ----
+
+    pub fn insert_automation_execution(
+        &self,
+        rec: &AutomationExecutionRecord,
+    ) -> Result<(), StoreError> {
+        let result_json = rec
+            .result
+            .as_ref()
+            .map(|v| serde_json::to_string(&self.redactor().redact_json(v)))
+            .transpose()?;
+        let actions_json = serde_json::to_string(&rec.action_executions)?;
+        let safe_err = rec.error.as_deref().map(|e| self.redactor().redact_str(e));
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO automation_executions (execution_id, automation_id, trigger_kind, trigger_ref, event_id, run_as, status, attempts, error, result_json, action_executions_json, trace_id, started_at, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    rec.execution_id,
+                    rec.automation_id,
+                    rec.trigger_kind,
+                    rec.trigger_ref,
+                    rec.event_id,
+                    rec.run_as,
+                    rec.status,
+                    rec.attempts,
+                    safe_err,
+                    result_json,
+                    actions_json,
+                    rec.trace_id,
+                    rec.started_at,
+                    rec.finished_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_automation_execution(
+        &self,
+        execution_id: &str,
+        status: &str,
+        attempts: i64,
+        error: Option<&str>,
+        result: Option<&serde_json::Value>,
+        action_executions: &[String],
+        finished_at: &str,
+    ) -> Result<(), StoreError> {
+        let result_json = result
+            .map(|v| serde_json::to_string(&self.redactor().redact_json(v)))
+            .transpose()?;
+        let actions_json = serde_json::to_string(action_executions)?;
+        let safe_err = error.map(|e| self.redactor().redact_str(e));
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "UPDATE automation_executions SET status = ?2, attempts = ?3, error = ?4, result_json = ?5,
+                    action_executions_json = ?6, finished_at = ?7
+                 WHERE execution_id = ?1",
+                params![execution_id, status, attempts, safe_err, result_json, actions_json, finished_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn map_automation_execution_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<AutomationExecutionRecord> {
+        let result_raw: Option<String> = r.get(9)?;
+        let actions_raw: Option<String> = r.get(10)?;
+        Ok(AutomationExecutionRecord {
+            execution_id: r.get(0)?,
+            automation_id: r.get(1)?,
+            trigger_kind: r.get(2)?,
+            trigger_ref: r.get(3)?,
+            event_id: r.get(4)?,
+            run_as: r.get(5)?,
+            status: r.get(6)?,
+            attempts: r.get(7)?,
+            error: r.get(8)?,
+            result: result_raw.and_then(|s| serde_json::from_str(&s).ok()),
+            action_executions: actions_raw
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            trace_id: r.get(11)?,
+            started_at: r.get(12)?,
+            finished_at: r.get(13)?,
+        })
+    }
+
+    const AUTOMATION_EXEC_COLUMNS: &'static str = "execution_id, automation_id, trigger_kind, trigger_ref, event_id, run_as, status, attempts, error, result_json, action_executions_json, trace_id, started_at, finished_at";
+
+    /// Latest succeeded execution of `automation_id` for one trigger occurrence (replay guard).
+    pub fn find_succeeded_automation_execution(
+        &self,
+        automation_id: &str,
+        trigger_ref: &str,
+    ) -> Result<Option<AutomationExecutionRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM automation_executions
+                     WHERE automation_id = ?1 AND trigger_ref = ?2 AND status = 'succeeded'
+                     ORDER BY started_at DESC LIMIT 1",
+                    Self::AUTOMATION_EXEC_COLUMNS
+                ),
+                params![automation_id, trigger_ref],
+                Self::map_automation_execution_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn get_automation_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<AutomationExecutionRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM automation_executions WHERE execution_id = ?1",
+                    Self::AUTOMATION_EXEC_COLUMNS
+                ),
+                params![execution_id],
+                Self::map_automation_execution_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// Most recent automation executions, optionally for one automation Instance.
+    pub fn list_automation_executions(
+        &self,
+        automation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AutomationExecutionRecord>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM automation_executions
+                 WHERE (?1 IS NULL OR automation_id = ?1)
+                 ORDER BY started_at DESC LIMIT ?2",
+                Self::AUTOMATION_EXEC_COLUMNS
+            ))?;
+            let rows = stmt.query_map(
+                params![automation_id, limit],
+                Self::map_automation_execution_row,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_automation_trigger_state(
+        &self,
+        automation_id: &str,
+        trigger_key: &str,
+    ) -> Result<Option<AutomationTriggerState>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT automation_id, trigger_key, last_fired_at, last_fingerprint, updated_at
+                 FROM automation_trigger_state WHERE automation_id = ?1 AND trigger_key = ?2",
+                params![automation_id, trigger_key],
+                |r| {
+                    Ok(AutomationTriggerState {
+                        automation_id: r.get(0)?,
+                        trigger_key: r.get(1)?,
+                        last_fired_at: r.get(2)?,
+                        last_fingerprint: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn set_automation_trigger_state(
+        &self,
+        automation_id: &str,
+        trigger_key: &str,
+        last_fired_at: Option<&str>,
+        last_fingerprint: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO automation_trigger_state (automation_id, trigger_key, last_fired_at, last_fingerprint, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(automation_id, trigger_key) DO UPDATE SET
+                    last_fired_at = excluded.last_fired_at,
+                    last_fingerprint = excluded.last_fingerprint,
+                    updated_at = excluded.updated_at",
+                params![automation_id, trigger_key, last_fired_at, last_fingerprint, now],
+            )?;
+            Ok(())
         })
     }
 
@@ -1317,6 +1832,8 @@ impl SqliteStore {
         since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<HistorySampleRecord>, StoreError> {
+        // Query budget (§7.4): one read never returns more than HISTORY_QUERY_BUDGET samples.
+        let limit = limit.clamp(1, HISTORY_QUERY_BUDGET);
         self.with_conn_sync(|conn| {
             let mut out = Vec::new();
             if let Some(since_ts) = since {
@@ -1343,8 +1860,11 @@ impl SqliteStore {
                 let mut stmt = conn.prepare(
                     "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
                      FROM history_samples
-                     WHERE series_id = ?1
-                     ORDER BY sampled_at ASC LIMIT ?2",
+                     WHERE sample_id IN (
+                        SELECT sample_id FROM history_samples
+                        WHERE series_id = ?1
+                        ORDER BY sampled_at DESC, sample_id DESC LIMIT ?2)
+                     ORDER BY sampled_at ASC, sample_id ASC",
                 )?;
                 let rows = stmt.query_map(params![series_id, limit as i64], |r| {
                     let meta_raw: Option<String> = r.get(4)?;
@@ -1405,6 +1925,22 @@ impl SqliteStore {
             let gen_id = tx.last_insert_rowid();
             tx.commit()?;
             Ok(gen_id)
+        })
+    }
+
+    /// Activation timestamp (RFC 3339) of a recorded Generation.
+    pub fn get_generation_activated_at(
+        &self,
+        generation_id: i64,
+    ) -> Result<Option<String>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT activated_at FROM generations WHERE generation_id = ?1",
+                params![generation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
         })
     }
 
@@ -1730,5 +2266,163 @@ mod tests {
         let pending = store.list_incomplete_activation_journals().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].phase, "committed");
+    }
+
+    #[test]
+    fn test_checkpoint_never_moves_backwards_and_min_sequence_append() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(store.find_consumer_checkpoint("c", "src").unwrap(), None);
+        store.set_consumer_checkpoint("c", "src", 5).unwrap();
+        store.set_consumer_checkpoint("c", "src", 2).unwrap();
+        assert_eq!(store.get_consumer_checkpoint("c", "src").unwrap(), 5);
+        assert_eq!(store.find_consumer_checkpoint("c", "src").unwrap(), Some(5));
+
+        let e1 = store
+            .append_event_min_sequence("src", "t", "1", "tr", true, json!({}), 7)
+            .unwrap();
+        assert_eq!(e1.sequence, 7);
+        let e2 = store.append_event("src", "t", "1", "tr", true, json!({})).unwrap();
+        assert_eq!(e2.sequence, 8);
+        assert_eq!(store.max_event_sequence("src").unwrap(), 8);
+        assert_eq!(store.get_event(&e1.event_id).unwrap().unwrap().sequence, 7);
+        assert_eq!(store.list_events_since_limited("src", 0, 1).unwrap().len(), 1);
+        assert_eq!(store.list_event_sources().unwrap(), vec!["src".to_string()]);
+        let future = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        assert_eq!(store.max_event_sequence_before("src", &future).unwrap(), 8);
+        let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        assert_eq!(store.max_event_sequence_before("src", &past).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_dead_letter_listing_resolution_and_event_retention() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let e1 = store.append_event("src", "t", "1", "tr", true, json!({"n": 1})).unwrap();
+        let e2 = store.append_event("src", "t", "1", "tr", true, json!({"n": 2})).unwrap();
+        let e3 = store.append_event("src", "t", "1", "tr", true, json!({"n": 3})).unwrap();
+        // Consumer acked e1 and e2; e2 is dead-lettered and unresolved.
+        store.set_consumer_checkpoint("auto", "src", e2.sequence).unwrap();
+        let dlq = store.record_dead_letter("auto", &e2.event_id, 3, "boom").unwrap();
+        assert_eq!(store.list_dead_letters(false, 10).unwrap().len(), 1);
+
+        let old_run = |id: &str, event_id: Option<&str>| AutomationExecutionRecord {
+            execution_id: id.into(),
+            automation_id: "auto".into(),
+            trigger_kind: "event".into(),
+            trigger_ref: format!("event:{}", event_id.unwrap_or("none")),
+            event_id: event_id.map(|s| s.to_string()),
+            run_as: None,
+            status: "succeeded".into(),
+            attempts: 1,
+            error: None,
+            result: None,
+            action_executions: vec![],
+            trace_id: "tr".into(),
+            started_at: (Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+            finished_at: None,
+        };
+        store.insert_automation_execution(&old_run("aex_e1", Some(&e1.event_id))).unwrap();
+        store.insert_automation_execution(&old_run("aex_e3", Some(&e3.event_id))).unwrap();
+
+        let cutoff = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        // Only e1: acked by every consumer and not referenced by an unresolved dead letter.
+        assert_eq!(store.prune_events_before(&cutoff).unwrap(), 1);
+        // The run record of the pruned Event goes too; the one guarding retained e3 stays.
+        assert!(store.get_automation_execution("aex_e1").unwrap().is_none());
+        assert!(store.get_automation_execution("aex_e3").unwrap().is_some());
+        assert!(store.get_event(&e1.event_id).unwrap().is_none());
+        assert!(store.get_event(&e2.event_id).unwrap().is_some());
+        assert!(store.get_event(&e3.event_id).unwrap().is_some());
+
+        assert!(store.resolve_dead_letter(&dlq).unwrap());
+        assert!(!store.resolve_dead_letter(&dlq).unwrap());
+        assert!(store.get_dead_letter(&dlq).unwrap().unwrap().resolved);
+        assert!(store.list_dead_letters(false, 10).unwrap().is_empty());
+        assert_eq!(store.list_dead_letters(true, 10).unwrap().len(), 1);
+        assert_eq!(store.prune_events_before(&cutoff).unwrap(), 1);
+        assert!(store.get_event(&e3.event_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_automation_execution_records_and_trigger_state() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let rec = AutomationExecutionRecord {
+            execution_id: "aex_1".into(),
+            automation_id: "complete_work".into(),
+            trigger_kind: "event".into(),
+            trigger_ref: "event:evt_1".into(),
+            event_id: Some("evt_1".into()),
+            run_as: Some("work_completion".into()),
+            status: "running".into(),
+            attempts: 0,
+            error: None,
+            result: None,
+            action_executions: vec![],
+            trace_id: "tr_1".into(),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        store.insert_automation_execution(&rec).unwrap();
+        assert!(store
+            .find_succeeded_automation_execution("complete_work", "event:evt_1")
+            .unwrap()
+            .is_none());
+        store
+            .finish_automation_execution(
+                "aex_1",
+                "succeeded",
+                1,
+                None,
+                Some(&json!({"ok": true})),
+                &["act_1".to_string()],
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        let found = store
+            .find_succeeded_automation_execution("complete_work", "event:evt_1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.result.unwrap()["ok"], true);
+        assert_eq!(found.action_executions, vec!["act_1".to_string()]);
+        assert_eq!(store.list_automation_executions(Some("complete_work"), 10).unwrap().len(), 1);
+        assert_eq!(store.list_automation_executions(None, 10).unwrap().len(), 1);
+        assert!(store.list_automation_executions(Some("other"), 10).unwrap().is_empty());
+
+        assert!(store.get_automation_trigger_state("a", "cron:0").unwrap().is_none());
+        store
+            .set_automation_trigger_state("a", "cron:0", Some("2026-01-01T00:00:00+00:00"), None)
+            .unwrap();
+        store
+            .set_automation_trigger_state("a", "cron:0", Some("2026-01-02T00:00:00+00:00"), Some("fp"))
+            .unwrap();
+        let st = store.get_automation_trigger_state("a", "cron:0").unwrap().unwrap();
+        assert_eq!(st.last_fired_at.as_deref(), Some("2026-01-02T00:00:00+00:00"));
+        assert_eq!(st.last_fingerprint.as_deref(), Some("fp"));
+    }
+
+    #[test]
+    fn test_history_default_read_returns_most_recent_samples() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_history_series(&HistorySeriesSpec {
+                series_id: "s".into(),
+                instance_id: "open_prs".into(),
+                params: json!({}),
+                aggregator: "count".into(),
+                cadence_secs: 3600,
+                retention_days: 30,
+                service_principal: "sp".into(),
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let base = Utc::now() - chrono::Duration::hours(10);
+        for i in 0..10 {
+            let ts = (base + chrono::Duration::hours(i)).to_rfc3339();
+            store.append_history_sample("s", &ts, i as f64, None).unwrap();
+        }
+        let recent = store.query_history_samples("s", None, 3).unwrap();
+        let values: Vec<f64> = recent.iter().map(|r| r.value_num).collect();
+        assert_eq!(values, vec![7.0, 8.0, 9.0], "newest samples, oldest first");
+        // Query budget clamps absurd limits.
+        assert_eq!(store.query_history_samples("s", None, usize::MAX).unwrap().len(), 10);
     }
 }
