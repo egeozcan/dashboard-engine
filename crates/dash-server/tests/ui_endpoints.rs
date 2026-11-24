@@ -292,10 +292,12 @@ async fn rendered_custom_widgets_carry_declared_asset_url() {
     // Built-in widgets have no asset URL.
     assert!(table["tree"]["asset_url"].is_null());
 
-    // Assets are only published for widget provider Definitions.
+    // Assets are only published for widget provider Definitions (asked as an authenticated
+    // Principal: /widgets/* requires authentication, so an anonymous request gets 401 first).
     let r = srv
         .client
         .get(format!("{}/widgets/engineering.linked_prs/runtime.luau", srv.base))
+        .bearer_auth(TOKEN)
         .send()
         .await
         .unwrap();

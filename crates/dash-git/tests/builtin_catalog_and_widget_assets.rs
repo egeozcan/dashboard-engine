@@ -86,5 +86,16 @@ fn widget_assets_come_only_from_assets_dir_of_widget_providers() {
     let err = load_workspace_graph(&ws, &tmp.path().join("data"), "test", 0, false)
         .unwrap_err()
         .to_string();
+    // Escaping the Definition directory is already rejected by the declaration path check.
+    assert!(err.contains("stay inside the Definition directory"), "{err}");
+
+    // Inside the Definition directory but outside assets/: rejected by the asset rule.
+    write(
+        &ws.join("packages/demo/badge/definition.luau"),
+        "local dash = require(\"dash\")\nreturn dash.widget_provider { id = \"demo.badge\", asset = \"notes.json\", props = dash.object { label = dash.string() } }\n",
+    );
+    let err = load_workspace_graph(&ws, &tmp.path().join("data"), "test", 0, false)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("under assets/"), "{err}");
 }
