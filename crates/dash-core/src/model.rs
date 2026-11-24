@@ -17,6 +17,33 @@ pub struct WorkspaceConfig {
     pub network: NetworkPolicy,
     #[serde(default)]
     pub history: Vec<HistorySeriesConfig>,
+    /// Luau resource budget overrides (`[resources]` in dashboard.toml), clamped by the daemon ceiling.
+    #[serde(default)]
+    pub resources: WorkspaceResources,
+}
+
+/// `[resources]` table: Workspace-wide defaults plus `[resources.instances.<id>]` per-Instance
+/// overrides (§2.1 resource budgets attach to Instances).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WorkspaceResources {
+    #[serde(flatten)]
+    pub defaults: dash_luau::ResourceOverrides,
+    #[serde(default)]
+    pub instances: BTreeMap<String, dash_luau::ResourceOverrides>,
+}
+
+impl WorkspaceResources {
+    /// Effective overrides for a pooled VM key (Preview Mock VMs use `preview_mock:<instance>`).
+    pub fn overrides_for(&self, vm_instance_id: &str) -> Option<dash_luau::ResourceOverrides> {
+        let inst = vm_instance_id
+            .strip_prefix("preview_mock:")
+            .unwrap_or(vm_instance_id);
+        let merged = match self.instances.get(inst) {
+            Some(o) => o.merged_over(&self.defaults),
+            None => self.defaults.clone(),
+        };
+        (merged != dash_luau::ResourceOverrides::default()).then_some(merged)
+    }
 }
 
 fn default_ws_name() -> String {
@@ -448,6 +475,34 @@ impl ConfiguredGraph {
             .filter(|d| d.manifest.category == DefinitionCategory::Library)
             .map(|d| (d.manifest.id.clone(), d.runtime_source.clone()))
             .collect()
+    }
+
+    /// Declared `libraries` entries that do not resolve to a Library Definition in a loaded
+    /// package, as `(definition_id, library_id, reason)`. At runtime `require` only serves
+    /// declared, resolved libraries, so each entry here would fail when loaded.
+    pub fn unresolved_library_declarations(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (def_id, def) in &self.definitions {
+            for lib in &def.manifest.libraries {
+                match self.definitions.get(lib) {
+                    None => out.push((
+                        def_id.clone(),
+                        lib.clone(),
+                        format!("declared library '{lib}' is not provided by any resolved package"),
+                    )),
+                    Some(d) if d.manifest.category != DefinitionCategory::Library => out.push((
+                        def_id.clone(),
+                        lib.clone(),
+                        format!(
+                            "declared library '{lib}' is a {} Definition, not a library",
+                            d.manifest.category.as_str()
+                        ),
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        out
     }
 
     /// Compute the downstream dependents (reverse edges) of an instance.

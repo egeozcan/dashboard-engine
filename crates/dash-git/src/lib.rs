@@ -14,7 +14,8 @@ pub use packages::{
     PackagesToml,
 };
 pub use preview::{
-    run_preview_and_scenarios, run_workspace_definition_tests, PreviewTestReport, ScenarioResult,
+    run_definition_tests_against_mocks, run_preview_and_scenarios, run_workspace_definition_tests,
+    CapturedTestEvent, MockTestBridge, PreviewTestReport, ScenarioResult,
 };
 pub use workspace::{
     delete_instance_in_workspace, load_workspace_graph, upsert_instance_in_workspace,

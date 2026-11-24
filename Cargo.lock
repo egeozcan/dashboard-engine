@@ -556,6 +556,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "chrono",
  "dash-core",
  "dash-luau",

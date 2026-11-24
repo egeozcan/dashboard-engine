@@ -303,6 +303,14 @@ impl ActionManager {
                     is_read_only: false,
                     step_counter: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 });
+                // Track mutating external calls so a failure after a possible side effect is
+                // recorded as `unknown`, never `failed` (§9.1, §15.2).
+                let tracking = Arc::new(dash_luau::CallTracking::default());
+                let bridge = Arc::new(dash_luau::CallTrackingBridge::new(
+                    bridge,
+                    Arc::clone(&tracking),
+                    connector_mutation_classifier(&g, &inst),
+                ));
                 let bundle = CompiledInstanceBundle {
                     instance_id: inst.id.clone(),
                     manifest: def.manifest.clone(),
@@ -342,7 +350,15 @@ impl ActionManager {
                         None,
                     )
                     .await
-                    .map_err(|e| self.store.redactor().redact_str(&e.to_string()))
+                    .map_err(|e| {
+                        let msg = self.store.redactor().redact_str(&e.to_string());
+                        let admitted = !matches!(e, dash_luau::RuntimeError::QueueFull(_));
+                        if admitted && tracking.side_effect_possible() && !msg.contains("UNKNOWN_OUTCOME") {
+                            format!("UNKNOWN_OUTCOME: failed after a mutating external call; outcome cannot be proven: {msg}")
+                        } else {
+                            msg
+                        }
+                    })
             };
 
             let duration_ms = started_instant.elapsed().as_millis() as i64;
@@ -864,6 +880,37 @@ fn resolve_invalidations(
     out
 }
 
+/// Classify an action's connector calls as mutating from the connector contract: an operation is
+/// read-only only when it is declared and every required capability is a read capability
+/// (`*.read`, `*.list`, `*.get`, `*.view`, `*.search`, `*.query`). Anything else, including
+/// undeclared operations or unbound inputs, counts as mutating (fail-safe for `unknown`).
+fn connector_mutation_classifier(
+    g: &ConfiguredGraph,
+    caller: &InstanceConfig,
+) -> dash_luau::MutationClassifier {
+    let mut read_only: std::collections::BTreeSet<(String, String)> = Default::default();
+    for (input_name, target_id) in &caller.inputs {
+        let Some(def) = g
+            .instances
+            .get(target_id)
+            .and_then(|t| g.definitions.get(&t.definition))
+        else {
+            continue;
+        };
+        for (op, spec) in &def.manifest.operations {
+            let is_read = !spec.required_capabilities.is_empty()
+                && spec.required_capabilities.iter().all(|cap| {
+                    let last = cap.rsplit(['.', ':']).next().unwrap_or(cap);
+                    matches!(last, "read" | "list" | "get" | "view" | "search" | "query")
+                });
+            if is_read {
+                read_only.insert((input_name.clone(), op.clone()));
+            }
+        }
+    }
+    Arc::new(move |input: &str, op: &str| !read_only.contains(&(input.to_string(), op.to_string())))
+}
+
 struct ActionHostBridge {
     manager: ActionManager,
     graph: ConfiguredGraph,
@@ -982,6 +1029,29 @@ impl HostBridge for ActionHostBridge {
                 &self.caller_inst.id,
                 event_type,
                 "1",
+                &self.trace_id,
+                durable,
+                payload,
+            )
+            .map(|_| ())
+    }
+
+    async fn emit_event_versioned(
+        &self,
+        event_type: &str,
+        schema_version: &str,
+        payload: serde_json::Value,
+        durable: bool,
+    ) -> Result<(), String> {
+        if self.is_read_only {
+            return Err("dry_run/reconcile is read-only and cannot emit Events".into());
+        }
+        self.manager
+            .events
+            .emit(
+                &self.caller_inst.id,
+                event_type,
+                schema_version,
                 &self.trace_id,
                 durable,
                 payload,

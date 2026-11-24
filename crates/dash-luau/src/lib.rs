@@ -8,15 +8,21 @@ pub mod test_runner;
 
 pub use declaration::{evaluate_declaration, DeclarationError};
 pub use host_api::{
-    ExecutionContextConfig, FutureHandle, HostBridge, HttpHostRequest, HttpHostResponse,
-    NullHostBridge,
+    CallTracking, CallTrackingBridge, ExecutionContextConfig, FutureHandle, HostBridge,
+    HttpHostRequest, HttpHostResponse, LuaContext, MutationClassifier, NullHostBridge,
 };
 pub use manifest::{
     compute_sources_digest, ConnectorOperationSpec, DefinitionCategory, DefinitionManifest,
     EventDeclSpec, InputRefSpec, SchemaSpec, TriggerDeclSpec, UpdateModes,
 };
-pub use pool::{CompiledInstanceBundle, ResourceBudget, RuntimeError, VmPool};
-pub use test_runner::{run_definition_tests, DefinitionTestCaseResult, DefinitionTestReport};
+pub use pool::{
+    current_execution_deadline, BudgetResolver, CompiledInstanceBundle, ExecutionObserver,
+    ExecutionStats, PoolMetrics, ResourceBudget, ResourceOverrides, RuntimeError, VmPool,
+};
+pub use test_runner::{
+    run_definition_tests, run_definition_tests_with_budget, DefinitionTestCaseResult,
+    DefinitionTestReport, NO_TESTS_CASE,
+};
 
 #[cfg(test)]
 mod tests {
@@ -170,6 +176,7 @@ return dash.adapter {
 local dash = require("dash")
 return dash.data_provider {
     id = "engineering.linked_prs",
+    libraries = { "engineering.helpers" },
     inputs = {
         prs = dash.data_ref("github.pull_requests"),
         issues = dash.data_ref("jira.issues_by_keys"),
@@ -214,6 +221,7 @@ return Runtime
             wall_timeout: Duration::from_millis(120),
             max_interrupts: 500_000,
             idle_ttl: Duration::from_millis(50),
+            ..ResourceBudget::default()
         });
 
         let bridge = Arc::new(MockAsyncBridge);
