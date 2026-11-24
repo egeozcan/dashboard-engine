@@ -2879,7 +2879,7 @@ mod tests {
     ) {
         let refs: Vec<String> = inputs
             .iter()
-            .map(|(name, _)| format!("{name} = dash.data_ref(\"any\")"))
+            .map(|(name, _)| format!("{name} = dash.data_ref(\"test.any\")"))
             .collect();
         let decl = format!(
             "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"{def_id}\", inputs = {{ {} }} }}",
