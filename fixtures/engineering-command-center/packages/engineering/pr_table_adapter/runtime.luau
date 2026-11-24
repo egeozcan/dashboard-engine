@@ -59,6 +59,11 @@ function Runtime.on_request(ctx)
                 issue_key = p.issue_key,
             },
         }
+    elseif ctx.request.request == "refresh_requested" then
+        return {
+            refresh = true,
+            invalidate = { "linked" },
+        }
     end
     error("unsupported widget request: " .. tostring(ctx.request.request))
 end

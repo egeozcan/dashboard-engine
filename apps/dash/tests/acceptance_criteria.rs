@@ -899,3 +899,33 @@ async fn ac17_benchmark_gates_sanity() {
     assert!(q0.elapsed() < Duration::from_millis(5));
     h.abort();
 }
+
+#[tokio::test]
+async fn pr_badge_widget_refresh_request_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let (services, _addr, h) = boot_http_app(&tmp, vec![]).await;
+    let admin = Principal::administrator();
+    let mut g = (*services.graph()).clone();
+    g.is_preview = true;
+    services.engine().graph.store(std::sync::Arc::new(g));
+
+    let exec = services
+        .dispatch_widget_request(
+            dash_core::WidgetRequestEnvelope {
+                protocol: "dash.widget/1".into(),
+                dashboard_id: "engineering".into(),
+                adapter_instance: "pr_table_adapter".into(),
+                widget_id: "pr_table_adapter_pr_summary".into(),
+                generation: services.graph().generation_id,
+                sequence: 1,
+                kind: "request".into(),
+                request: "refresh_requested".into(),
+                payload: json!({}),
+            },
+            &admin,
+        )
+        .await
+        .unwrap();
+    assert_eq!(exec.status, "succeeded");
+    h.abort();
+}

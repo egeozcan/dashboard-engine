@@ -764,6 +764,55 @@ impl ActionManager {
                     .map(|s| s.to_string());
                 return self.invoke(target_action, args, principal, ikey, None).await;
             }
+            if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("invalidate").is_some()
+            {
+                let mut targets: Vec<String> = Vec::new();
+                if let Some(arr) = val.get("invalidate").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            let resolved = adapter_inst
+                                .inputs
+                                .get(s)
+                                .cloned()
+                                .unwrap_or_else(|| s.to_string());
+                            targets.push(resolved);
+                        }
+                    }
+                } else {
+                    for target_id in adapter_inst.inputs.values() {
+                        if g.instances
+                            .get(target_id)
+                            .map(|i| i.category == DefinitionCategory::DataProvider)
+                            .unwrap_or(false)
+                        {
+                            targets.push(target_id.clone());
+                        }
+                    }
+                }
+                if !targets.is_empty() {
+                    self.queries.invalidate_instances(&targets).await;
+                }
+                let now = Utc::now().to_rfc3339();
+                return Ok(ActionExecutionRecord {
+                    execution_id: format!("req_{}", Uuid::now_v7().simple()),
+                    action_instance: adapter_inst.id,
+                    parent_execution_id: None,
+                    principal_id: principal.id.clone(),
+                    principal_kind: principal.kind.as_str().into(),
+                    status: "succeeded".into(),
+                    idempotency_key: None,
+                    args: req.payload,
+                    result: Some(serde_json::json!({ "refreshed": targets })),
+                    reason: None,
+                    retry_safe: true,
+                    reconcile_attempts: 0,
+                    trace_id: format!("req_{}", Uuid::now_v7().simple()),
+                    started_at: now.clone(),
+                    finished_at: Some(now),
+                    duration_ms: Some(0),
+                });
+            }
             return Err("adapter on_request handler did not invoke or specify an action".into());
         }
 

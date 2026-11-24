@@ -11,5 +11,5 @@ return dash.adapter {
         merge = dash.action_ref("github.merge_pr"),
     },
     dashboard_state_reads = { "selected_repository" },
-    accepts_requests = { "merge_requested" },
+    accepts_requests = { "merge_requested", "refresh_requested" },
 }
