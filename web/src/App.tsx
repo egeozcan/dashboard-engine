@@ -27,7 +27,7 @@ export const App: React.FC = () => {
   const [me, setMe] = useState<MeResponse | null>(null);
   const [checking, setChecking] = useState(true);
   const [view, setView] = useState<AppView>("dashboard");
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [loginErr, setLoginErr] = useState<string | null>(null);
@@ -90,6 +90,8 @@ export const App: React.FC = () => {
   const handleLogout = async () => {
     await apiFetch("/api/auth/logout", { method: "POST" });
     setCsrfToken("");
+    setUsername("");
+    setPassword("");
     setMe(null);
   };
 
@@ -112,6 +114,7 @@ export const App: React.FC = () => {
               id="dash-username"
               name="username"
               type="text"
+              placeholder="admin"
               autoComplete="username"
               spellCheck={false}
               autoCapitalize="none"

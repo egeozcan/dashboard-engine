@@ -189,8 +189,22 @@ export const DiagnosticsView: React.FC = () => {
         <div className="card col">
           <strong>Central Encrypted Secrets (Write-Only)</strong>
           <form className="row" onSubmit={(e) => void createSecret(e)}>
-            <input type="text" placeholder="Secret name (e.g. github-work)" value={secName} onChange={(e) => setSecName(e.target.value)} required />
-            <input type="password" placeholder="Secret plaintext" value={secVal} onChange={(e) => setSecVal(e.target.value)} required />
+            <input
+              type="text"
+              placeholder="Secret name (e.g. github-work)"
+              value={secName}
+              onChange={(e) => setSecName(e.target.value)}
+              style={{ flex: "1 1 220px", minWidth: 220 }}
+              required
+            />
+            <input
+              type="password"
+              placeholder="Secret plaintext"
+              value={secVal}
+              onChange={(e) => setSecVal(e.target.value)}
+              style={{ flex: "1 1 180px", minWidth: 160 }}
+              required
+            />
             <button type="submit" className="btn primary">Store Secret</button>
           </form>
           <ul>
@@ -222,8 +236,23 @@ export const DiagnosticsView: React.FC = () => {
             <button type="submit" className="btn primary">Issue Agent Token</button>
           </form>
           {createdToken && (
-            <div className="badge warn" style={{ wordBreak: "break-all" }}>
-              Token (shown once): <code>{createdToken}</code>
+            <div
+              style={{
+                borderRadius: 6,
+                padding: "6px 10px",
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 6,
+                alignItems: "center",
+                fontSize: 12,
+                fontWeight: 600,
+                background: "var(--surface-elevated)",
+                border: "1px solid var(--warn)",
+                color: "var(--warn)",
+              }}
+            >
+              <span>Token (shown once):</span>
+              <code style={{ wordBreak: "break-all" }}>{createdToken}</code>
             </div>
           )}
           <ul>

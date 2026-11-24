@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
 import { WidgetRenderer } from "./components/widgets/BuiltInWidgets";
+import { GraphEditorView } from "./views/GraphEditorView";
 import { getOrCreateClientId, clientStateStorageKey } from "./lib/clientState";
 
 describe("dash Web UI", () => {
@@ -38,11 +39,17 @@ describe("dash Web UI", () => {
     expect(userField).toHaveAttribute("autocomplete", "username");
     expect(pwField).toHaveAttribute("autocomplete", "current-password");
 
+    fireEvent.change(userField, { target: { value: "admin" } });
     fireEvent.change(pwField, { target: { value: "secret" } });
     fireEvent.click(screen.getByRole("button", { name: "Sign In" }));
 
     await waitFor(() => {
       expect(screen.getByRole("navigation", { name: "Primary sections" })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign Out" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Username")).toHaveValue("");
     });
   });
 
@@ -122,5 +129,157 @@ describe("dash Web UI", () => {
     const frame = screen.getByTitle("Custom widget pr_table_adapter_pr_summary");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+  });
+
+  it("keeps GraphEditorView drag slot separate from create-instance slot and supports Discard Draft", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/api/graph")) {
+        return new Response(
+          JSON.stringify({
+            generation: 1,
+            revision: "abc123",
+            instances: {},
+            validation: { valid: true, issues: [] },
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/api/drafts") && init?.method === "POST") {
+        return new Response(JSON.stringify({ draft_id: "dft_ui_1" }), { status: 200 });
+      }
+      if (url.endsWith("/api/drafts/dft_ui_1/instances")) {
+        return new Response(JSON.stringify({ draft_id: "dft_ui_1" }), { status: 200 });
+      }
+      if (url.endsWith("/api/drafts/dft_ui_1/validate")) {
+        return new Response(JSON.stringify({ valid: false, issues: [{ severity: "error", message: "bad def" }] }), {
+          status: 200,
+        });
+      }
+      if (url.endsWith("/api/drafts/dft_ui_1") && init?.method === "DELETE") {
+        return new Response(JSON.stringify({ aborted: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    render(<GraphEditorView />);
+    await screen.findByText("Configured Dependency Graph");
+
+    const dragInput = screen.getByLabelText("Target input slot for drag-connect:") as HTMLInputElement;
+    const formSlotInput = screen.getByPlaceholderText("input slot (e.g. prs)") as HTMLInputElement;
+    expect(dragInput.value).toBe("prs");
+    expect(formSlotInput.value).toBe("prs");
+
+    fireEvent.change(formSlotInput, { target: { value: "linked" } });
+    expect(formSlotInput.value).toBe("linked");
+    expect(dragInput.value).toBe("prs");
+
+    fireEvent.change(screen.getByPlaceholderText("instance_id"), { target: { value: "bad_inst" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add to Draft" }));
+
+    await screen.findByText("Active Draft: dft_ui_1");
+    const discardBtn = screen.getByRole("button", { name: "Discard Draft" });
+    fireEvent.click(discardBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByText("Active Draft: dft_ui_1")).not.toBeInTheDocument();
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/drafts/dft_ui_1",
+      expect.objectContaining({ method: "DELETE" })
+    );
+  });
+
+  it("preserves grid and container layout overrides consistently across normal and Designer modes", () => {
+    const gridNode = {
+      widget_id: "trend_root",
+      widget_type: "dash.grid",
+      props: { columns: 2, gap: 16 },
+      children: [
+        {
+          widget_id: "open_count",
+          widget_type: "dash.counter",
+          props: { label: "Open PRs", value: 3 },
+        },
+        {
+          widget_id: "trend_chart",
+          widget_type: "dash.text",
+          props: { text: "Chart placeholder" },
+          layout_override: { w: 8 },
+        },
+      ],
+    };
+
+    for (const designerMode of [false, true]) {
+      const { unmount, container } = render(
+        <WidgetRenderer
+          adapterInstance="pr_trend_adapter"
+          generation={1}
+          designerMode={designerMode}
+          onWidgetRequest={vi.fn()}
+          node={gridNode}
+        />
+      );
+      const rootEl = container.querySelector('[data-widget-id="trend_root"]')!;
+      const gridEl = Array.from(rootEl.querySelectorAll("div")).find(
+        (d) => d.style.display === "grid"
+      );
+      expect(gridEl?.style.gridTemplateColumns).toBe("repeat(12, minmax(0, 1fr))");
+
+      const countEl = container.querySelector('[data-widget-id="open_count"]') as HTMLElement;
+      const chartEl = container.querySelector('[data-widget-id="trend_chart"]') as HTMLElement;
+      expect(countEl.style.gridColumn).toBe("span 4");
+      expect(chartEl.style.gridColumn).toBe("span 8");
+      unmount();
+    }
+
+    const containerNode = {
+      widget_id: "box",
+      widget_type: "dash.container",
+      props: { direction: "vertical" },
+      children: [
+        {
+          widget_id: "half_child",
+          widget_type: "dash.text",
+          props: { text: "Half" },
+          layout_override: { w: 6 },
+        },
+      ],
+    };
+    const { container } = render(
+      <WidgetRenderer
+        adapterInstance="pr_table_adapter"
+        generation={1}
+        designerMode={false}
+        onWidgetRequest={vi.fn()}
+        node={containerNode}
+      />
+    );
+    const halfEl = container.querySelector('[data-widget-id="half_child"]') as HTMLElement;
+    expect(halfEl.style.width).toBe("50%");
+  });
+
+  it("renders Y-axis scale and X-axis timestamp labels on ChartWidget even with 1 sample", () => {
+    const { container } = render(
+      <WidgetRenderer
+        adapterInstance="pr_trend_adapter"
+        generation={1}
+        onWidgetRequest={vi.fn()}
+        node={{
+          widget_id: "trend_chart",
+          widget_type: "dash.chart",
+          props: {
+            title: "30-Day Open PR Count",
+            series: [{ sampled_at: "2026-11-24T12:00:00Z", value_num: 3 }],
+            x_key: "sampled_at",
+            y_key: "value_num",
+          },
+        }}
+      />
+    );
+    const texts = Array.from(container.querySelectorAll("svg text")).map((t) => t.textContent);
+    expect(texts).toContain("0");
+    expect(texts).toContain("3");
+    expect(texts.some((t) => t && t.includes("11-24"))).toBe(true);
   });
 });

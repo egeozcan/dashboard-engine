@@ -65,6 +65,11 @@ impl DraftManager {
         budget: dash_luau::ResourceBudget,
         use_mocks: bool,
     ) -> Result<Self, GitError> {
+        std::fs::create_dir_all(&workspace_dir)?;
+        std::fs::create_dir_all(&data_dir)?;
+        let workspace_dir = crate::git_cli::absolutize_path(&workspace_dir)?;
+        let data_dir = crate::git_cli::absolutize_path(&data_dir)?;
+
         let branch = "main";
         let head = ensure_git_repo(&workspace_dir, branch).await?;
         let lock_path = workspace_dir.join("packages.lock");
@@ -845,6 +850,11 @@ fn collect_rel_paths(
 }
 
 fn sync_worktree_to_workspace(src: &Path, dst: &Path) -> Result<(), GitError> {
+    if !src.join(".git").exists() && !src.join("dashboard.toml").exists() {
+        return Err(GitError::Workspace(
+            "refusing to sync uninitialized draft worktree".into(),
+        ));
+    }
     let src_files = list_relative_files(src)?;
     let dst_files = list_relative_files(dst)?;
     for stale in dst_files.difference(&src_files) {

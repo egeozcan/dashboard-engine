@@ -124,6 +124,18 @@ export const PackageStudioView: React.FC = () => {
     }
   };
 
+  const discardDraft = async () => {
+    if (!draftId) return;
+    setError(null);
+    try {
+      await apiFetch(`/api/drafts/${draftId}`, { method: "DELETE" });
+      setDraftId(null);
+      setOutput("");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const syncGit = async () => {
     setError(null);
     try {
@@ -225,6 +237,11 @@ export const PackageStudioView: React.FC = () => {
             <button type="button" className="btn primary" disabled={!draftId} onClick={() => void activateDraft()}>
               Commit &amp; Activate
             </button>
+            {draftId && (
+              <button type="button" className="btn danger" onClick={() => void discardDraft()}>
+                Discard Draft
+              </button>
+            )}
           </div>
         </div>
 

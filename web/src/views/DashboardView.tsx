@@ -125,6 +125,7 @@ export const DashboardView: React.FC = () => {
     patch: { w?: number; h?: number; visible?: boolean }
   ) => {
     if (!doc) return;
+    setError(null);
     const nextDoc: DashboardDoc = {
       ...doc,
       overrides: {
@@ -184,7 +185,14 @@ export const DashboardView: React.FC = () => {
           <button
             type="button"
             className={`btn ${designerMode ? "primary" : ""}`}
-            onClick={() => setDesignerMode(!designerMode)}
+            onClick={() => {
+              const next = !designerMode;
+              setDesignerMode(next);
+              if (!next) {
+                setSelectedWidgetId(null);
+                setError(null);
+              }
+            }}
           >
             {designerMode ? "Exit Designer" : "Dashboard Designer"}
           </button>

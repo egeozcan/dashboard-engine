@@ -296,4 +296,122 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
         assert!(mgr.engine().graph.load().instances.contains_key("hello_metric"));
         assert!(mgr.engine().graph.load().dashboards.contains_key("ops"));
     }
+
+    #[tokio::test]
+    async fn test_relative_paths_draft_worktree_activation_preserves_workspace() {
+        let cwd = std::env::current_dir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix(".dash-rel-test-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let rel_tmp = tmp.path().strip_prefix(&cwd).unwrap().to_path_buf();
+        let rel_ws = rel_tmp.join("ws");
+        let rel_data = rel_tmp.join("data");
+        assert!(!rel_ws.is_absolute() && !rel_data.is_absolute());
+
+        copy_fixture_ws(&rel_ws);
+        let store = SqliteStore::open(&rel_data).unwrap();
+        let mgr = DraftManager::initialize_with_mocks(
+            rel_ws,
+            rel_data,
+            store,
+            ResourceBudget::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        let admin = Principal::administrator();
+
+        let status0 = mgr.git_status().await.unwrap();
+        assert!(!status0.dirty, "initial status dirty: {:?}", status0.changed_files);
+        assert!(status0.changed_files.is_empty());
+
+        // 1. Package Studio draft flow: adding custom_metric must keep existing packages & dashboards intact
+        let d1 = mgr.draft_begin(&admin).await.unwrap();
+        assert!(
+            Path::new(&d1.worktree_path).join("dashboard.toml").exists(),
+            "draft worktree missing dashboard.toml at {}",
+            d1.worktree_path
+        );
+        let status_during_d1 = mgr.git_status().await.unwrap();
+        assert!(
+            !status_during_d1.dirty,
+            "workspace dirty after draft_begin: {:?}",
+            status_during_d1.changed_files
+        );
+
+        mgr.draft_write_definition(
+            &d1.draft_id,
+            "engineering",
+            "custom_metric",
+            r#"local dash = require("dash")
+return dash.data_provider {
+    id = "engineering.custom_metric",
+    runtime = "runtime.luau",
+    handler = "query",
+}
+"#,
+            Some(
+                r#"--!strict
+local Runtime = {}
+function Runtime.query(ctx)
+    return { ok = true, instance = ctx.instance_id }
+end
+return Runtime
+"#,
+            ),
+            Some(
+                r#"local dash = require("dash")
+local Runtime = require("runtime")
+dash.test("smoke", function(make_ctx)
+    local res = Runtime.query(make_ctx({}))
+    dash.assert(res.ok == true, "expected ok")
+end)
+"#,
+            ),
+        )
+        .unwrap();
+        let preview = mgr.draft_preview_and_test(&d1.draft_id).await.unwrap();
+        assert!(preview.all_passed, "preview failed: {:?}", preview);
+
+        let _act1 = mgr.draft_activate(&d1.draft_id, &admin).await.unwrap();
+        let g1 = mgr.engine().graph.load();
+        assert!(g1.definitions.contains_key("engineering.custom_metric"));
+        assert!(g1.definitions.contains_key("engineering.linked_prs"));
+        assert!(g1.dashboards.contains_key("engineering"));
+        let status_after_d1 = mgr.git_status().await.unwrap();
+        assert!(
+            !status_after_d1.dirty,
+            "workspace dirty after d1 activate: {:?}",
+            status_after_d1.changed_files
+        );
+
+        // 2. Dashboard Designer override flow: updating override in draft activates cleanly
+        let d2 = mgr.draft_begin(&admin).await.unwrap();
+        let mut dash_doc = g1.dashboards.get("engineering").unwrap().clone();
+        dash_doc.overrides.insert(
+            "pr_table_adapter_pr_table".into(),
+            dash_core::LayoutOverride {
+                x: None,
+                y: None,
+                w: Some(6),
+                h: Some(6),
+                visible: Some(true),
+                props: BTreeMap::new(),
+            },
+        );
+        mgr.draft_update_dashboard(&d2.draft_id, &dash_doc).unwrap();
+        let _act2 = mgr.draft_activate(&d2.draft_id, &admin).await.unwrap();
+        let g2 = mgr.engine().graph.load();
+        assert_eq!(
+            g2.dashboards["engineering"].overrides["pr_table_adapter_pr_table"].w,
+            Some(6)
+        );
+        let status_after_d2 = mgr.git_status().await.unwrap();
+        assert!(
+            !status_after_d2.dirty,
+            "workspace dirty after d2 activate: {:?}",
+            status_after_d2.changed_files
+        );
+    }
 }

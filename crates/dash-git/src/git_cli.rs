@@ -1,9 +1,38 @@
 //! Host-mediated Git CLI wrapper (`GIT_TERMINAL_PROMPT=0`), worktrees, 3-way merge, commit, and push.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::process::Command;
+
+pub fn absolutize_path(path: &Path) -> Result<PathBuf, GitError> {
+    if path.exists() {
+        return Ok(std::fs::canonicalize(path)?);
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = abs.as_path();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            tail.push(name.to_os_string());
+        } else {
+            return Ok(abs);
+        }
+        match existing.parent() {
+            Some(p) => existing = p,
+            None => return Ok(abs),
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing)?;
+    for comp in tail.into_iter().rev() {
+        resolved.push(comp);
+    }
+    Ok(resolved)
+}
 
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -183,23 +212,33 @@ pub async fn create_worktree(
     worktree_dir: &Path,
     base_commit: &str,
 ) -> Result<(), GitError> {
-    if let Some(parent) = worktree_dir.parent() {
+    let abs_repo = absolutize_path(repo_dir)?;
+    let abs_wt = absolutize_path(worktree_dir)?;
+    if let Some(parent) = abs_wt.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let wt_str = worktree_dir.to_string_lossy().to_string();
+    let wt_str = abs_wt.to_string_lossy().to_string();
     run_git(
-        repo_dir,
+        &abs_repo,
         &["worktree", "add", "--detach", &wt_str, base_commit],
     )
     .await?;
+    if !abs_wt.join(".git").exists() {
+        return Err(GitError::Workspace(format!(
+            "git worktree creation did not populate {}",
+            abs_wt.display()
+        )));
+    }
     Ok(())
 }
 
 pub async fn remove_worktree(repo_dir: &Path, worktree_dir: &Path) {
-    if worktree_dir.exists() {
-        let wt_str = worktree_dir.to_string_lossy().to_string();
-        let _ = run_git(repo_dir, &["worktree", "remove", "--force", &wt_str]).await;
-        let _ = std::fs::remove_dir_all(worktree_dir);
+    let abs_repo = absolutize_path(repo_dir).unwrap_or_else(|_| repo_dir.to_path_buf());
+    let abs_wt = absolutize_path(worktree_dir).unwrap_or_else(|_| worktree_dir.to_path_buf());
+    if abs_wt.exists() {
+        let wt_str = abs_wt.to_string_lossy().to_string();
+        let _ = run_git(&abs_repo, &["worktree", "remove", "--force", &wt_str]).await;
+        let _ = std::fs::remove_dir_all(&abs_wt);
     }
 }
 

@@ -9,7 +9,8 @@ export const GraphEditorView: React.FC = () => {
   const [newInstId, setNewInstId] = useState("");
   const [newInstDef, setNewInstDef] = useState("engineering.linked_prs");
   const [newInstCat, setNewInstCat] = useState("data_provider");
-  const [bindSlot, setBindSlot] = useState("prs");
+  const [dragBindSlot, setDragBindSlot] = useState("prs");
+  const [newInstBindSlot, setNewInstBindSlot] = useState("prs");
   const [bindTarget, setBindTarget] = useState("open_prs");
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -62,9 +63,21 @@ export const GraphEditorView: React.FC = () => {
     if (!target) return;
     const updated: InstanceConfig = {
       ...target,
-      inputs: { ...target.inputs, [bindSlot]: fromId },
+      inputs: { ...target.inputs, [dragBindSlot]: fromId },
     };
     await upsertInstance(updated);
+  };
+
+  const discardDraft = async () => {
+    if (!draftId) return;
+    setError(null);
+    try {
+      await apiFetch(`/api/drafts/${draftId}`, { method: "DELETE" });
+      setDraftId(null);
+      setStatusMsg(null);
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const activateDraft = async () => {
@@ -100,9 +113,14 @@ export const GraphEditorView: React.FC = () => {
         </div>
         <div className="row">
           {draftId && (
-            <button type="button" className="btn primary" onClick={() => void activateDraft()}>
-              Validate, Test &amp; Activate Draft
-            </button>
+            <>
+              <button type="button" className="btn primary" onClick={() => void activateDraft()}>
+                Validate, Test &amp; Activate Draft
+              </button>
+              <button type="button" className="btn danger" onClick={() => void discardDraft()}>
+                Discard Draft
+              </button>
+            </>
           )}
           <button type="button" className="btn" onClick={() => void loadGraph()}>
             Reload Graph
@@ -136,8 +154,8 @@ export const GraphEditorView: React.FC = () => {
             <span>Target input slot for drag-connect:</span>
             <input
               type="text"
-              value={bindSlot}
-              onChange={(e) => setBindSlot(e.target.value)}
+              value={dragBindSlot}
+              onChange={(e) => setDragBindSlot(e.target.value)}
               style={{ width: 110 }}
             />
           </label>
@@ -223,7 +241,7 @@ export const GraphEditorView: React.FC = () => {
               id: newInstId.trim(),
               category: newInstCat,
               definition: newInstDef.trim(),
-              inputs: bindTarget ? { [bindSlot]: bindTarget } : {},
+              inputs: bindTarget ? { [newInstBindSlot]: bindTarget } : {},
               config: {},
               secrets: {},
               capabilities: [],
@@ -254,8 +272,8 @@ export const GraphEditorView: React.FC = () => {
           <input
             type="text"
             placeholder="input slot (e.g. prs)"
-            value={bindSlot}
-            onChange={(e) => setBindSlot(e.target.value)}
+            value={newInstBindSlot}
+            onChange={(e) => setNewInstBindSlot(e.target.value)}
           />
           <input
             type="text"

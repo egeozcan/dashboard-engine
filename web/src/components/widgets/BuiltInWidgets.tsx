@@ -19,6 +19,7 @@ interface RendererProps {
   designerMode?: boolean;
   onSelectWidget?: (widgetId: string) => void;
   selectedWidgetId?: string | null;
+  layoutStyle?: React.CSSProperties;
 }
 
 export const WidgetRenderer: React.FC<RendererProps> = ({
@@ -30,6 +31,7 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
   designerMode,
   onSelectWidget,
   selectedWidgetId,
+  layoutStyle,
 }) => {
   if (node.layout_override?.visible === false && !designerMode) {
     return null;
@@ -42,15 +44,16 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
         outline: isSelected ? "2px solid var(--accent)" : "1px dashed var(--border)",
         outlineOffset: 2,
         opacity: node.layout_override?.visible === false ? 0.5 : 1,
-        gridColumn: node.layout_override?.w ? `span ${Math.min(12, node.layout_override.w)}` : undefined,
       }
     : undefined;
+  const wrapperStyle: React.CSSProperties | undefined =
+    layoutStyle || designerStyle ? { ...layoutStyle, ...designerStyle } : undefined;
 
   const wrap = (inner: React.ReactNode) => (
     <div
       key={node.widget_id}
       data-widget-id={node.widget_id}
-      style={designerStyle}
+      style={wrapperStyle}
       onClick={
         designerMode && onSelectWidget
           ? (e) => {
@@ -75,47 +78,80 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
       const gap = typeof props.gap === "number" ? props.gap : 12;
       return wrap(
         <div style={{ display: "flex", flexDirection: dir, gap }}>
-          {(node.children ?? []).map((child) => (
-            <WidgetRenderer
-              key={child.widget_id}
-              node={child}
-              adapterInstance={adapterInstance}
-              generation={generation}
-              onWidgetRequest={onWidgetRequest}
-              onDashboardStateChange={onDashboardStateChange}
-              designerMode={designerMode}
-              onSelectWidget={onSelectWidget}
-              selectedWidgetId={selectedWidgetId}
-            />
-          ))}
+          {(node.children ?? []).map((child) => {
+            const w = child.layout_override?.w;
+            const childLayout: React.CSSProperties | undefined =
+              typeof w === "number" && w < 12
+                ? { width: `${(Math.min(12, Math.max(1, w)) / 12) * 100}%` }
+                : undefined;
+            return (
+              <WidgetRenderer
+                key={child.widget_id}
+                node={child}
+                adapterInstance={adapterInstance}
+                generation={generation}
+                onWidgetRequest={onWidgetRequest}
+                onDashboardStateChange={onDashboardStateChange}
+                designerMode={designerMode}
+                onSelectWidget={onSelectWidget}
+                selectedWidgetId={selectedWidgetId}
+                layoutStyle={childLayout}
+              />
+            );
+          })}
         </div>
       );
     }
 
     case "dash.grid": {
-      const cols = typeof props.columns === "number" ? props.columns : 2;
+      const cols = Math.max(1, typeof props.columns === "number" ? props.columns : 2);
       const gap = typeof props.gap === "number" ? props.gap : 12;
+      const children = node.children ?? [];
+      const visibleChildren = children.filter(
+        (c) => designerMode || c.layout_override?.visible !== false
+      );
+      let explicitSum = 0;
+      let unsetCount = 0;
+      for (const child of visibleChildren) {
+        const w = child.layout_override?.w;
+        if (typeof w === "number") {
+          explicitSum += Math.min(12, Math.max(1, w));
+        } else {
+          unsetCount += 1;
+        }
+      }
+      const fallbackUnsetSpan =
+        explicitSum < 12 && unsetCount > 0 && visibleChildren.length <= cols
+          ? Math.max(1, Math.floor((12 - explicitSum) / unsetCount))
+          : Math.max(1, Math.floor(12 / cols));
+
       return wrap(
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+            gridTemplateColumns: "repeat(12, minmax(0, 1fr))",
             gap,
           }}
         >
-          {(node.children ?? []).map((child) => (
-            <WidgetRenderer
-              key={child.widget_id}
-              node={child}
-              adapterInstance={adapterInstance}
-              generation={generation}
-              onWidgetRequest={onWidgetRequest}
-              onDashboardStateChange={onDashboardStateChange}
-              designerMode={designerMode}
-              onSelectWidget={onSelectWidget}
-              selectedWidgetId={selectedWidgetId}
-            />
-          ))}
+          {children.map((child) => {
+            const w = child.layout_override?.w;
+            const span =
+              typeof w === "number" ? Math.min(12, Math.max(1, w)) : fallbackUnsetSpan;
+            return (
+              <WidgetRenderer
+                key={child.widget_id}
+                node={child}
+                adapterInstance={adapterInstance}
+                generation={generation}
+                onWidgetRequest={onWidgetRequest}
+                onDashboardStateChange={onDashboardStateChange}
+                designerMode={designerMode}
+                onSelectWidget={onSelectWidget}
+                selectedWidgetId={selectedWidgetId}
+                layoutStyle={{ gridColumn: `span ${span}` }}
+              />
+            );
+          })}
         </div>
       );
     }
@@ -394,6 +430,15 @@ const TableWidget: React.FC<{
   );
 };
 
+function formatAxisTime(raw: unknown): string {
+  const s = String(raw ?? "");
+  const iso = s.match(/^(\d{4})-(\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (iso) {
+    return `${iso[2]} ${iso[3]}`;
+  }
+  return s.length > 14 ? `${s.slice(0, 14)}...` : s;
+}
+
 const ChartWidget: React.FC<{
   title: string;
   series: Array<Record<string, unknown>>;
@@ -402,15 +447,21 @@ const ChartWidget: React.FC<{
 }> = ({ title, series, yKey, xKey }) => {
   const vals = series.map((s) => Number(s[yKey] ?? 0));
   const maxVal = Math.max(1, ...vals);
-  const w = 360;
-  const h = 110;
-  const points = vals
-    .map((v, i) => {
-      const x = vals.length <= 1 ? w / 2 : (i / (vals.length - 1)) * (w - 20) + 10;
-      const y = h - 14 - (v / maxVal) * (h - 28);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  const w = 380;
+  const h = 130;
+  const padLeft = 32;
+  const padRight = 14;
+  const padTop = 12;
+  const padBottom = 22;
+  const plotW = w - padLeft - padRight;
+  const plotH = h - padTop - padBottom;
+  const coords = vals.map((v, i) => {
+    const x = vals.length <= 1 ? padLeft + plotW / 2 : padLeft + (i / (vals.length - 1)) * plotW;
+    const y = padTop + plotH - (v / maxVal) * plotH;
+    return { x, y, v, rawX: series[i]?.[xKey] ?? i };
+  });
+  const points = coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" ");
+  const yTicks = maxVal >= 2 ? [0, Math.round(maxVal / 2), maxVal] : [0, maxVal];
 
   return (
     <div className="card" style={{ marginBottom: 0 }}>
@@ -419,17 +470,59 @@ const ChartWidget: React.FC<{
         <span className="badge">{series.length} samples</span>
       </div>
       <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} role="img" aria-label={title}>
-        <line x1="10" y1={h - 14} x2={w - 10} y2={h - 14} stroke="var(--border)" />
-        {vals.length > 0 && (
-          <polyline fill="none" stroke="var(--accent)" strokeWidth="2.5" points={points} />
-        )}
-        {vals.map((v, i) => {
-          const x = vals.length <= 1 ? w / 2 : (i / (vals.length - 1)) * (w - 20) + 10;
-          const y = h - 14 - (v / maxVal) * (h - 28);
+        {yTicks.map((tick) => {
+          const y = padTop + plotH - (tick / maxVal) * plotH;
           return (
-            <circle key={String(series[i]?.[xKey] ?? i)} cx={x} cy={y} r="3.5" fill="var(--accent)" />
+            <g key={tick}>
+              <line
+                x1={padLeft}
+                y1={y}
+                x2={w - padRight}
+                y2={y}
+                stroke="var(--border)"
+                strokeDasharray={tick === 0 ? undefined : "3 3"}
+              />
+              <text
+                x={padLeft - 6}
+                y={y + 3}
+                textAnchor="end"
+                fontSize="10"
+                fill="var(--text-muted)"
+              >
+                {tick}
+              </text>
+            </g>
           );
         })}
+        {coords.length > 1 && (
+          <polyline fill="none" stroke="var(--accent)" strokeWidth="2.5" points={points} />
+        )}
+        {coords.map((c, i) => (
+          <circle key={String(c.rawX ?? i)} cx={c.x} cy={c.y} r="3.5" fill="var(--accent)">
+            <title>{`${formatAxisTime(c.rawX)}: ${c.v}`}</title>
+          </circle>
+        ))}
+        {coords.length === 1 && (
+          <text
+            x={coords[0].x}
+            y={h - 5}
+            textAnchor="middle"
+            fontSize="10"
+            fill="var(--text-muted)"
+          >
+            {formatAxisTime(coords[0].rawX)}
+          </text>
+        )}
+        {coords.length > 1 && (
+          <>
+            <text x={padLeft} y={h - 5} textAnchor="start" fontSize="10" fill="var(--text-muted)">
+              {formatAxisTime(coords[0].rawX)}
+            </text>
+            <text x={w - padRight} y={h - 5} textAnchor="end" fontSize="10" fill="var(--text-muted)">
+              {formatAxisTime(coords[coords.length - 1].rawX)}
+            </text>
+          </>
+        )}
       </svg>
     </div>
   );

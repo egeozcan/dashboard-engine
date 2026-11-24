@@ -244,6 +244,41 @@ mod tests {
             .unwrap();
         assert!(csp.contains("connect-src 'none'"));
 
+        // Embedded UI index.html must obey strict CSP `script-src 'self'` with no inline scripts
+        let src_index = include_str!("../../../web/index.html");
+        assert!(
+            src_index.contains(r#"src="/theme-init.js""#),
+            "web/index.html should load /theme-init.js externally"
+        );
+        assert!(
+            !src_index.contains("localStorage.getItem"),
+            "web/index.html must not contain inline theme script"
+        );
+
+        let ui_resp = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(ui_resp.status(), 200);
+        let ui_csp = ui_resp
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ui_csp.contains("script-src 'self'"));
+        assert!(!ui_csp.contains("script-src 'self' 'unsafe-inline'"));
+        let ui_html = ui_resp.text().await.unwrap();
+        assert!(ui_html.contains(r#"src="/theme-init.js""#));
+        assert!(!ui_html.contains("localStorage.getItem"));
+
+        let theme_js = client
+            .get(format!("{base}/theme-init.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(theme_js.status(), 200);
+        let theme_body = theme_js.text().await.unwrap();
+        assert!(theme_body.contains("localStorage.getItem"));
+
         server_h.abort();
     }
 }
