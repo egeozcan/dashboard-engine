@@ -253,15 +253,18 @@ pub async fn call_mcp_tool(
         "capability_explain" => Ok(services.capability_explain(req_str(&args, "target")?, principal)),
 
         // Drafts
-        "draft_begin" => Ok(json!(services.draft_begin(principal).await?)),
-        "draft_status" => Ok(json!(services.draft_status(req_str(&args, "draft_id")?)?)),
-        "draft_validate" => Ok(json!(services.draft_validate(req_str(&args, "draft_id")?).await?)),
-        "draft_preview" => Ok(json!(services.draft_preview(req_str(&args, "draft_id")?).await?)),
-        "draft_test" => Ok(json!(services.draft_test(req_str(&args, "draft_id")?).await?)),
-        "draft_rebase" => Ok(json!(services.draft_rebase(req_str(&args, "draft_id")?).await?)),
+        "draft_begin" => {
+            let base = args.get("base_revision").and_then(|v| v.as_str());
+            Ok(json!(services.draft_begin_at(principal, base).await?))
+        }
+        "draft_status" => Ok(json!(services.draft_status_as(req_str(&args, "draft_id")?, principal)?)),
+        "draft_validate" => Ok(json!(services.draft_validate_as(req_str(&args, "draft_id")?, principal).await?)),
+        "draft_preview" => Ok(json!(services.draft_preview_as(req_str(&args, "draft_id")?, principal).await?)),
+        "draft_test" => Ok(json!(services.draft_test_as(req_str(&args, "draft_id")?, principal).await?)),
+        "draft_rebase" => Ok(json!(services.draft_rebase_as(req_str(&args, "draft_id")?, principal).await?)),
         "draft_activate" => Ok(json!(services.draft_activate(req_str(&args, "draft_id")?, principal).await?)),
         "draft_abort" => {
-            services.draft_abort(req_str(&args, "draft_id")?).await?;
+            services.draft_abort_as(req_str(&args, "draft_id")?, principal).await?;
             Ok(json!({ "aborted": true }))
         }
 
@@ -334,9 +337,10 @@ pub async fn call_mcp_tool(
         }
         "dashboard_preview" => {
             services
-                .dashboard_preview(
+                .dashboard_preview_as(
                     req_str(&args, "draft_id")?,
                     req_str(&args, "dashboard_id")?,
+                    principal,
                 )
                 .await
         }
@@ -516,7 +520,7 @@ pub fn mcp_tool_definitions() -> Vec<Value> {
         ("contract_get", "Get generated manifest, JSON Schema, and Luau types for a Definition"),
         ("graph_inspect", "Inspect Configured Graph, bindings, Service principals, and validation"),
         ("capability_explain", "Explain effective authority for the current Principal on an Instance"),
-        ("draft_begin", "Start an isolated Draft transaction against the active Revision"),
+        ("draft_begin", "Start an isolated Draft transaction from `base_revision` (optional; defaults to the active Revision)"),
         ("draft_status", "Get status, changes, validation, and test reports for a Draft"),
         ("draft_validate", "Run static contract, compatibility, capability, and cycle validation on a Draft"),
         ("draft_preview", "Instantiate isolated Preview with Mocks and run Scenario + Definition tests"),

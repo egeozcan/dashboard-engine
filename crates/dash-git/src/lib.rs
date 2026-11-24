@@ -6,7 +6,7 @@ pub mod packages;
 pub mod preview;
 pub mod workspace;
 
-pub use drafts::{ActivationResult, DraftManager};
+pub use drafts::{verify_lock_matches_manifest, ActivationResult, DraftManager};
 pub use git_cli::{GitCommitInfo, GitError, GitStatusReport};
 pub use packages::{
     compute_tree_digest, read_packages_lock, read_packages_toml, resolve_and_lock_packages,
@@ -15,7 +15,8 @@ pub use packages::{
 };
 pub use preview::{
     run_definition_tests_against_mocks, run_preview_and_scenarios, run_workspace_definition_tests,
-    CapturedTestEvent, MockTestBridge, PreviewTestReport, ScenarioResult,
+    validate_graph_with_contracts, validate_instance_contracts, CapturedTestEvent, MockTestBridge,
+    PreviewTestReport, ScenarioResult,
 };
 pub use workspace::{
     delete_instance_in_workspace, load_workspace_graph, upsert_instance_in_workspace,

@@ -5,7 +5,7 @@ use crate::workspace::load_workspace_graph_async as load_workspace_graph;
 use async_trait::async_trait;
 use dash_core::{
     validate_configured_graph, ConfiguredGraph, FailureInjectionRule, LoadedDefinition, Principal,
-    RuntimeEngine, ValidationReport, WidgetRequestEnvelope,
+    RuntimeEngine, ValidationIssue, ValidationReport, WidgetRequestEnvelope,
 };
 use dash_luau::{
     run_definition_tests, CompiledInstanceBundle, DefinitionCategory, DefinitionTestReport,
@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioSuiteFile {
     pub name: String,
     #[serde(default)]
@@ -26,13 +27,16 @@ pub struct ScenarioSuiteFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioSpec {
     pub name: String,
     #[serde(default)]
     pub steps: Vec<ScenarioStep>,
 }
 
+/// One Scenario step. Exactly one operation key must be set; `assert` may accompany it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioStep {
     #[serde(default)]
     pub query: Option<QueryStep>,
@@ -49,6 +53,10 @@ pub struct ScenarioStep {
     #[serde(default)]
     pub process_events: Option<ProcessEventsStep>,
     #[serde(default)]
+    pub emit_event: Option<EmitEventStep>,
+    #[serde(default)]
+    pub push_update: Option<PushUpdateStep>,
+    #[serde(default)]
     pub inject_failure: Option<InjectFailureStep>,
     #[serde(default)]
     pub clear_failure: Option<ClearFailureStep>,
@@ -59,6 +67,7 @@ pub struct ScenarioStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryStep {
     pub instance: String,
     #[serde(default)]
@@ -70,6 +79,7 @@ pub struct QueryStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DryRunStep {
     pub action: String,
     #[serde(default)]
@@ -79,6 +89,7 @@ pub struct DryRunStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvokeActionStep {
     pub action: String,
     #[serde(default)]
@@ -90,6 +101,7 @@ pub struct InvokeActionStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SendRequestStep {
     pub dashboard: String,
     pub adapter: String,
@@ -102,6 +114,7 @@ pub struct SendRequestStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetDashboardStateStep {
     pub dashboard: String,
     pub key: String,
@@ -109,6 +122,7 @@ pub struct SetDashboardStateStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenderDashboardStep {
     pub dashboard: String,
     #[serde(default)]
@@ -116,13 +130,52 @@ pub struct RenderDashboardStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessEventsStep {
     pub source: String,
     #[serde(default)]
     pub assert: Option<StepAssertion>,
 }
 
+/// Inject a simulated Event into the Preview's isolated Event store (§4.5, §10.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmitEventStep {
+    /// Source Instance id the Event is attributed to.
+    pub source: String,
+    /// Semantic Event type (e.g. `github.pr_merged`).
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub durable: bool,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: String,
+}
+
+/// Push a value for a cached Query (push / keyed-delta update path, §6.2, §10.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushUpdateStep {
+    pub instance: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub assert: Option<StepAssertion>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_schema_version() -> String {
+    "1".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InjectFailureStep {
     pub instance: String,
     pub mode: String,
@@ -133,16 +186,19 @@ pub struct InjectFailureStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClearFailureStep {
     pub instance: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdvanceTimeStep {
     pub seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StepAssertion {
     #[serde(default)]
     pub length: Option<usize>,
@@ -156,6 +212,27 @@ pub struct StepAssertion {
     pub transitions: Option<usize>,
     #[serde(default)]
     pub contains_text: Option<String>,
+    /// Structural Widget-node assertions on a rendered Dashboard.
+    #[serde(default)]
+    pub widget: Option<Vec<WidgetAssertion>>,
+    /// Expected envelope kind of a pushed update (`snapshot` | `delta`).
+    #[serde(default)]
+    pub envelope_kind: Option<String>,
+}
+
+/// Assert that a rendered Widget node with `widget_id` exists and matches the given fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WidgetAssertion {
+    pub widget_id: String,
+    #[serde(default)]
+    pub widget_type: Option<String>,
+    /// JSON subset that the node's `props` must contain.
+    #[serde(default)]
+    pub props: Option<serde_json::Value>,
+    /// Effective visibility after Dashboard layout overrides (defaults to visible).
+    #[serde(default)]
+    pub visible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,7 +249,14 @@ pub struct PreviewTestReport {
     pub definition_tests: Vec<DefinitionTestReport>,
     pub scenario_results: Vec<ScenarioResult>,
     pub preview_renders: BTreeMap<String, serde_json::Value>,
+    /// Dashboards that failed to render in Preview (dashboard id -> error). Any entry fails Preview.
+    #[serde(default)]
+    pub preview_render_errors: BTreeMap<String, String>,
     pub all_passed: bool,
+    /// Git tree id of the exact draft content this report was computed for. Activation only
+    /// trusts a cached report whose `tested_tree` equals the draft's current content.
+    #[serde(default)]
+    pub tested_tree: Option<String>,
 }
 
 /// Maximum nesting of Mock-backed input resolution inside one Definition test (cycle guard).
@@ -605,6 +689,80 @@ pub async fn run_workspace_definition_tests(
     Ok(reports)
 }
 
+/// Contract checks on Instance configuration that complement `validate_configured_graph`
+/// (§12.2 step 3 "schema"): every Instance `config` must satisfy its Definition's declared
+/// config schema, and every secret slot must be a credential the Definition declares and be
+/// written as a `secret://<name>` reference.
+pub fn validate_instance_contracts(graph: &ConfiguredGraph) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    for (inst_id, inst) in &graph.instances {
+        let Some(def) = graph.definitions.get(&inst.definition) else {
+            continue; // unknown Definitions are reported by validate_configured_graph
+        };
+        if let Some(schema) = &def.manifest.config {
+            let cfg = if inst.config.is_null() {
+                serde_json::json!({})
+            } else {
+                inst.config.clone()
+            };
+            if let Err(e) = schema.validate_value(&cfg) {
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    code: "CONFIG_SCHEMA".into(),
+                    target: inst_id.clone(),
+                    message: format!(
+                        "config of '{inst_id}' does not match the config schema of '{}': {e}",
+                        inst.definition
+                    ),
+                });
+            }
+        }
+        for (slot, reference) in &inst.secrets {
+            if !def.manifest.credentials.iter().any(|c| c == slot) {
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    code: "UNDECLARED_SECRET_SLOT".into(),
+                    target: inst_id.clone(),
+                    message: format!(
+                        "secret slot '{slot}' is not a credential declared by '{}' (declared: {:?})",
+                        inst.definition, def.manifest.credentials
+                    ),
+                });
+            }
+            let valid_ref = reference
+                .strip_prefix("secret://")
+                .map(|n| !n.trim().is_empty())
+                .unwrap_or(false);
+            if !valid_ref {
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    code: "INVALID_SECRET_REF".into(),
+                    target: inst_id.clone(),
+                    message: format!(
+                        "secret slot '{slot}' must reference a central secret as 'secret://<name>', got '{reference}'"
+                    ),
+                });
+            }
+        }
+    }
+    issues
+}
+
+/// `validate_configured_graph` plus [`validate_instance_contracts`].
+pub fn validate_graph_with_contracts(
+    graph: &ConfiguredGraph,
+    store: &SqliteStore,
+    is_preview: bool,
+) -> ValidationReport {
+    let mut report = validate_configured_graph(graph, store, is_preview);
+    let extra = validate_instance_contracts(graph);
+    if extra.iter().any(|i| i.severity == "error") {
+        report.valid = false;
+    }
+    report.issues.extend(extra);
+    report
+}
+
 /// Execute full isolated Preview: validates Mocks, runs Definition tests and all Scenario tests,
 /// and renders Dashboards using Mocks (never touching production state or real external APIs).
 pub async fn run_preview_and_scenarios(
@@ -616,12 +774,13 @@ pub async fn run_preview_and_scenarios(
     let preview_store = SqliteStore::open_in_memory()
         .map_err(|e| GitError::Workspace(e.to_string()))?;
 
-    let validation = validate_configured_graph(&graph, &preview_store, true);
+    let validation = validate_graph_with_contracts(&graph, &preview_store, true);
     let definition_tests =
         run_workspace_definition_tests(workspace_dir, data_dir, changed_definitions).await?;
 
     let mut scenario_results = Vec::new();
     let mut preview_renders = BTreeMap::new();
+    let mut preview_render_errors = BTreeMap::new();
 
     if validation.valid {
         // Also render each dashboard once in isolated Preview
@@ -633,8 +792,13 @@ pub async fn run_preview_and_scenarios(
         .map_err(|e| GitError::Workspace(e.to_string()))?;
         let admin = Principal::administrator();
         for dash_id in graph.dashboards.keys() {
-            if let Ok(rendered) = render_engine.queries.render_dashboard(dash_id, &admin).await {
-                preview_renders.insert(dash_id.clone(), rendered);
+            match render_engine.queries.render_dashboard(dash_id, &admin).await {
+                Ok(rendered) => {
+                    preview_renders.insert(dash_id.clone(), rendered);
+                }
+                Err(e) => {
+                    preview_render_errors.insert(dash_id.clone(), e);
+                }
             }
         }
 
@@ -680,23 +844,175 @@ pub async fn run_preview_and_scenarios(
 
     let defs_ok = definition_tests.iter().all(|r| r.failed == 0);
     let scens_ok = scenario_results.iter().all(|s| s.passed);
-    let all_passed = validation.valid && defs_ok && scens_ok;
+    let renders_ok = preview_render_errors.is_empty();
+    let all_passed = validation.valid && defs_ok && scens_ok && renders_ok;
 
     Ok(PreviewTestReport {
         validation,
         definition_tests,
         scenario_results,
         preview_renders,
+        preview_render_errors,
         all_passed,
+        tested_tree: None,
     })
+}
+
+/// Assertion fields a step kind evaluates. Setting any other field is an error, so a typo or a
+/// misplaced key can never make a Scenario pass silently.
+fn check_assertion_fields(
+    idx: usize,
+    kind: &str,
+    a: &StepAssertion,
+    supported: &[&str],
+) -> Result<(), String> {
+    let set: Vec<&str> = [
+        ("length", a.length.is_some()),
+        ("contains", a.contains.is_some()),
+        ("feasible", a.feasible.is_some()),
+        ("status", a.status.is_some()),
+        ("transitions", a.transitions.is_some()),
+        ("contains_text", a.contains_text.is_some()),
+        ("widget", a.widget.is_some()),
+        ("envelope_kind", a.envelope_kind.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, is_set)| *is_set)
+    .map(|(name, _)| name)
+    .collect();
+    let unsupported: Vec<&str> = set
+        .into_iter()
+        .filter(|f| !supported.contains(f))
+        .collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "step {idx}: assertion field(s) {unsupported:?} are not supported by '{kind}' steps (supported: {supported:?})"
+        ))
+    }
+}
+
+/// Resolve the effective assertion of a step: an inline (operation-level) or step-level
+/// `assert`, but not both.
+fn step_assertion<'a>(
+    idx: usize,
+    inline: Option<&'a StepAssertion>,
+    step_level: Option<&'a StepAssertion>,
+) -> Result<Option<&'a StepAssertion>, String> {
+    match (inline, step_level) {
+        (Some(_), Some(_)) => Err(format!(
+            "step {idx}: 'assert' given both inside the operation and on the step; use one"
+        )),
+        (a, b) => Ok(a.or(b)),
+    }
+}
+
+fn operation_keys(step: &ScenarioStep) -> Vec<&'static str> {
+    [
+        ("query", step.query.is_some()),
+        ("dry_run", step.dry_run.is_some()),
+        ("invoke_action", step.invoke_action.is_some()),
+        ("send_request", step.send_request.is_some()),
+        ("set_dashboard_state", step.set_dashboard_state.is_some()),
+        ("render_dashboard", step.render_dashboard.is_some()),
+        ("process_events", step.process_events.is_some()),
+        ("emit_event", step.emit_event.is_some()),
+        ("push_update", step.push_update.is_some()),
+        ("inject_failure", step.inject_failure.is_some()),
+        ("clear_failure", step.clear_failure.is_some()),
+        ("advance_time", step.advance_time.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, set)| *set)
+    .map(|(k, _)| k)
+    .collect()
+}
+
+/// An automation result counts as a transition only when it is an action execution that
+/// succeeded (a `{ skipped = true }` result or a failed execution does not).
+fn is_succeeded_execution(v: &serde_json::Value) -> bool {
+    v.get("execution_id").and_then(|x| x.as_str()).is_some()
+        && v.get("status").and_then(|x| x.as_str()) == Some("succeeded")
+}
+
+fn find_widget_node<'a>(node: &'a serde_json::Value, widget_id: &str) -> Option<&'a serde_json::Value> {
+    match node {
+        serde_json::Value::Object(obj) => {
+            if obj.get("widget_id").and_then(|v| v.as_str()) == Some(widget_id) {
+                return Some(node);
+            }
+            obj.values().find_map(|v| find_widget_node(v, widget_id))
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(|v| find_widget_node(v, widget_id)),
+        _ => None,
+    }
+}
+
+fn check_widget_assertion(
+    idx: usize,
+    rendered: &serde_json::Value,
+    wa: &WidgetAssertion,
+) -> Result<(), String> {
+    let adapters = rendered
+        .get("adapters")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let node = find_widget_node(&adapters, &wa.widget_id)
+        .ok_or_else(|| format!("step {idx}: no rendered Widget node with widget_id '{}'", wa.widget_id))?;
+    if let Some(ref exp_type) = wa.widget_type {
+        let actual = node
+            .get("widget_type")
+            .or_else(|| node.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if actual != exp_type {
+            return Err(format!(
+                "step {idx}: widget '{}' has widget_type '{actual}', expected '{exp_type}'",
+                wa.widget_id
+            ));
+        }
+    }
+    if let Some(ref exp_props) = wa.props {
+        let props = node.get("props").cloned().unwrap_or(serde_json::Value::Null);
+        if !json_matches_subset(&props, exp_props) {
+            return Err(format!(
+                "step {idx}: widget '{}' props {props} do not contain {exp_props}",
+                wa.widget_id
+            ));
+        }
+    }
+    if let Some(exp_visible) = wa.visible {
+        let visible = node
+            .get("layout_override")
+            .and_then(|o| o.get("visible"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if visible != exp_visible {
+            return Err(format!(
+                "step {idx}: widget '{}' visible={visible}, expected {exp_visible}",
+                wa.widget_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Result<(), String> {
     let admin = Principal::administrator();
     for (idx, step) in steps.iter().enumerate() {
+        let ops = operation_keys(step);
+        if ops.len() > 1 {
+            return Err(format!(
+                "step {idx}: exactly one operation per step is allowed, found {ops:?}"
+            ));
+        }
         let step_assert = step.assert.as_ref();
         if let Some(q) = &step.query {
-            let assert = q.assert.as_ref().or(step_assert);
+            let assert = step_assertion(idx, q.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "query", a, &["status", "length", "contains"])?;
+            }
             let env = engine
                 .queries
                 .query(
@@ -721,7 +1037,9 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 }
                 let val = env.value.unwrap_or(serde_json::Value::Null);
                 if let Some(exp_len) = a.length {
-                    let actual_len = val.as_array().map(|v| v.len()).unwrap_or(0);
+                    let actual_len = val.as_array().map(|v| v.len()).ok_or_else(|| {
+                        format!("step {idx}: expected array for 'length' assertion, got {val}")
+                    })?;
                     if actual_len != exp_len {
                         return Err(format!(
                             "step {idx}: expected length {exp_len}, got {actual_len} ({val})"
@@ -743,7 +1061,10 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 }
             }
         } else if let Some(d) = &step.dry_run {
-            let assert = d.assert.as_ref().or(step_assert);
+            let assert = step_assertion(idx, d.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "dry_run", a, &["feasible"])?;
+            }
             let report = engine
                 .actions
                 .dry_run(&d.action, d.args.clone(), &admin)
@@ -759,7 +1080,10 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 }
             }
         } else if let Some(act) = &step.invoke_action {
-            let assert = act.assert.as_ref().or(step_assert);
+            let assert = step_assertion(idx, act.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "invoke_action", a, &["status"])?;
+            }
             let rec = engine
                 .actions
                 .invoke(
@@ -781,7 +1105,10 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 }
             }
         } else if let Some(req) = &step.send_request {
-            let assert = req.assert.as_ref().or(step_assert);
+            let assert = step_assertion(idx, req.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "send_request", a, &["status"])?;
+            }
             let rec = engine
                 .actions
                 .dispatch_widget_request_outcome(
@@ -810,6 +1137,9 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 }
             }
         } else if let Some(st) = &step.set_dashboard_state {
+            if step_assert.is_some() {
+                return Err(format!("step {idx}: 'set_dashboard_state' steps take no assertions"));
+            }
             engine
                 .state
                 .set(
@@ -823,7 +1153,10 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 )
                 .map_err(|e| e.to_string())?;
         } else if let Some(rd) = &step.render_dashboard {
-            let assert = rd.assert.as_ref().or(step_assert);
+            let assert = step_assertion(idx, rd.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "render_dashboard", a, &["contains_text", "widget"])?;
+            }
             let rendered = engine
                 .queries
                 .render_dashboard(&rd.dashboard, &admin)
@@ -837,30 +1170,98 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                         ));
                     }
                 }
+                if let Some(ref widgets) = a.widget {
+                    for wa in widgets {
+                        check_widget_assertion(idx, &rendered, wa)?;
+                    }
+                }
             }
         } else if let Some(pe) = &step.process_events {
-            let assert = pe.assert.as_ref().or(step_assert);
+            let assert = step_assertion(idx, pe.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "process_events", a, &["transitions"])?;
+            }
             let events = engine.events.replay_since(&pe.source, 0)?;
-            let mut ok_count = 0;
+            let mut transitions = 0;
             for ev in &events {
                 let res = engine.automations.dispatch_event(ev).await;
                 for item in res {
                     match item {
-                        Ok(_) => ok_count += 1,
+                        Ok(v) => {
+                            if is_succeeded_execution(&v) {
+                                transitions += 1;
+                            }
+                        }
                         Err(e) => return Err(format!("step {idx}: automation failed: {e}")),
                     }
                 }
             }
             if let Some(a) = assert {
                 if let Some(exp_t) = a.transitions {
-                    if ok_count != exp_t {
+                    if transitions != exp_t {
                         return Err(format!(
-                            "step {idx}: expected {exp_t} automation transitions, got {ok_count}"
+                            "step {idx}: expected {exp_t} automation transitions (succeeded action executions), got {transitions}"
+                        ));
+                    }
+                }
+            }
+        } else if let Some(em) = &step.emit_event {
+            if step_assert.is_some() {
+                return Err(format!("step {idx}: 'emit_event' steps take no assertions; follow with process_events"));
+            }
+            if !engine.graph.load().instances.contains_key(&em.source) {
+                return Err(format!(
+                    "step {idx}: emit_event source '{}' is not an Instance of the Preview graph",
+                    em.source
+                ));
+            }
+            engine.events.emit(
+                &em.source,
+                &em.event_type,
+                &em.schema_version,
+                &format!("scenario_step_{idx}"),
+                em.durable,
+                em.payload.clone(),
+            )?;
+        } else if let Some(pu) = &step.push_update {
+            let assert = step_assertion(idx, pu.assert.as_ref(), step_assert)?;
+            if let Some(a) = assert {
+                check_assertion_fields(idx, "push_update", a, &["status", "envelope_kind"])?;
+            }
+            let env = engine.queries.push_query_value(
+                &pu.instance,
+                &pu.params,
+                &admin,
+                pu.value.clone(),
+            )?;
+            if let Some(a) = assert {
+                if let Some(ref exp_status) = a.status {
+                    let actual = serde_json::to_value(env.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    if &actual != exp_status {
+                        return Err(format!(
+                            "step {idx}: expected pushed envelope status '{exp_status}', got '{actual}'"
+                        ));
+                    }
+                }
+                if let Some(ref exp_kind) = a.envelope_kind {
+                    let actual = serde_json::to_value(env.kind)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    if &actual != exp_kind {
+                        return Err(format!(
+                            "step {idx}: expected pushed envelope kind '{exp_kind}', got '{actual}'"
                         ));
                     }
                 }
             }
         } else if let Some(inj) = &step.inject_failure {
+            if step_assert.is_some() {
+                return Err(format!("step {idx}: 'inject_failure' steps take no assertions"));
+            }
             engine.telemetry.inject_failure(FailureInjectionRule {
                 instance_id: inj.instance.clone(),
                 mode: inj.mode.clone(),
@@ -868,9 +1269,18 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
                 remaining: inj.remaining,
             });
         } else if let Some(clr) = &step.clear_failure {
+            if step_assert.is_some() {
+                return Err(format!("step {idx}: 'clear_failure' steps take no assertions"));
+            }
             engine.telemetry.clear_failure(&clr.instance);
-        } else if step.advance_time.is_some() {
-            // Virtual clock hook
+        } else if let Some(adv) = &step.advance_time {
+            // Preview has no virtual clock yet (time simulation is an open Preview-fidelity
+            // detail, §19.9). Refuse rather than pretend time moved, so time-dependent
+            // Scenarios can never pass falsely.
+            return Err(format!(
+                "step {idx}: advance_time ({}s) is not supported: Preview has no virtual clock yet",
+                adv.seconds
+            ));
         } else {
             return Err(format!("step {idx}: empty/unknown scenario step"));
         }
@@ -1013,5 +1423,184 @@ end)
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].failed, 1);
         assert_eq!(reports[0].cases[0].name, dash_luau::NO_TESTS_CASE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_ws(dst: &Path) {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/engineering-command-center");
+        crate::packages::copy_tree_excluding_git(&src, dst).unwrap();
+    }
+
+    fn parse_steps(yaml: &str) -> Result<Vec<ScenarioStep>, String> {
+        let v: serde_json::Value = serde_yaml_ng::from_str(yaml).map_err(|e| e.to_string())?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+
+    async fn preview_engine(ws: &Path, data: &Path) -> RuntimeEngine {
+        let graph = load_workspace_graph(ws, data, "preview", 1, true).await.unwrap();
+        RuntimeEngine::new(
+            graph,
+            SqliteStore::open_in_memory().unwrap(),
+            ResourceBudget::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn misspelled_assertion_key_is_rejected_at_parse_time() {
+        let err = parse_steps(
+            "- query: { instance: linked_prs }\n  assert: { lenght: 3 }\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("lenght"), "{err}");
+        let err = parse_steps("- quer: { instance: linked_prs }\n").unwrap_err();
+        assert!(err.contains("quer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_assertion_multi_op_and_advance_time_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fixture_ws(&ws);
+        let engine = preview_engine(&ws, &tmp.path().join("data")).await;
+
+        // `contains_text` is a render assertion: on a query step it must fail, not pass
+        let steps = parse_steps(
+            "- query: { instance: linked_prs, params: { repository: acme/platform, state: open } }\n  assert: { contains_text: anything }\n",
+        )
+        .unwrap();
+        let err = execute_scenario(&engine, &steps).await.unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
+
+        let steps = parse_steps(
+            "- query: { instance: linked_prs }\n  render_dashboard: { dashboard: engineering }\n",
+        )
+        .unwrap();
+        let err = execute_scenario(&engine, &steps).await.unwrap_err();
+        assert!(err.contains("exactly one operation"), "{err}");
+
+        let steps = parse_steps("- advance_time: { seconds: 60 }\n").unwrap();
+        let err = execute_scenario(&engine, &steps).await.unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn widget_assertions_check_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fixture_ws(&ws);
+        let engine = preview_engine(&ws, &tmp.path().join("data")).await;
+        let ok = parse_steps(
+            "- render_dashboard: { dashboard: engineering }\n  assert:\n    widget:\n      - widget_id: pr_table_adapter_pr_table\n        widget_type: dash.table\n        props: { client_sort_state_key: pr_table_sort }\n        visible: true\n",
+        )
+        .unwrap();
+        execute_scenario(&engine, &ok).await.unwrap();
+
+        let wrong_type = parse_steps(
+            "- render_dashboard: { dashboard: engineering }\n  assert:\n    widget:\n      - widget_id: pr_table_adapter_pr_table\n        widget_type: dash.chart\n",
+        )
+        .unwrap();
+        assert!(execute_scenario(&engine, &wrong_type).await.unwrap_err().contains("widget_type"));
+
+        let missing = parse_steps(
+            "- render_dashboard: { dashboard: engineering }\n  assert:\n    widget:\n      - widget_id: does_not_exist\n",
+        )
+        .unwrap();
+        assert!(execute_scenario(&engine, &missing).await.unwrap_err().contains("no rendered Widget"));
+    }
+
+    #[tokio::test]
+    async fn injected_event_drives_automation_and_skips_are_not_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fixture_ws(&ws);
+        let engine = preview_engine(&ws, &tmp.path().join("data")).await;
+        let g = engine.graph.load_full();
+        // Find the automation's Event trigger and the source Instance bound to it
+        let (auto_inst, trigger) = g
+            .instances
+            .values()
+            .filter(|i| i.category == dash_luau::DefinitionCategory::Automation)
+            .find_map(|i| {
+                let def = g.definitions.get(&i.definition)?;
+                let t = def.manifest.triggers.iter().find(|t| t.kind == "event")?.clone();
+                Some((i.clone(), t))
+            })
+            .expect("fixture automation with an event trigger");
+        let source = trigger
+            .source_input
+            .as_deref()
+            .and_then(|slot| auto_inst.inputs.get(slot).cloned())
+            .unwrap();
+        let event_type = trigger.event_type.clone().unwrap();
+
+        // An Event without a linked issue: the automation skips -> 0 transitions
+        let yaml = format!(
+            "- emit_event: {{ source: {source}, type: {event_type}, payload: {{ repository: acme/platform, number: 44 }} }}\n- process_events: {{ source: {source} }}\n  assert: {{ transitions: 0 }}\n"
+        );
+        execute_scenario(&engine, &parse_steps(&yaml).unwrap()).await.unwrap();
+
+        let yaml = format!(
+            "- emit_event: {{ source: {source}, type: {event_type}, payload: {{ repository: acme/platform, number: 45 }} }}\n- process_events: {{ source: {source} }}\n  assert: {{ transitions: 1 }}\n"
+        );
+        let err = execute_scenario(&engine, &parse_steps(&yaml).unwrap()).await.unwrap_err();
+        assert!(err.contains("got 0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn push_update_step_reaches_the_query_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fixture_ws(&ws);
+        let engine = preview_engine(&ws, &tmp.path().join("data")).await;
+        let steps = parse_steps(
+            "- query: { instance: open_prs, params: { repository: acme/platform, state: open } }\n- push_update: { instance: open_prs, params: { repository: acme/platform, state: open }, value: [ { number: 1 } ] }\n  assert: { status: fresh }\n- query: { instance: open_prs, params: { repository: acme/platform, state: open } }\n  assert: { length: 1 }\n",
+        )
+        .unwrap();
+        execute_scenario(&engine, &steps).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn render_failure_fails_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fixture_ws(&ws);
+        // Break the table Adapter at render time (valid declaration, failing runtime). Every
+        // declared handler must still exist in the module, or loading fails first.
+        let rt = ws.join("packages/engineering/pr_table_adapter/runtime.luau");
+        std::fs::write(
+            &rt,
+            "local R = {}\nfunction R.render(ctx) error(\"adapter exploded\") end\nfunction R.on_request(ctx) return nil end\nreturn R\n",
+        )
+        .unwrap();
+        let report = run_preview_and_scenarios(&ws, &tmp.path().join("data"), Some(&[]))
+            .await
+            .unwrap();
+        assert!(report.preview_render_errors.contains_key("engineering"), "{report:?}");
+        assert!(!report.all_passed);
+    }
+
+    #[test]
+    fn instance_contract_checks_flag_bad_secret_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fixture_ws(&ws);
+        let mut graph = crate::workspace::load_workspace_graph(&ws, &tmp.path().join("data"), "x", 1, true).unwrap();
+        assert!(validate_instance_contracts(&graph).is_empty(), "{:?}", validate_instance_contracts(&graph));
+        let (id, inst) = graph
+            .instances
+            .iter_mut()
+            .find(|(_, i)| !i.secrets.is_empty())
+            .unwrap();
+        let id = id.clone();
+        inst.secrets.insert("not_declared".into(), "plaintext-token".into());
+        let issues = validate_instance_contracts(&graph);
+        assert!(issues.iter().any(|i| i.code == "UNDECLARED_SECRET_SLOT" && i.target == id));
+        assert!(issues.iter().any(|i| i.code == "INVALID_SECRET_REF" && i.target == id));
     }
 }

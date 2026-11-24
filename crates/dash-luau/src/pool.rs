@@ -265,6 +265,25 @@ struct PoolCounters {
     queue_rejections: AtomicU64,
 }
 
+/// Replacement VMs built for a pending Generation but not yet installed in the live pool.
+pub struct PreparedVms {
+    vms: Vec<(String, PooledVm)>,
+}
+
+impl PreparedVms {
+    pub fn instance_ids(&self) -> Vec<String> {
+        self.vms.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.vms.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vms.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub struct VmPool {
     vms: Arc<DashMap<String, PooledVm>>,
@@ -430,6 +449,95 @@ impl VmPool {
     /// Evict a single instance VM (e.g., on unrecoverable runtime fault or circuit open).
     pub fn evict(&self, instance_id: &str) {
         self.vms.remove(instance_id);
+    }
+
+    /// Prepare replacement VMs for a pending Generation without installing them (§12.2 step 5):
+    /// each VM is built under this pool's `ResourceBudget` and its `runtime.luau` module is
+    /// evaluated (wall-time, interrupt and memory limits enforced). The first failing Instance
+    /// is returned so activation can be refused before anything is committed.
+    pub async fn prepare_replacements(
+        &self,
+        bundles: &[CompiledInstanceBundle],
+    ) -> Result<PreparedVms, (String, RuntimeError)> {
+        let mut vms = Vec::with_capacity(bundles.len());
+        for bundle in bundles {
+            let inst_id = bundle.instance_id.clone();
+            // Per-Instance budget (`[resources]` overrides clamped to the ceiling), as at runtime.
+            let budget = self.effective_budget(&inst_id);
+            let lua = build_sandboxed_vm(bundle, &budget).map_err(|e| (inst_id.clone(), e))?;
+            let fingerprint = budget.fingerprint();
+            let idle_ttl = budget.idle_ttl;
+            let src = bundle.runtime_source.clone();
+            let def_id = bundle.manifest.id.clone();
+            let lua = tokio::task::spawn_blocking(move || -> Result<Lua, RuntimeError> {
+                let started = Instant::now();
+                let ticks = Arc::new(AtomicU64::new(0));
+                let ticks_ref = Arc::clone(&ticks);
+                let wall_timeout = budget.wall_timeout;
+                let max_interrupts = budget.max_interrupts;
+                lua.set_interrupt(move |_| {
+                    let count = ticks_ref.fetch_add(1, Ordering::Relaxed);
+                    if started.elapsed() > wall_timeout || count > max_interrupts {
+                        return Err(mlua::Error::runtime("DASH_TIMEOUT"));
+                    }
+                    Ok(VmState::Continue)
+                });
+                let evaluated = lua
+                    .load(&src)
+                    .set_name(format!("{def_id}/runtime.luau"))
+                    .eval::<Value>();
+                lua.set_interrupt(|_| Ok(VmState::Continue));
+                match evaluated {
+                    Ok(Value::Table(t)) => {
+                        lua.globals().set("__dash_module", Value::Table(t))?;
+                    }
+                    Ok(_) => {
+                        return Err(RuntimeError::Luau(mlua::Error::runtime(
+                            "runtime.luau must return a module table",
+                        )))
+                    }
+                    Err(e) => {
+                        return Err(if e.to_string().contains("DASH_TIMEOUT") {
+                            RuntimeError::Timeout(wall_timeout)
+                        } else if matches!(e, mlua::Error::MemoryError(_)) {
+                            RuntimeError::MemoryExceeded(budget.memory_limit_bytes)
+                        } else {
+                            RuntimeError::Luau(e)
+                        })
+                    }
+                }
+                Ok(lua)
+            })
+            .await
+            .map_err(|e| (inst_id.clone(), RuntimeError::Join(e)))?
+            .map_err(|e| (inst_id.clone(), e))?;
+            self.counters.vm_starts.fetch_add(1, Ordering::Relaxed);
+            vms.push((
+                inst_id,
+                PooledVm {
+                    vm_uid: format!("vm_{}", Uuid::now_v7().simple()),
+                    definition_digest: bundle.manifest.identity_version.clone(),
+                    config_digest: bundle.config_digest.clone(),
+                    budget_fingerprint: fingerprint,
+                    idle_ttl,
+                    last_used: Instant::now(),
+                    in_flight: Arc::new(AtomicUsize::new(0)),
+                    lua: Arc::new(tokio::sync::Mutex::new(lua)),
+                },
+            ));
+        }
+        Ok(PreparedVms { vms })
+    }
+
+    /// Install VMs prepared by [`VmPool::prepare_replacements`], replacing any live VM of the
+    /// same Instance. Called right after the atomic Generation switch.
+    pub fn install_prepared(&self, prepared: PreparedVms) -> Vec<String> {
+        let mut installed = Vec::with_capacity(prepared.vms.len());
+        for (inst_id, vm) in prepared.vms {
+            self.vms.insert(inst_id.clone(), vm);
+            installed.push(inst_id);
+        }
+        installed
     }
 
     /// Evict only if the live VM is still the one identified by `vm_uid`.

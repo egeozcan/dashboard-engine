@@ -194,8 +194,14 @@ impl AppServices {
         Ok(meta)
     }
 
-    fn draft_instance(&self, draft_id: &str, instance_id: &str) -> Result<Option<InstanceConfig>, String> {
-        let draft = self.draft_status(draft_id)?;
+    /// An Instance as it stands in the Draft, read with the caller's draft ownership checked.
+    fn draft_instance(
+        &self,
+        draft_id: &str,
+        instance_id: &str,
+        principal: &Principal,
+    ) -> Result<Option<InstanceConfig>, String> {
+        let draft = self.draft_status_as(draft_id, principal)?;
         let g = dash_git::load_workspace_graph(
             std::path::Path::new(&draft.worktree_path),
             self.drafts.data_dir(),
@@ -639,10 +645,19 @@ impl AppServices {
     // ---- Drafts & Definitions & Instances & Dashboards ----
 
     pub async fn draft_begin(&self, principal: &Principal) -> Result<DraftRecord, String> {
+        self.draft_begin_at(principal, None).await
+    }
+
+    /// Begin a Draft from a specified base Revision (`None` = the active Revision, §12.2 step 1).
+    pub async fn draft_begin_at(
+        &self,
+        principal: &Principal,
+        base_revision: Option<&str>,
+    ) -> Result<DraftRecord, String> {
         self.require_draft_author(principal, "draft.begin", "draft")?;
         let rec = self
             .drafts
-            .draft_begin(principal)
+            .draft_begin_at(principal, base_revision)
             .await
             .map_err(|e| e.to_string())?;
         let _ = self.store().append_audit(
@@ -656,24 +671,58 @@ impl AppServices {
         Ok(rec)
     }
 
+    // The draft methods without a Principal act as the Administrator and exist for trusted
+    // in-process callers (CLI). Network-facing handlers use the `_as` variants, which enforce
+    // draft ownership and `can_author_drafts` (§5.1 deny by default, §20 attribution).
+
     pub fn draft_status(&self, draft_id: &str) -> Result<DraftRecord, String> {
-        self.drafts.draft_status(draft_id).map_err(|e| e.to_string())
+        self.draft_status_as(draft_id, &Principal::administrator())
+    }
+
+    pub fn draft_status_as(&self, draft_id: &str, principal: &Principal) -> Result<DraftRecord, String> {
+        self.drafts
+            .draft_status_as(draft_id, principal)
+            .map_err(|e| e.to_string())
     }
 
     pub fn draft_list(&self) -> Result<Vec<DraftRecord>, String> {
         self.drafts.draft_list().map_err(|e| e.to_string())
     }
 
-    pub async fn draft_validate(&self, draft_id: &str) -> Result<ValidationReport, String> {
+    pub fn draft_list_for(&self, principal: &Principal) -> Result<Vec<DraftRecord>, String> {
         self.drafts
-            .draft_validate(draft_id)
+            .draft_list_for(principal)
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn draft_validate(&self, draft_id: &str) -> Result<ValidationReport, String> {
+        self.draft_validate_as(draft_id, &Principal::administrator())
+            .await
+    }
+
+    pub async fn draft_validate_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<ValidationReport, String> {
+        self.drafts
+            .draft_validate_as(draft_id, principal)
             .await
             .map_err(|e| e.to_string())
     }
 
     pub async fn draft_preview(&self, draft_id: &str) -> Result<PreviewTestReport, String> {
+        self.draft_preview_as(draft_id, &Principal::administrator())
+            .await
+    }
+
+    pub async fn draft_preview_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<PreviewTestReport, String> {
         self.drafts
-            .draft_preview_and_test(draft_id)
+            .draft_preview_and_test_as(draft_id, principal)
             .await
             .map_err(|e| e.to_string())
     }
@@ -682,9 +731,26 @@ impl AppServices {
         self.draft_preview(draft_id).await
     }
 
+    pub async fn draft_test_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<PreviewTestReport, String> {
+        self.draft_preview_as(draft_id, principal).await
+    }
+
     pub async fn draft_rebase(&self, draft_id: &str) -> Result<DraftRecord, String> {
+        self.draft_rebase_as(draft_id, &Principal::administrator())
+            .await
+    }
+
+    pub async fn draft_rebase_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
         self.drafts
-            .draft_rebase(draft_id)
+            .draft_rebase_as(draft_id, principal)
             .await
             .map_err(|e| e.to_string())
     }
@@ -701,8 +767,13 @@ impl AppServices {
     }
 
     pub async fn draft_abort(&self, draft_id: &str) -> Result<(), String> {
+        self.draft_abort_as(draft_id, &Principal::administrator())
+            .await
+    }
+
+    pub async fn draft_abort_as(&self, draft_id: &str, principal: &Principal) -> Result<(), String> {
         self.drafts
-            .draft_abort(draft_id)
+            .draft_abort_as(draft_id, principal)
             .await
             .map_err(|e| e.to_string())
     }
@@ -721,13 +792,14 @@ impl AppServices {
         self.require_draft_author(principal, "draft.edit", draft_id)?;
         self.record_draft_edit(draft_id, principal, &format!("definition:{package}.{def_name}"))?;
         self.drafts
-            .draft_write_definition(
+            .draft_write_definition_as(
                 draft_id,
                 package,
                 def_name,
                 definition_luau,
                 runtime_luau,
                 tests_luau,
+                principal,
             )
             .map_err(|e| e.to_string())
     }
@@ -766,7 +838,7 @@ impl AppServices {
         self.require_draft_author(principal, "draft.edit", draft_id)?;
         let mut newly_bound: Vec<(String, String)> = Vec::new();
         if !inst.secrets.is_empty() {
-            let existing = self.draft_instance(draft_id, &inst.id)?;
+            let existing = self.draft_instance(draft_id, &inst.id, principal)?;
             for slot in inst.secrets.keys() {
                 let unchanged = existing
                     .as_ref()
@@ -785,7 +857,7 @@ impl AppServices {
         self.record_draft_edit(draft_id, principal, &format!("instance.upsert:{}", inst.id))?;
         let rec = self
             .drafts
-            .draft_upsert_instance(draft_id, inst)
+            .draft_upsert_instance_as(draft_id, inst, principal)
             .map_err(|e| e.to_string())?;
         for (slot, secret_name) in newly_bound {
             let _ = self.store().append_audit(
@@ -809,7 +881,7 @@ impl AppServices {
         self.require_draft_author(principal, "draft.edit", draft_id)?;
         self.record_draft_edit(draft_id, principal, &format!("instance.delete:{instance_id}"))?;
         self.drafts
-            .draft_delete_instance(draft_id, instance_id)
+            .draft_delete_instance_as(draft_id, instance_id, principal)
             .map_err(|e| e.to_string())
     }
 
@@ -842,7 +914,7 @@ impl AppServices {
         self.require_draft_author(principal, "draft.edit", draft_id)?;
         self.record_draft_edit(draft_id, principal, &format!("dashboard:{}", doc.id))?;
         self.drafts
-            .draft_update_dashboard(draft_id, doc)
+            .draft_update_dashboard_as(draft_id, doc, principal)
             .map_err(|e| e.to_string())
     }
 
@@ -851,7 +923,17 @@ impl AppServices {
         draft_id: &str,
         dashboard_id: &str,
     ) -> Result<serde_json::Value, String> {
-        let report = self.draft_preview(draft_id).await?;
+        self.dashboard_preview_as(draft_id, dashboard_id, &Principal::administrator())
+            .await
+    }
+
+    pub async fn dashboard_preview_as(
+        &self,
+        draft_id: &str,
+        dashboard_id: &str,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
+        let report = self.draft_preview_as(draft_id, principal).await?;
         Ok(report
             .preview_renders
             .get(dashboard_id)
@@ -1025,7 +1107,7 @@ impl AppServices {
         let requested = serde_json::to_value(&spec).unwrap_or_default();
         let result = self
             .drafts
-            .draft_update_dependency(draft_id, package_name, spec)
+            .draft_update_dependency_as(draft_id, package_name, spec, principal)
             .await
             .map_err(|e| e.to_string());
         // §14.3: audit Package installation/updates, including the pinned lock entry.
@@ -1183,14 +1265,14 @@ impl AppServices {
         self.check_secret_binding(principal, instance_id, secret_name)?;
 
         let mut inst = self
-            .draft_instance(draft_id, instance_id)?
+            .draft_instance(draft_id, instance_id, principal)?
             .ok_or_else(|| format!("instance '{instance_id}' not found in draft"))?;
         inst.secrets
             .insert(slot.to_string(), format!("secret://{secret_name}"));
         self.record_draft_edit(draft_id, principal, &format!("secret.bind:{instance_id}.{slot}"))?;
         let updated = self
             .drafts
-            .draft_upsert_instance(draft_id, &inst)
+            .draft_upsert_instance_as(draft_id, &inst, principal)
             .map_err(|e| e.to_string())?;
         let _ = self.store().append_audit(
             &principal.id,
@@ -1362,6 +1444,7 @@ impl AppServices {
             "instances": g.instances.len(),
             "validation": val,
             "service_principals": self.service_principal_list(),
+            "startup_warnings": self.drafts.startup_warnings(),
         }))
     }
 }

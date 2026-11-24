@@ -517,25 +517,33 @@ async fn drafts_list_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
-        return r;
-    }
-    match st.services.draft_list() {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_list_for(&p) {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
+}
+
+#[derive(Deserialize, Default)]
+struct DraftBeginParams {
+    #[serde(default)]
+    base_revision: Option<String>,
 }
 
 async fn draft_begin_handler(
     State(st): State<ServerState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(q): Query<DraftBeginParams>,
 ) -> Response {
     let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.draft_begin(&p).await {
+    match st.services.draft_begin_at(&p, q.base_revision.as_deref()).await {
         Ok(d) => Json(d).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -547,10 +555,11 @@ async fn draft_status_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
-        return r;
-    }
-    match st.services.draft_status(&id) {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_status_as(&id, &p) {
         Ok(d) => Json(d).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
     }
@@ -562,10 +571,11 @@ async fn draft_abort_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::DELETE, peer) {
-        return r;
-    }
-    match st.services.draft_abort(&id).await {
+    let p = match auth_or_err(&st, &headers, &Method::DELETE, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_abort_as(&id, &p).await {
         Ok(()) => Json(json!({ "aborted": true })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -577,10 +587,11 @@ async fn draft_validate_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::POST, peer) {
-        return r;
-    }
-    match st.services.draft_validate(&id).await {
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_validate_as(&id, &p).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -592,10 +603,11 @@ async fn draft_preview_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::POST, peer) {
-        return r;
-    }
-    match st.services.draft_preview(&id).await {
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_preview_as(&id, &p).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -607,10 +619,11 @@ async fn draft_rebase_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::POST, peer) {
-        return r;
-    }
-    match st.services.draft_rebase(&id).await {
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_rebase_as(&id, &p).await {
         Ok(d) => Json(d).into_response(),
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
     }
