@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use dash_core::{
     validate_configured_graph, CapabilityCeiling, ConfiguredGraph, DashboardDoc, DryRunReport,
-    ExecutionGraphSnapshot, HistorySeriesConfig, InstanceConfig, Principal,
+    ExecutionGraphSnapshot, HistorySeriesConfig, InstanceConfig, NetworkPolicy, Principal,
     QueryEnvelope, RuntimeEngine, RuntimeMetricsSnapshot, SanitizedLogEntry, ValidationReport,
     WidgetRequestEnvelope,
 };
@@ -77,6 +77,119 @@ impl AppServices {
 
     pub fn graph(&self) -> Arc<ConfiguredGraph> {
         self.engine().graph.load_full()
+    }
+
+    /// Audit a denial (§14.3 "Audit all capability denials") and return its message.
+    fn deny(&self, principal: &Principal, operation: &str, target: &str, msg: &str) -> String {
+        dash_core::audit_denial(self.store(), principal, operation, target, msg);
+        msg.to_string()
+    }
+
+    fn require_draft_author(
+        &self,
+        principal: &Principal,
+        operation: &str,
+        target: &str,
+    ) -> Result<(), String> {
+        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
+            return Err(self.deny(principal, operation, target, "principal lacks can_author_drafts"));
+        }
+        Ok(())
+    }
+
+    fn require_administrator(
+        &self,
+        principal: &Principal,
+        operation: &str,
+        target: &str,
+        msg: &str,
+    ) -> Result<(), String> {
+        if !principal.ceiling.unrestricted {
+            return Err(self.deny(principal, operation, target, msg));
+        }
+        Ok(())
+    }
+
+    /// Attribute a Draft change to its Principal *before* applying it (fail closed). Activation
+    /// checks every recorded editor's ceiling (secret bindings, Service principal consumers).
+    fn record_draft_edit(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+        change: &str,
+    ) -> Result<(), String> {
+        self.store()
+            .append_audit(
+                &principal.id,
+                principal.kind.as_str(),
+                "draft.edit",
+                draft_id,
+                "ok",
+                serde_json::json!({ "change": change }),
+            )
+            .map(|_| ())
+            .map_err(|e| format!("failed to record draft attribution: {e}"))
+    }
+
+    /// The same checks `secret_bind` applies, for any path that binds a secret reference: the
+    /// Principal's ceiling must allow the secret, the secret must exist, and its
+    /// `allowed_bindings` policy must admit the Instance (§5.2). Denials are audited.
+    fn check_secret_binding(
+        &self,
+        principal: &Principal,
+        instance_id: &str,
+        secret_name: &str,
+    ) -> Result<SecretMetadata, String> {
+        if !principal.ceiling.allows_secret(secret_name) {
+            let _ = self.store().append_audit(
+                &principal.id,
+                principal.kind.as_str(),
+                "secret.bind",
+                secret_name,
+                "denied",
+                serde_json::json!({ "instance_id": instance_id, "reason": "ceiling" }),
+            );
+            return Err(format!(
+                "principal ceiling does not permit binding secret '{secret_name}'"
+            ));
+        }
+        let secrets = self.store().list_secrets().map_err(|e| e.to_string())?;
+        let meta = secrets
+            .into_iter()
+            .find(|m| m.name == secret_name)
+            .ok_or_else(|| format!("secret '{secret_name}' not found or access denied"))?;
+        if !meta.allowed_bindings.is_empty()
+            && !meta
+                .allowed_bindings
+                .iter()
+                .any(|b| b == instance_id || b == "*")
+        {
+            let _ = self.store().append_audit(
+                &principal.id,
+                principal.kind.as_str(),
+                "secret.bind",
+                secret_name,
+                "denied",
+                serde_json::json!({ "instance_id": instance_id, "reason": "allowed_bindings" }),
+            );
+            return Err(format!(
+                "secret '{secret_name}' policy restricts allowed bindings"
+            ));
+        }
+        Ok(meta)
+    }
+
+    fn draft_instance(&self, draft_id: &str, instance_id: &str) -> Result<Option<InstanceConfig>, String> {
+        let draft = self.draft_status(draft_id)?;
+        let g = dash_git::load_workspace_graph(
+            std::path::Path::new(&draft.worktree_path),
+            self.drafts.data_dir(),
+            &draft.base_revision,
+            0,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(g.instances.get(instance_id).cloned())
     }
 
     /// Spawn background maintenance loops: idle VM reclamation, durable Event automation consumer,
@@ -255,13 +368,21 @@ impl AppServices {
     // ---- Drafts & Definitions & Instances & Dashboards ----
 
     pub async fn draft_begin(&self, principal: &Principal) -> Result<DraftRecord, String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
-        }
-        self.drafts
+        self.require_draft_author(principal, "draft.begin", "draft")?;
+        let rec = self
+            .drafts
             .draft_begin(principal)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let _ = self.store().append_audit(
+            &principal.id,
+            principal.kind.as_str(),
+            "draft.begin",
+            &rec.draft_id,
+            "ok",
+            serde_json::json!({ "base_revision": rec.base_revision }),
+        );
+        Ok(rec)
     }
 
     pub fn draft_status(&self, draft_id: &str) -> Result<DraftRecord, String> {
@@ -326,9 +447,8 @@ impl AppServices {
         tests_luau: Option<&str>,
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
-        }
+        self.require_draft_author(principal, "draft.edit", draft_id)?;
+        self.record_draft_edit(draft_id, principal, &format!("definition:{package}.{def_name}"))?;
         self.drafts
             .draft_write_definition(
                 draft_id,
@@ -377,18 +497,50 @@ impl AppServices {
         .await
     }
 
+    /// Upsert an Instance in a Draft. Any new or changed secret reference goes through the same
+    /// checks as `secret_bind` (ceiling, existence, `allowed_bindings`) and is audited as
+    /// `secret.bind`; Agents cannot bind ungranted secrets by writing the `secrets` map (§5.2).
     pub fn instance_upsert_in_draft(
         &self,
         draft_id: &str,
         inst: &InstanceConfig,
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
+        self.require_draft_author(principal, "draft.edit", draft_id)?;
+        let mut newly_bound: Vec<(String, String)> = Vec::new();
+        if !inst.secrets.is_empty() {
+            let existing = self.draft_instance(draft_id, &inst.id)?;
+            for slot in inst.secrets.keys() {
+                let unchanged = existing
+                    .as_ref()
+                    .and_then(|e| e.resolved_secret_name(slot))
+                    == inst.resolved_secret_name(slot);
+                if unchanged {
+                    continue;
+                }
+                let Some(secret_name) = inst.resolved_secret_name(slot) else {
+                    continue;
+                };
+                self.check_secret_binding(principal, &inst.id, &secret_name)?;
+                newly_bound.push((slot.clone(), secret_name));
+            }
         }
-        self.drafts
+        self.record_draft_edit(draft_id, principal, &format!("instance.upsert:{}", inst.id))?;
+        let rec = self
+            .drafts
             .draft_upsert_instance(draft_id, inst)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        for (slot, secret_name) in newly_bound {
+            let _ = self.store().append_audit(
+                &principal.id,
+                principal.kind.as_str(),
+                "secret.bind",
+                &secret_name,
+                "ok",
+                serde_json::json!({ "instance_id": inst.id, "slot": slot, "draft_id": draft_id }),
+            );
+        }
+        Ok(rec)
     }
 
     pub fn instance_delete_in_draft(
@@ -397,9 +549,8 @@ impl AppServices {
         instance_id: &str,
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
-        }
+        self.require_draft_author(principal, "draft.edit", draft_id)?;
+        self.record_draft_edit(draft_id, principal, &format!("instance.delete:{instance_id}"))?;
         self.drafts
             .draft_delete_instance(draft_id, instance_id)
             .map_err(|e| e.to_string())
@@ -429,9 +580,8 @@ impl AppServices {
         doc: &DashboardDoc,
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
-        }
+        self.require_draft_author(principal, "draft.edit", draft_id)?;
+        self.record_draft_edit(draft_id, principal, &format!("dashboard:{}", doc.id))?;
         self.drafts
             .draft_update_dashboard(draft_id, doc)
             .map_err(|e| e.to_string())
@@ -569,7 +719,7 @@ impl AppServices {
 
     pub async fn git_sync(&self, principal: &Principal) -> Result<GitSyncRecord, String> {
         if !principal.ceiling.can_git_sync && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_git_sync".into());
+            return Err(self.deny(principal, "git.sync", "workspace", "principal lacks can_git_sync"));
         }
         self.drafts
             .git_sync(principal)
@@ -584,13 +734,38 @@ impl AppServices {
         spec: PackageDependencySpec,
         principal: &Principal,
     ) -> Result<(DraftRecord, PackagesLock), String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
-        }
-        self.drafts
+        self.require_draft_author(principal, "package.update", package_name)?;
+        self.record_draft_edit(draft_id, principal, &format!("dependency:{package_name}"))?;
+        let requested = serde_json::to_value(&spec).unwrap_or_default();
+        let result = self
+            .drafts
             .draft_update_dependency(draft_id, package_name, spec)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        // §14.3: audit Package installation/updates, including the pinned lock entry.
+        let (outcome, detail) = match &result {
+            Ok((_, lock)) => (
+                "ok",
+                serde_json::json!({
+                    "draft_id": draft_id,
+                    "requested": requested,
+                    "locked": lock.packages.iter().find(|p| p.name == package_name),
+                }),
+            ),
+            Err(e) => (
+                "error",
+                serde_json::json!({ "draft_id": draft_id, "requested": requested, "error": e }),
+            ),
+        };
+        let _ = self.store().append_audit(
+            &principal.id,
+            principal.kind.as_str(),
+            "package.update",
+            package_name,
+            outcome,
+            detail,
+        );
+        result
     }
 
     // ---- Secrets (never returns plaintext!) ----
@@ -611,12 +786,39 @@ impl AppServices {
         allowed_bindings: &[String],
         principal: &Principal,
     ) -> Result<SecretMetadata, String> {
-        if !principal.ceiling.unrestricted {
-            return Err("only the Administrator may set secret values".into());
-        }
+        self.secret_set_with_policy(name, description, plaintext, allowed_bindings, None, None, principal)
+    }
+
+    /// Set a secret plus its Administrator policy: destination hosts the credential may be
+    /// attached to and how the broker presents it (`bearer`, `basic`, `header:<Name>`,
+    /// `query:<param>`). `None` keeps the current policy value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn secret_set_with_policy(
+        &self,
+        name: &str,
+        description: &str,
+        plaintext: &str,
+        allowed_bindings: &[String],
+        allowed_hosts: Option<&[String]>,
+        credential_scheme: Option<&str>,
+        principal: &Principal,
+    ) -> Result<SecretMetadata, String> {
+        self.require_administrator(
+            principal,
+            "secret.set",
+            name,
+            "only the Administrator may set secret values",
+        )?;
         let meta = self
             .store()
-            .set_secret(name, description, plaintext, allowed_bindings)
+            .set_secret_with_policy(
+                name,
+                description,
+                plaintext,
+                allowed_bindings,
+                allowed_hosts,
+                credential_scheme,
+            )
             .map_err(|e| e.to_string())?;
         let _ = self.store().append_audit(
             &principal.id,
@@ -624,9 +826,62 @@ impl AppServices {
             "secret.set",
             name,
             "ok",
-            serde_json::json!({ "key_version": meta.key_version }),
+            serde_json::json!({
+                "key_version": meta.key_version,
+                "allowed_bindings": meta.allowed_bindings,
+                "allowed_hosts": meta.allowed_hosts,
+                "credential_scheme": meta.credential_scheme,
+            }),
         );
         Ok(meta)
+    }
+
+    // ---- Network ceiling (Administrator-only, outside the Git Workspace) ----
+
+    /// Requested Workspace `[network]` policy, the Administrator ceiling, and whether the
+    /// request is fully covered (§5.2, §11.3).
+    pub fn network_policy_status(&self) -> serde_json::Value {
+        let g = self.graph();
+        let ceiling = self.store().get_network_policy_ceiling().ok().flatten();
+        let parsed: Option<NetworkPolicy> = ceiling
+            .as_ref()
+            .and_then(|(v, _, _)| serde_json::from_value(v.clone()).ok());
+        let requested = &g.workspace.network;
+        let pending_hosts: Vec<&String> = requested
+            .allowed_hosts
+            .iter()
+            .filter(|h| parsed.as_ref().map(|c| !c.allows_host(h)).unwrap_or(true))
+            .collect();
+        serde_json::json!({
+            "requested": requested,
+            "granted": parsed,
+            "granted_by": ceiling.as_ref().map(|(_, by, _)| by),
+            "granted_at": ceiling.as_ref().map(|(_, _, at)| at),
+            "pending_hosts": pending_hosts,
+        })
+    }
+
+    /// Set the Administrator network ceiling (audited as `network_policy.grant`).
+    pub fn network_policy_grant(&self, policy: NetworkPolicy, actor: &Principal) -> Result<(), String> {
+        self.require_administrator(
+            actor,
+            "network_policy.grant",
+            "network",
+            "only the Administrator can grant the network ceiling",
+        )?;
+        let value = serde_json::to_value(&policy).map_err(|e| e.to_string())?;
+        self.store()
+            .set_network_policy_ceiling(value.clone(), &actor.id)
+            .map_err(|e| e.to_string())?;
+        let _ = self.store().append_audit(
+            &actor.id,
+            actor.kind.as_str(),
+            "network_policy.grant",
+            "network",
+            "ok",
+            value,
+        );
+        Ok(())
     }
 
     /// Bind an existing secret into a connector instance inside a Draft (requires secret ceiling!).
@@ -638,54 +893,15 @@ impl AppServices {
         secret_name: &str,
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
-        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err("principal lacks can_author_drafts".into());
-        }
-        if !principal.ceiling.allows_secret(secret_name) {
-            let _ = self.store().append_audit(
-                &principal.id,
-                principal.kind.as_str(),
-                "secret.bind",
-                secret_name,
-                "denied",
-                serde_json::json!({ "instance_id": instance_id }),
-            );
-            return Err(format!(
-                "principal ceiling does not permit binding secret '{secret_name}'"
-            ));
-        }
-        let secrets = self.store().list_secrets().map_err(|e| e.to_string())?;
-        let meta = secrets
-            .into_iter()
-            .find(|m| m.name == secret_name)
-            .ok_or_else(|| format!("secret '{secret_name}' not found or access denied"))?;
-        if !meta.allowed_bindings.is_empty()
-            && !meta
-                .allowed_bindings
-                .iter()
-                .any(|b| b == instance_id || b == "*")
-        {
-            return Err(format!(
-                "secret '{secret_name}' policy restricts allowed bindings"
-            ));
-        }
+        self.require_draft_author(principal, "draft.edit", draft_id)?;
+        self.check_secret_binding(principal, instance_id, secret_name)?;
 
-        let draft = self.draft_status(draft_id)?;
-        let g = dash_git::load_workspace_graph(
-            std::path::Path::new(&draft.worktree_path),
-            self.drafts.data_dir(),
-            &draft.base_revision,
-            0,
-            false,
-        )
-        .map_err(|e| e.to_string())?;
-        let mut inst = g
-            .instances
-            .get(instance_id)
-            .cloned()
+        let mut inst = self
+            .draft_instance(draft_id, instance_id)?
             .ok_or_else(|| format!("instance '{instance_id}' not found in draft"))?;
         inst.secrets
             .insert(slot.to_string(), format!("secret://{secret_name}"));
+        self.record_draft_edit(draft_id, principal, &format!("secret.bind:{instance_id}.{slot}"))?;
         let updated = self
             .drafts
             .draft_upsert_instance(draft_id, &inst)
@@ -741,9 +957,12 @@ impl AppServices {
         ceiling: CapabilityCeiling,
         actor: &Principal,
     ) -> Result<(), String> {
-        if !actor.ceiling.unrestricted {
-            return Err("only the Administrator can grant Service principal ceilings".into());
-        }
+        self.require_administrator(
+            actor,
+            "service_principal.grant",
+            principal_id,
+            "only the Administrator can grant Service principal ceilings",
+        )?;
         self.store()
             .set_service_principal_grant(
                 principal_id,
@@ -769,9 +988,12 @@ impl AppServices {
         expires_at: Option<DateTime<Utc>>,
         actor: &Principal,
     ) -> Result<(AgentPrincipalRecord, String), String> {
-        if !actor.ceiling.unrestricted {
-            return Err("only the Administrator can issue Agent MCP tokens".into());
-        }
+        self.require_administrator(
+            actor,
+            "agent.create",
+            name,
+            "only the Administrator can issue Agent MCP tokens",
+        )?;
         let mut safe_ceiling = ceiling;
         // Agents NEVER become unrestricted Administrators!
         safe_ceiling.unrestricted = false;
@@ -803,9 +1025,12 @@ impl AppServices {
     }
 
     pub fn agent_revoke(&self, agent_id: &str, actor: &Principal) -> Result<bool, String> {
-        if !actor.ceiling.unrestricted {
-            return Err("only the Administrator can revoke Agent tokens".into());
-        }
+        self.require_administrator(
+            actor,
+            "agent.revoke",
+            agent_id,
+            "only the Administrator can revoke Agent tokens",
+        )?;
         let ok = self
             .store()
             .revoke_agent_principal(agent_id)
@@ -837,7 +1062,12 @@ impl AppServices {
     pub fn workspace_doctor(&self) -> Result<serde_json::Value, GitError> {
         let g = self.graph();
         let val = validate_configured_graph(&g, self.store(), false);
+        let key_protection = self.store().vault().key_protection().clone();
+        let warnings: Vec<String> = key_protection.warning().into_iter().collect();
         Ok(serde_json::json!({
+            "vault_key_protection": key_protection,
+            "network_policy": self.network_policy_status(),
+            "warnings": warnings,
             "sqlite_ok": true,
             "sqlite_bytes": self.store().db_size_bytes(),
             "active_revision": g.revision_commit,

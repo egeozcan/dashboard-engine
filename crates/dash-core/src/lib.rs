@@ -18,6 +18,11 @@ pub use authority::{
     validate_configured_graph, AuthError, Principal, PrincipalKind, ValidationIssue,
     ValidationReport,
 };
+pub use authority::{
+    audit_denial, audited, check_connector_operation_read_only, check_draft_activation_authority,
+    draft_editor_principals, resolve_recorded_principal, DRAFT_EDITOR_AUDIT_OPS,
+};
+pub use http_broker::{load_network_ceiling, EffectiveNetworkPolicy};
 pub use automations::AutomationEngine;
 pub use events::{EventBus, EventEnvelope};
 pub use history::HistoryManager;
@@ -482,6 +487,20 @@ return R
             enabled: None,
         };
         let mut graph = ConfiguredGraph::default();
+        // Network policy is deny-by-default: the Workspace requests hosts and the Administrator
+        // ceiling (SQLite, outside Git) must cover them.
+        graph.workspace.network.allowed_hosts = vec!["127.0.0.1".into()];
+        graph.workspace.network.allowed_methods = vec!["GET".into()];
+        store
+            .set_network_policy_ceiling(
+                json!({
+                    "allowed_hosts": ["127.0.0.1"],
+                    "allowed_methods": ["GET"],
+                    "allow_loopback_for_tests": true
+                }),
+                "admin",
+            )
+            .unwrap();
         // Default policy blocks loopback SSRF!
         let admin = Principal::administrator();
         let blocked = broker

@@ -588,6 +588,23 @@ fn parse_operations(
         let required_capabilities = parse_string_vec(&op_tbl, "required_capabilities")?;
         let args = parse_opt_schema(&op_tbl, "args")?.unwrap_or(SchemaSpec::Any);
         let result = parse_opt_schema(&op_tbl, "result")?.unwrap_or(SchemaSpec::Any);
+        let mode = match op_tbl.get::<Value>("mode")? {
+            Value::Nil => None,
+            Value::String(s) => {
+                let m = s.to_str()?.to_string();
+                if m != "read" && m != "write" {
+                    return Err(DeclarationError::InvalidContract(format!(
+                        "operation '{op_name}' mode must be \"read\" or \"write\", got \"{m}\""
+                    )));
+                }
+                Some(m)
+            }
+            _ => {
+                return Err(DeclarationError::InvalidContract(format!(
+                    "operation '{op_name}' mode must be a string"
+                )))
+            }
+        };
         out.insert(
             op_name,
             ConnectorOperationSpec {
@@ -595,6 +612,7 @@ fn parse_operations(
                 required_capabilities,
                 args,
                 result,
+                mode,
             },
         );
     }

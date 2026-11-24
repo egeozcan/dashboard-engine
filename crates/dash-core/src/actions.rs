@@ -1,7 +1,9 @@
 //! Action execution lifecycle (§9), Dry run, nested calls, `unknown` reconcile,
 //! manual resolution, invalidation, and widget Request dispatch.
 
-use crate::authority::{check_action_authority, Principal};
+use crate::authority::{
+    audited, check_action_authority, check_connector_operation_read_only, Principal,
+};
 use crate::events::EventBus;
 use crate::model::{ConfiguredGraph, InstanceConfig, LoadedDefinition};
 use crate::query_engine::QueryEngine;
@@ -88,7 +90,8 @@ impl ActionManager {
             if inst.category != DefinitionCategory::ActionProvider {
                 return Err(format!("instance '{action_instance}' is not an action_provider"));
             }
-            check_action_authority(principal, &inst, &g, &self.store).map_err(|e| e.to_string())?;
+            audited(&self.store, principal, "action.dry_run", check_action_authority(principal, &inst, &g, &self.store))
+                .map_err(|e| e.to_string())?;
 
             let def = g
                 .definitions
@@ -468,7 +471,8 @@ impl ActionManager {
             return Ok(rec);
         };
 
-        check_action_authority(principal, &inst, &g, &self.store).map_err(|e| e.to_string())?;
+        audited(&self.store, principal, "action.reconcile", check_action_authority(principal, &inst, &g, &self.store))
+            .map_err(|e| e.to_string())?;
 
         let attempts = rec.reconcile_attempts + 1;
         let bridge = Arc::new(ActionHostBridge {
@@ -898,26 +902,27 @@ impl HostBridge for ActionHostBridge {
         operation: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        if self.is_read_only {
-            // Reconcile/dry_run may only execute read operations; block mutating connector ops heuristically if named merge/transition/delete/create/write
-            let op_lower = operation.to_ascii_lowercase();
-            if op_lower.contains("merge")
-                || op_lower.contains("transition")
-                || op_lower.contains("delete")
-                || op_lower.contains("write")
-                || op_lower.contains("update")
-                || op_lower.contains("create")
-            {
-                return Err(format!(
-                    "dry_run/reconcile is read-only; mutating operation '{operation}' is forbidden"
-                ));
-            }
-        }
         let target_id = self
             .caller_inst
             .inputs
             .get(input_name)
             .ok_or_else(|| format!("input '{input_name}' not bound on '{}'", self.caller_inst.id))?;
+        if self.is_read_only {
+            // Dry run / reconcile may only execute operations the connector declares side-effect
+            // free (`mode = "read"`, or read-only capabilities), never a name heuristic (§9, §20).
+            let target_inst = self
+                .graph
+                .instances
+                .get(target_id)
+                .ok_or_else(|| format!("target instance '{target_id}' not found"))?;
+            audited(
+                &self.manager.store,
+                &self.principal,
+                "connector.invoke",
+                check_connector_operation_read_only(&self.principal, target_inst, operation, &self.graph),
+            )
+            .map_err(|e| format!("dry_run/reconcile is read-only: {e}"))?;
+        }
         self.manager
             .queries
             .invoke_connector(target_id, operation, args, &self.principal, &self.trace_id)

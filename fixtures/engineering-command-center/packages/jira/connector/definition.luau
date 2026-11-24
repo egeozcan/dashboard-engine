@@ -11,6 +11,7 @@ return dash.connector {
         get_issues = {
             description = "Fetch issues by keys",
             required_capabilities = { "issues.read" },
+            mode = "read",
             args = dash.object {
                 keys = dash.list(dash.string()),
             },
@@ -19,6 +20,7 @@ return dash.connector {
         transition_issue = {
             description = "Transition a Jira issue to a target status",
             required_capabilities = { "issues.transition" },
+            mode = "write",
             args = dash.object {
                 key = dash.string(),
                 status = dash.optional(dash.string()),

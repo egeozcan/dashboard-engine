@@ -843,6 +843,12 @@ struct SetSecretReq {
     plaintext: String,
     #[serde(default)]
     allowed_bindings: Vec<String>,
+    /// Optional destination-host policy for the credential (omitted = keep current).
+    #[serde(default)]
+    allowed_hosts: Option<Vec<String>>,
+    /// Optional credential scheme: bearer | basic | header:<Name> | query:<param>.
+    #[serde(default)]
+    credential_scheme: Option<String>,
 }
 
 async fn secrets_set_handler(
@@ -855,11 +861,13 @@ async fn secrets_set_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.secret_set(
+    match st.services.secret_set_with_policy(
         &req.name,
         &req.description,
         &req.plaintext,
         &req.allowed_bindings,
+        req.allowed_hosts.as_deref(),
+        req.credential_scheme.as_deref(),
         &p,
     ) {
         Ok(m) => Json(m).into_response(),

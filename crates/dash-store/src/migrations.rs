@@ -325,5 +325,45 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         tx.commit()?;
     }
 
+    ensure_security_schema(conn)?;
+    Ok(())
+}
+
+/// Additive, idempotent security schema extensions (Administrator network ceiling and per-secret
+/// destination/credential-scheme policy). Applied on every open, independent of the versioned
+/// migrations, so it never conflicts with them and is safe to re-run.
+fn ensure_security_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS network_policy_ceiling (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            policy_json TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at TEXT NOT NULL
+        );",
+    )?;
+    ensure_column(
+        conn,
+        "secret_metadata",
+        "allowed_hosts_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "secret_metadata",
+        "credential_scheme",
+        "TEXT NOT NULL DEFAULT 'bearer'",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|c| c == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
     Ok(())
 }
