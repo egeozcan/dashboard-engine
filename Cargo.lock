@@ -500,6 +500,7 @@ name = "dash"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dash-core",
@@ -507,6 +508,7 @@ dependencies = [
  "dash-luau",
  "dash-server",
  "dash-store",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
