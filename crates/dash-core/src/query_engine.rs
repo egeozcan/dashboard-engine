@@ -70,6 +70,7 @@ pub struct QueryEngine {
     forward_deps: Arc<DashMap<String, BTreeSet<String>>>,
     reverse_deps: Arc<DashMap<String, BTreeSet<String>>>,
     circuit_breakers: Arc<DashMap<String, CircuitState>>,
+    mock_kv: Arc<DashMap<String, serde_json::Value>>,
     cache_ttl: Duration,
 }
 
@@ -98,6 +99,7 @@ impl QueryEngine {
             forward_deps: Arc::new(DashMap::new()),
             reverse_deps: Arc::new(DashMap::new()),
             circuit_breakers: Arc::new(DashMap::new()),
+            mock_kv: Arc::new(DashMap::new()),
             cache_ttl: Duration::from_secs(30),
         }
     }
@@ -1269,5 +1271,21 @@ impl HostBridge for EngineHostBridge {
                     self.caller_def.manifest.id
                 )
             })
+    }
+
+    async fn mock_state_get(&self, key: &str) -> Result<serde_json::Value, String> {
+        let namespaced = format!("{}:{key}", self.caller_def.manifest.id);
+        Ok(self
+            .engine
+            .mock_kv
+            .get(&namespaced)
+            .map(|v| v.clone())
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn mock_state_set(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+        let namespaced = format!("{}:{key}", self.caller_def.manifest.id);
+        self.engine.mock_kv.insert(namespaced, value);
+        Ok(())
     }
 }

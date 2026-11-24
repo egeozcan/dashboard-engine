@@ -1,12 +1,14 @@
 --!strict
 local Runtime = {}
-local prs_cache = nil
 
 local function load_prs(ctx)
-    if prs_cache == nil then
-        prs_cache = ctx:await(ctx:fixture("fixtures/prs.json"))
+    local cached = ctx:await(ctx:mock_get("prs"))
+    if cached ~= nil then
+        return cached
     end
-    return prs_cache
+    local init = ctx:await(ctx:fixture("fixtures/prs.json"))
+    ctx:await(ctx:mock_set("prs", init))
+    return init
 end
 
 function Runtime.call(ctx)
@@ -31,27 +33,18 @@ function Runtime.call(ctx)
             end
         end
         error("PR not found in mock fixture: " .. tostring(repo) .. "#" .. tostring(num))
-    elseif ctx.operation == "merge_pr" then
+    elseif ctx.operation == "merge_pr" or ctx.operation == "simulate_external_merge" then
         local repo = ctx.args.repository
         local num = ctx.args.number
         for _, pr in ipairs(prs) do
             if pr.repository == repo and pr.number == num then
                 pr.state = "merged"
                 pr.merged = true
-                return { merged = true, sha = "mocksha_" .. tostring(num), number = num, repository = repo }
+                ctx:await(ctx:mock_set("prs", prs))
+                return { merged = true, sha = "mocksha_" .. tostring(num), number = num, repository = repo, pr = pr }
             end
         end
         error("PR not found for merge: " .. tostring(repo) .. "#" .. tostring(num))
-    elseif ctx.operation == "simulate_external_merge" then
-        local repo = ctx.args.repository
-        local num = ctx.args.number
-        for _, pr in ipairs(prs) do
-            if pr.repository == repo and pr.number == num then
-                pr.state = "merged"
-                pr.merged = true
-                return pr
-            end
-        end
     end
     error("unknown mock operation: " .. tostring(ctx.operation))
 end

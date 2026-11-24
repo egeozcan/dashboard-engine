@@ -111,14 +111,9 @@ pub async fn run_definition_tests(
             )
             .map_err(|e| e.to_string())?;
 
-            let runtime_val: Value = lua
-                .load(&runtime_src)
-                .set_name(format!("{}/runtime.luau", manifest_clone.id))
-                .eval()
-                .map_err(|e| format!("failed to load runtime.luau: {e}"))?;
-            let runtime_key = lua
-                .create_registry_value(runtime_val)
-                .map_err(|e| e.to_string())?;
+            let runtime_key: Arc<std::sync::Mutex<Option<mlua::RegistryKey>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let rt_key_ref = Arc::clone(&runtime_key);
 
             let require_fn = lua
                 .create_function(move |lua, name: String| -> mlua::Result<Value> {
@@ -126,7 +121,9 @@ pub async fn run_definition_tests(
                         return Ok(Value::Table(dash.clone()));
                     }
                     if name == "runtime" || name == "./runtime" {
-                        return lua.registry_value(&runtime_key);
+                        if let Some(ref k) = *rt_key_ref.lock().unwrap() {
+                            return lua.registry_value(k);
+                        }
                     }
                     if let Some(src) = libs_map.get(&name) {
                         return lua.load(src).set_name(format!("lib/{name}.luau")).eval();
@@ -140,6 +137,16 @@ pub async fn run_definition_tests(
                 .set("require", require_fn)
                 .map_err(|e| e.to_string())?;
             lua.sandbox(true).map_err(|e| e.to_string())?;
+
+            let runtime_val: Value = lua
+                .load(&runtime_src)
+                .set_name(format!("{}/runtime.luau", manifest_clone.id))
+                .eval()
+                .map_err(|e| format!("failed to load runtime.luau: {e}"))?;
+            let rk = lua
+                .create_registry_value(runtime_val)
+                .map_err(|e| e.to_string())?;
+            *runtime_key.lock().unwrap() = Some(rk);
 
             lua.load(&tests_src)
                 .set_name(format!("{}/tests.luau", manifest_clone.id))

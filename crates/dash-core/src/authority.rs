@@ -110,8 +110,8 @@ pub fn check_action_authority(
         });
     }
 
-    // 2. If ServicePrincipal, also verify Administrator SQLite grant ceiling (never trust Workspace YAML alone!)
-    if principal.kind == PrincipalKind::ServicePrincipal {
+    // 2. If ServicePrincipal in live mode, also verify Administrator SQLite grant ceiling (never trust Workspace YAML alone!)
+    if principal.kind == PrincipalKind::ServicePrincipal && !graph.is_preview {
         let granted = store
             .get_service_principal_grant(&principal.id)
             .ok()

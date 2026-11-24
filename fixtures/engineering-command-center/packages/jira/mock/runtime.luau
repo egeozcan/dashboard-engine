@@ -1,12 +1,14 @@
 --!strict
 local Runtime = {}
-local issues_cache = nil
 
 local function load_issues(ctx)
-    if issues_cache == nil then
-        issues_cache = ctx:await(ctx:fixture("fixtures/issues.json"))
+    local cached = ctx:await(ctx:mock_get("issues"))
+    if cached ~= nil then
+        return cached
     end
-    return issues_cache
+    local init = ctx:await(ctx:fixture("fixtures/issues.json"))
+    ctx:await(ctx:mock_set("issues", init))
+    return init
 end
 
 function Runtime.call(ctx)
@@ -29,6 +31,7 @@ function Runtime.call(ctx)
         for _, issue in ipairs(issues) do
             if issue.key == key then
                 issue.status = target_status
+                ctx:await(ctx:mock_set("issues", issues))
                 return {
                     key = key,
                     status = target_status,

@@ -73,6 +73,14 @@ pub trait HostBridge: Send + Sync {
     ) -> Result<(), String>;
 
     async fn load_fixture(&self, fixture_path: &str) -> Result<serde_json::Value, String>;
+
+    async fn mock_state_get(&self, _key: &str) -> Result<serde_json::Value, String> {
+        Ok(serde_json::Value::Null)
+    }
+
+    async fn mock_state_set(&self, _key: &str, _value: serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Default no-op host bridge for pure unit execution.
@@ -339,6 +347,40 @@ impl UserData for LuaContext {
                 .await
                 .map_err(mlua::Error::runtime)?;
             lua.to_value(&val)
+        });
+
+        methods.add_async_method("mock_get", |lua, this, key: String| async move {
+            if this.cfg.category != DefinitionCategory::Mock {
+                return Err(mlua::Error::runtime(
+                    "ctx:mock_get(...) is only available inside Mock definitions",
+                ));
+            }
+            let val = this
+                .cfg
+                .bridge
+                .mock_state_get(&key)
+                .await
+                .map_err(mlua::Error::runtime)?;
+            if val.is_null() {
+                Ok(Value::Nil)
+            } else {
+                lua.to_value(&val)
+            }
+        });
+
+        methods.add_async_method("mock_set", |lua, this, (key, val): (String, Value)| async move {
+            if this.cfg.category != DefinitionCategory::Mock {
+                return Err(mlua::Error::runtime(
+                    "ctx:mock_set(...) is only available inside Mock definitions",
+                ));
+            }
+            let j: serde_json::Value = lua.from_value(val)?;
+            this.cfg
+                .bridge
+                .mock_state_set(&key, j)
+                .await
+                .map_err(mlua::Error::runtime)?;
+            Ok(())
         });
     }
 }
