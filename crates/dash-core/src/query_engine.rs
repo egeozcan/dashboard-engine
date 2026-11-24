@@ -2777,6 +2777,25 @@ impl QueryEngine {
         format!("render:{}", hex::encode(&hasher.finalize()[..16]))
     }
 
+    /// Render keys (the `signal_key`s of `render_dashboard`) of `dashboard_id`'s Adapter
+    /// placements for `principal` in the active Generation, without rendering or checking
+    /// access. Lets a live Dashboard subscription register as a Signal consumer of what its
+    /// renders read (via [`Self::recorded_dependencies`]) even when a render failed.
+    pub fn dashboard_render_keys(&self, dashboard_id: &str, principal: &Principal) -> Vec<String> {
+        let g = self.graph.load_full();
+        let Some(dash) = g.dashboards.get(dashboard_id) else {
+            return Vec::new();
+        };
+        dash.adapters
+            .iter()
+            .filter_map(|placement| {
+                let inst = g.instances.get(&placement.adapter_instance)?;
+                let def = g.definitions.get(&inst.definition)?;
+                Some(self.render_key(&g, &dash.id, inst, def, &placement.query_params, principal))
+            })
+            .collect()
+    }
+
     /// Evaluate one Adapter placement, sharing, caching and deduplicating the output like a
     /// Query result (ADR-0001). The cache entry stays valid while the Dashboard State it read
     /// and the upstream query versions it observed are unchanged.
