@@ -202,6 +202,8 @@ export interface PreviewTestReport {
   definition_tests: DefinitionTestReport[];
   scenario_results: Array<{ suite: string; scenario: string; passed: boolean; error?: string | null }>;
   preview_renders: Record<string, unknown>;
+  /** Dashboards that failed to render in Preview (dashboard id -> error); any entry fails Preview. */
+  preview_render_errors?: Record<string, string>;
   all_passed: boolean;
 }
 

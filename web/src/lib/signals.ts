@@ -5,8 +5,11 @@
  *   initially and whenever the Dashboard's State, an upstream Query Signal or the active
  *   Generation changes. Renders coalesce server-side; the latest one always wins here.
  * - `subscribe_query`: `query_signal` envelopes (`dash.query/1`) carry snapshots and keyed
- *   deltas. Deltas are applied only on top of their `base_version`; a gap triggers a
- *   resubscribe, which makes the server send a fresh snapshot.
+ *   deltas. The server answers each `subscribe_query` (in request order) with `subscribed
+ *   {query_key, instance}` or an `error {instance}`; that binds the subscription to its exact
+ *   `query_key`, so subscriptions to one Instance with different params never mix. Deltas are
+ *   applied only on top of their `base_version`; a gap sends `resync_query`, which makes the
+ *   server send a fresh snapshot. Dropping the last listener sends `unsubscribe_query`.
  * - `state_signal`: Dashboard/Instance State Signals.
  *
  * The socket reconnects with backoff and replays every active subscription.
@@ -141,7 +144,15 @@ type DashboardListener = (msg: DashboardRenderMessage) => void;
 type QueryListener = (state: LocalQueryState) => void;
 type StateListener = (sig: StateSignal) => void;
 type StatusListener = (status: ConnectionStatus) => void;
-type ErrorListener = (message: string, dashboardId?: string) => void;
+/** A `/ws` `error` frame: `code` (e.g. `render_failed`, `forbidden`, `subscription_limit`). */
+export interface SignalError {
+  code: string;
+  message: string;
+  dashboardId?: string;
+  instance?: string;
+  queryKey?: string;
+}
+type ErrorListener = (message: string, dashboardId?: string, error?: SignalError) => void;
 
 interface QuerySub {
   instance: string;
@@ -149,6 +160,10 @@ interface QuerySub {
   queryKey: string | null;
   state: LocalQueryState | null;
   listeners: Set<QueryListener>;
+  /** Removed locally (last listener gone); a late `subscribed` is answered with an unsubscribe. */
+  closed: boolean;
+  /** Waiting for the snapshot requested by `resync_query` after a sequence gap. */
+  resyncing: boolean;
 }
 
 export interface SignalClientOptions {
@@ -175,6 +190,8 @@ export class SignalClient {
   private readonly delay: (attempt: number) => number;
   private dashboards = new Map<string, Set<DashboardListener>>();
   private queries = new Map<string, QuerySub>();
+  /** Per Instance, subscriptions awaiting the server's `subscribed`/`error` reply, in request order. */
+  private pendingQueries = new Map<string, QuerySub[]>();
   private stateListeners = new Set<StateListener>();
   private statusListeners = new Set<StatusListener>();
   private errorListeners = new Set<ErrorListener>();
@@ -205,9 +222,11 @@ export class SignalClient {
       this.attempts = 0;
       this.setStatus("open");
       for (const id of this.dashboards.keys()) this.send({ type: "subscribe_dashboard", dashboard_id: id });
+      this.pendingQueries.clear();
       for (const sub of this.queries.values()) {
         sub.queryKey = null;
-        this.send({ type: "subscribe_query", instance: sub.instance, params: sub.params });
+        sub.resyncing = false;
+        this.requestQuery(sub);
       }
     };
     ws.onmessage = (ev: MessageEvent) => this.handleMessage(ev.data);
@@ -254,9 +273,17 @@ export class SignalClient {
     const id = `${instance}\u0000${JSON.stringify(params ?? {})}`;
     let sub = this.queries.get(id);
     if (!sub) {
-      sub = { instance, params: params ?? {}, queryKey: null, state: null, listeners: new Set() };
+      sub = {
+        instance,
+        params: params ?? {},
+        queryKey: null,
+        state: null,
+        listeners: new Set(),
+        closed: false,
+        resyncing: false,
+      };
       this.queries.set(id, sub);
-      this.send({ type: "subscribe_query", instance, params: sub.params });
+      this.requestQuery(sub);
     } else if (sub.state) {
       listener(sub.state);
     }
@@ -266,7 +293,11 @@ export class SignalClient {
       const s = this.queries.get(id);
       if (!s) return;
       s.listeners.delete(listener);
-      if (s.listeners.size === 0) this.queries.delete(id);
+      if (s.listeners.size > 0) return;
+      this.queries.delete(id);
+      s.closed = true;
+      // Unbound subscriptions are released when their `subscribed` reply arrives.
+      if (s.queryKey !== null) this.releaseQueryKey(s.queryKey);
     };
   }
 
@@ -301,6 +332,39 @@ export class SignalClient {
     }, this.delay(this.attempts));
   }
 
+  /** Send `subscribe_query` and queue the subscription for the server's in-order reply. */
+  private requestQuery(sub: QuerySub) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== 1) return; // replayed by `onopen`
+    const q = this.pendingQueries.get(sub.instance) ?? [];
+    q.push(sub);
+    this.pendingQueries.set(sub.instance, q);
+    this.send({ type: "subscribe_query", instance: sub.instance, params: sub.params });
+  }
+
+  private takePending(instance: string): QuerySub | undefined {
+    const q = this.pendingQueries.get(instance);
+    const sub = q?.shift();
+    if (q && q.length === 0) this.pendingQueries.delete(instance);
+    return sub;
+  }
+
+  /** Stop the server forwarder for `queryKey` unless another live subscription shares it. */
+  private releaseQueryKey(queryKey: string) {
+    for (const s of this.queries.values()) if (s.queryKey === queryKey) return;
+    this.send({ type: "unsubscribe_query", query_key: queryKey });
+  }
+
+  private handleSubscribed(queryKey: string, instance: string) {
+    const sub = this.takePending(instance);
+    if (!sub) return;
+    if (sub.closed) {
+      this.releaseQueryKey(queryKey);
+      return;
+    }
+    sub.queryKey = queryKey;
+  }
+
   private send(msg: Record<string, unknown>) {
     const ws = this.ws;
     // 1 === WebSocket.OPEN; subscriptions made while connecting are replayed by `onopen`.
@@ -327,11 +391,25 @@ export class SignalClient {
       case "state_signal":
         for (const l of this.stateListeners) l(msg.payload as StateSignal);
         return;
-      case "error":
-        for (const l of this.errorListeners) {
-          l(String(msg.message ?? "error"), msg.dashboard_id as string | undefined);
+      case "subscribed":
+        if (typeof msg.query_key === "string" && typeof msg.instance === "string") {
+          this.handleSubscribed(msg.query_key, msg.instance);
         }
         return;
+      case "error": {
+        const err: SignalError = {
+          code: String(msg.code ?? "error"),
+          message: String(msg.message ?? "error"),
+          dashboardId: typeof msg.dashboard_id === "string" ? msg.dashboard_id : undefined,
+          instance: typeof msg.instance === "string" ? msg.instance : undefined,
+          queryKey: typeof msg.query_key === "string" ? msg.query_key : undefined,
+        };
+        // A refused `subscribe_query` (query_denied, subscription_limit) answers the oldest
+        // pending request for its Instance; it carries no query_key.
+        if (err.instance && !err.queryKey && !err.dashboardId) this.takePending(err.instance);
+        for (const l of this.errorListeners) l(err.message, err.dashboardId, err);
+        return;
+      }
       default:
         return;
     }
@@ -339,34 +417,25 @@ export class SignalClient {
 
   private handleQuerySignal(env: QueryEnvelope) {
     if (!env || env.protocol !== QUERY_PROTOCOL) return;
-    let sub: QuerySub | undefined;
-    for (const s of this.queries.values()) {
-      if (s.queryKey === env.query_key) {
-        sub = s;
-        break;
+    // Bound by the exact query_key from `subscribed`; several local subscriptions may share
+    // one key when their params canonicalize to the same query.
+    let gap = false;
+    for (const sub of this.queries.values()) {
+      if (sub.queryKey !== env.query_key) continue;
+      if (sub.resyncing && env.kind !== "snapshot") continue;
+      const res = applyQueryEnvelope(sub.state, env);
+      if (!res.ok) {
+        // Sequence gap: never apply out of order; ask for a fresh snapshot.
+        sub.state = null;
+        sub.resyncing = true;
+        gap = true;
+        continue;
       }
+      sub.resyncing = false;
+      sub.state = res.state;
+      if (res.changed) for (const l of sub.listeners) l(res.state);
     }
-    if (!sub && env.kind === "snapshot") {
-      // First snapshot after (re)subscribing binds the pending subscription for this Instance.
-      for (const s of this.queries.values()) {
-        if (s.queryKey === null && s.instance === env.instance) {
-          sub = s;
-          sub.queryKey = env.query_key;
-          break;
-        }
-      }
-    }
-    if (!sub) return;
-    const res = applyQueryEnvelope(sub.state, env);
-    if (!res.ok) {
-      // Sequence gap: never apply out of order; ask for a fresh snapshot.
-      sub.state = null;
-      sub.queryKey = null;
-      this.send({ type: "subscribe_query", instance: sub.instance, params: sub.params });
-      return;
-    }
-    sub.state = res.state;
-    if (res.changed) for (const l of sub.listeners) l(res.state);
+    if (gap) this.send({ type: "resync_query", query_key: env.query_key });
   }
 }
 
@@ -384,43 +453,84 @@ export function setSignalClient(client: SignalClient | null) {
   sharedClient = client;
 }
 
+export interface DashboardSignals {
+  status: ConnectionStatus;
+  /**
+   * True once the server delivered a `dashboard_render` for this Dashboard on the current
+   * connection, and until it reports an `error` for it (render failure, refusal) or the socket
+   * leaves `open`. Only then do pushes reflect the user's own writes.
+   */
+  subscribed: boolean;
+  /** Last subscription error for this Dashboard; cleared by the next successful render. */
+  lastError: SignalError | null;
+  freshness: Record<string, SignalFreshness>;
+  lastPushAt: string | null;
+}
+
 /**
  * Subscribe the active Dashboard to live renders. `onRender` receives every pushed
- * `dashboard_render` for `dashboardId`; the hook reports connection status and the latest
- * per-Instance Signal freshness.
+ * `dashboard_render` for `dashboardId`; `onError` every `/ws` error reported for it. The hook
+ * reports connection status, whether the subscription is healthy, the last error and the
+ * latest per-Instance Signal freshness.
  */
 export function useDashboardSignals(
   dashboardId: string | null,
   onRender: (msg: DashboardRenderMessage) => void,
-  onStateSignal?: (sig: StateSignal) => void
-): { status: ConnectionStatus; freshness: Record<string, SignalFreshness>; lastPushAt: string | null } {
+  onStateSignal?: (sig: StateSignal) => void,
+  onError?: (err: SignalError) => void
+): DashboardSignals {
   const client = getSignalClient();
   const [status, setStatus] = useState<ConnectionStatus>(client.getStatus());
+  const [subscribed, setSubscribed] = useState(false);
+  const [lastError, setLastError] = useState<SignalError | null>(null);
   const [freshness, setFreshness] = useState<Record<string, SignalFreshness>>({});
   const [lastPushAt, setLastPushAt] = useState<string | null>(null);
   const renderRef = useRef(onRender);
   renderRef.current = onRender;
   const stateRef = useRef(onStateSignal);
   stateRef.current = onStateSignal;
+  const errorRef = useRef(onError);
+  errorRef.current = onError;
 
-  useEffect(() => client.onStatus(setStatus), [client]);
+  useEffect(
+    () =>
+      client.onStatus((s) => {
+        setStatus(s);
+        // A new connection must deliver a fresh render before it counts as subscribed.
+        if (s !== "open") setSubscribed(false);
+      }),
+    [client]
+  );
 
   useEffect(() => {
+    setSubscribed(false);
+    setLastError(null);
     if (!dashboardId) return;
     setFreshness({});
     const offState = client.onState((sig) => {
       if (sig.scope === "dashboard" && sig.owner === dashboardId) stateRef.current?.(sig);
     });
+    const offError = client.onError((_message, id, err) => {
+      if (id !== dashboardId || !err) return;
+      // The server reports each distinct render error once and sends no render until it
+      // recovers, so stay unsubscribed until the next `dashboard_render`.
+      setSubscribed(false);
+      setLastError(err);
+      errorRef.current?.(err);
+    });
     const offRender = client.subscribeDashboard(dashboardId, (msg) => {
+      setSubscribed(true);
+      setLastError(null);
       setFreshness(msg.signals ?? {});
       setLastPushAt(new Date().toISOString());
       renderRef.current(msg);
     });
     return () => {
       offRender();
+      offError();
       offState();
     };
   }, [client, dashboardId]);
 
-  return { status, freshness, lastPushAt };
+  return { status, subscribed: status === "open" && subscribed, lastError, freshness, lastPushAt };
 }

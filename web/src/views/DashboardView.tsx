@@ -22,7 +22,7 @@ import {
   type DesignerEdit,
   type OverridePatch,
 } from "../lib/designer";
-import { useDashboardSignals, type DashboardRenderMessage } from "../lib/signals";
+import { useDashboardSignals, type DashboardRenderMessage, type SignalError } from "../lib/signals";
 
 function findNode(node: WidgetNode, widgetId: string): WidgetNode | null {
   if (node.widget_id === widgetId) return node;
@@ -123,10 +123,17 @@ export const DashboardView: React.FC = () => {
     },
     []
   );
-  const live = useDashboardSignals(activeId, onRender, onStateSignal);
+  const onSignalError = useCallback((err: SignalError) => {
+    // The Dashboard may have been removed or broken by a newly activated Generation: refresh
+    // the selector so a vanished Dashboard drops out.
+    if (err.code === "render_failed") void loadDashboards();
+  }, []);
+  const live = useDashboardSignals(activeId, onRender, onStateSignal, onSignalError);
 
+  // Pushes reflect the user's own writes only while the subscription is healthy (socket open
+  // AND the server delivering renders for this Dashboard); otherwise reload over HTTP.
   const refreshIfNotLive = async () => {
-    if (live.status !== "open" && activeId) await loadActiveDashboard(activeId);
+    if (!live.subscribed && activeId) await loadActiveDashboard(activeId);
   };
 
   const handleDashboardStateChange = async (key: string, value: unknown) => {
@@ -314,10 +321,18 @@ export const DashboardView: React.FC = () => {
           {rendered && <span className="badge">Generation #{rendered.generation}</span>}
           {activeId && (
             <span
-              className={`badge ${live.status === "open" ? "ok" : "warn"}`}
+              className={`badge ${live.subscribed ? "ok" : live.lastError ? "danger" : "warn"}`}
               title={live.lastPushAt ? `Last pushed render ${formatTime(live.lastPushAt)}` : undefined}
             >
-              {live.status === "open" ? "Live" : live.status === "connecting" ? "Connecting…" : "Offline (last render)"}
+              {live.subscribed
+                ? "Live"
+                : live.lastError
+                  ? "Live updates failed"
+                  : live.status === "open"
+                    ? "Subscribing…"
+                    : live.status === "connecting"
+                      ? "Connecting…"
+                      : "Offline (last render)"}
             </span>
           )}
         </div>
@@ -345,6 +360,13 @@ export const DashboardView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {activeId && live.lastError && (
+        <div className="card badge danger" role="alert" style={{ display: "block" }}>
+          Live updates for this Dashboard stopped ({live.lastError.code}): {live.lastError.message}. Showing the
+          last render; your changes reload it directly.
+        </div>
+      )}
 
       {stateKeys.length > 0 && (
         <DashboardStateBar
@@ -603,10 +625,14 @@ const DashboardStateField: React.FC<{
   value: unknown;
   onCommit: (key: string, value: unknown) => void;
 }> = ({ stateKey, value, onCommit }) => {
-  const [draft, setDraft] = useState(() => (typeof value === "string" ? value : JSON.stringify(value ?? null)));
+  // Reset on content, not identity: every pushed render re-parses object values. While the user
+  // has uncommitted text, pushes never overwrite it.
+  const serialized = typeof value === "string" ? value : JSON.stringify(value ?? null);
+  const [draft, setDraft] = useState(serialized);
+  const dirtyRef = useRef(false);
   useEffect(() => {
-    setDraft(typeof value === "string" ? value : JSON.stringify(value ?? null));
-  }, [value]);
+    if (!dirtyRef.current) setDraft(serialized);
+  }, [serialized]);
   if (typeof value === "boolean") {
     return (
       <label className="row" style={{ fontSize: 12 }}>
@@ -616,8 +642,8 @@ const DashboardStateField: React.FC<{
     );
   }
   const commit = () => {
-    const current = typeof value === "string" ? value : JSON.stringify(value ?? null);
-    if (draft === current) return;
+    dirtyRef.current = false;
+    if (draft === serialized) return;
     if (typeof value === "string" || value === undefined) {
       onCommit(stateKey, draft);
       return;
@@ -635,7 +661,10 @@ const DashboardStateField: React.FC<{
         type="text"
         aria-label={`Dashboard State ${stateKey}`}
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          dirtyRef.current = true;
+          setDraft(e.target.value);
+        }}
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === "Enter") commit();
@@ -838,9 +867,15 @@ const PlacementRow: React.FC<{ placement: DashboardPlacement; onEdit: (e: Design
   placement,
   onEdit,
 }) => {
-  const [paramsText, setParamsText] = useState(JSON.stringify(placement.query_params ?? {}));
+  // Reset on content, not identity (pushes and every Designer edit clone query_params), and
+  // never while the user has uncommitted text in the field.
+  const paramsJson = JSON.stringify(placement.query_params ?? {});
+  const [paramsText, setParamsText] = useState(paramsJson);
   const [paramsError, setParamsError] = useState<string | null>(null);
-  useEffect(() => setParamsText(JSON.stringify(placement.query_params ?? {})), [placement.query_params]);
+  const dirtyRef = useRef(false);
+  useEffect(() => {
+    if (!dirtyRef.current) setParamsText(paramsJson);
+  }, [paramsJson]);
   return (
     <div className="col" style={{ gap: 4 }}>
       <div className="row" style={{ justifyContent: "space-between" }}>
@@ -880,7 +915,10 @@ const PlacementRow: React.FC<{ placement: DashboardPlacement; onEdit: (e: Design
             className="code"
             style={{ flex: 1 }}
             value={paramsText}
-            onChange={(e) => setParamsText(e.target.value)}
+            onChange={(e) => {
+              dirtyRef.current = true;
+              setParamsText(e.target.value);
+            }}
             onBlur={() => {
               try {
                 const parsed = JSON.parse(paramsText || "{}");
@@ -888,12 +926,15 @@ const PlacementRow: React.FC<{ placement: DashboardPlacement; onEdit: (e: Design
                   throw new Error("query_params must be a JSON object");
                 }
                 setParamsError(null);
-                if (JSON.stringify(parsed) !== JSON.stringify(placement.query_params ?? {})) {
+                dirtyRef.current = false;
+                if (JSON.stringify(parsed) !== paramsJson) {
                   onEdit({
                     kind: "placement_update",
                     adapterInstance: placement.adapter_instance,
                     queryParams: parsed as Record<string, unknown>,
                   });
+                } else {
+                  setParamsText(paramsJson);
                 }
               } catch (err) {
                 setParamsError(String(err));
