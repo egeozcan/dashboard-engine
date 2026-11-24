@@ -33,7 +33,7 @@ function Runtime.call(ctx)
             end
         end
         error("PR not found in mock fixture: " .. tostring(repo) .. "#" .. tostring(num))
-    elseif ctx.operation == "merge_pr" or ctx.operation == "simulate_external_merge" then
+    elseif ctx.operation == "merge_pr" then
         local repo = ctx.args.repository
         local num = ctx.args.number
         for _, pr in ipairs(prs) do

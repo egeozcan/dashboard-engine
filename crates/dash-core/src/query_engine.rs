@@ -2,7 +2,8 @@
 //! tracking, cycle isolation, stale retention, circuit breakers, keyed deltas, and Preview mocks.
 
 use crate::authority::{
-    check_connector_operation_authority, check_provider_access, Principal,
+    audited, check_connector_operation_authority, check_connector_operation_read_only,
+    check_provider_access, Principal,
 };
 use crate::events::EventBus;
 use crate::http_broker::HttpBroker;
@@ -116,6 +117,21 @@ impl QueryEngine {
         &self.signals
     }
 
+    /// Host-side Mock state access (Scenario/test hook): read a Mock Definition's state key.
+    pub fn mock_state_get(&self, mock_definition_id: &str, key: &str) -> serde_json::Value {
+        self.mock_kv
+            .get(&format!("{mock_definition_id}:{key}"))
+            .map(|v| v.clone())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Host-side Mock state mutation (Scenario/test hook), e.g. simulating an external change
+    /// without exposing an undeclared connector operation.
+    pub fn mock_state_set(&self, mock_definition_id: &str, key: &str, value: serde_json::Value) {
+        self.mock_kv
+            .insert(format!("{mock_definition_id}:{key}"), value);
+    }
+
     pub fn cache_len(&self) -> usize {
         self.cache.lock().unwrap().len()
     }
@@ -181,7 +197,8 @@ impl QueryEngine {
                 ));
             }
 
-            check_provider_access(principal, &inst).map_err(|e| e.to_string())?;
+            audited(&self.store, principal, "provider.query", check_provider_access(principal, &inst))
+                .map_err(|e| e.to_string())?;
 
             // Built-in history_series provider (§7.4)
             if inst.definition == "dash.history_series" {
@@ -586,15 +603,20 @@ impl QueryEngine {
             .ok_or_else(|| format!("connector instance '{connector_id}' not found"))?
             .clone();
 
-        check_connector_operation_authority(principal, &conn_inst, operation, &g)
-            .map_err(|e| e.to_string())?;
+        audited(
+            &self.store,
+            principal,
+            "connector.invoke",
+            check_connector_operation_authority(principal, &conn_inst, operation, &g),
+        )
+        .map_err(|e| e.to_string())?;
 
         if let Some(rule) = self.telemetry.take_injected_failure(connector_id) {
             return Err(format!("injected failure ({}): {}", rule.mode, rule.message));
         }
 
         // In Preview mode, substitute matching Mock Definition (§10.3)
-        let (eff_def, eff_cat) = if g.is_preview {
+        let (eff_def, eff_cat) = if g.routes_to_mocks() {
             let mock_def = g.find_mock_for(&conn_inst.definition).ok_or_else(|| {
                 format!(
                     "preview requires a Mock definition for connector '{}'",
@@ -624,7 +646,7 @@ impl QueryEngine {
         });
 
         let bundle = CompiledInstanceBundle {
-            instance_id: if g.is_preview {
+            instance_id: if g.routes_to_mocks() {
                 format!("preview_mock:{}", conn_inst.id)
             } else {
                 conn_inst.id.clone()
@@ -937,7 +959,8 @@ impl QueryEngine {
                 .ok_or_else(|| format!("adapter definition '{}' missing", inst.definition))?
                 .clone();
 
-            check_provider_access(principal, &inst).map_err(|e| e.to_string())?;
+            audited(&self.store, principal, "provider.query", check_provider_access(principal, &inst))
+                .map_err(|e| e.to_string())?;
 
             let trace_id = format!("tr_{}", Uuid::now_v7().simple());
             let mut payload = placement.query_params.clone();
@@ -1166,6 +1189,14 @@ impl HostBridge for EngineHostBridge {
         if target_inst.category != DefinitionCategory::Connector {
             return Err(format!("call_input expects connector, got '{}'", target_inst.category.as_str()));
         }
+        // Reads have no side effects (§20): data providers may only call read operations.
+        audited(
+            &self.engine.store,
+            &self.principal,
+            "connector.invoke",
+            check_connector_operation_read_only(&self.principal, target_inst, operation, &self.graph),
+        )
+        .map_err(|e| e.to_string())?;
         self.engine
             .invoke_connector(target_id, operation, args, &self.principal, &self.trace_id)
             .await

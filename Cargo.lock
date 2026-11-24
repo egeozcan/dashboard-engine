@@ -526,6 +526,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "cron",
  "dash-luau",
@@ -636,6 +637,7 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "base64 0.22.1",
  "chrono",
  "hex",

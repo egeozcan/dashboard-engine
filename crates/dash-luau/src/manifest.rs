@@ -433,6 +433,28 @@ pub struct ConnectorOperationSpec {
     pub required_capabilities: Vec<String>,
     pub args: SchemaSpec,
     pub result: SchemaSpec,
+    /// Side-effect classification: `"read"` (no external side effects) or `"write"`.
+    /// When omitted the host infers `read` only if the operation requires at least one
+    /// capability and every required capability ends in `.read`; otherwise `write`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+impl ConnectorOperationSpec {
+    /// Whether the operation may cause external side effects (deny by default, §20).
+    pub fn has_side_effects(&self) -> bool {
+        match self.mode.as_deref() {
+            Some("read") => false,
+            Some(_) => true,
+            None => {
+                self.required_capabilities.is_empty()
+                    || !self
+                        .required_capabilities
+                        .iter()
+                        .all(|c| c.ends_with(".read"))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

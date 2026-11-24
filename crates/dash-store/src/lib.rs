@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub use vault::{Redactor, SecretVault, VaultError};
+pub use vault::{KeyProtection, Redactor, SecretVault, VaultError, VaultKeySource};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -30,6 +30,8 @@ pub enum StoreError {
     Join(#[from] tokio::task::JoinError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,8 +52,55 @@ pub struct SecretMetadata {
     pub description: String,
     pub key_version: i64,
     pub allowed_bindings: Vec<String>,
+    /// Destination hosts the credential may be attached to (`*.example.com` / exact / `*`).
+    /// Empty = any host the effective network policy allows.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// How the broker presents the credential: `bearer` (default), `basic` (value is
+    /// `user:password`), `header:<Name>` or `query:<param>`. Administrator-controlled.
+    #[serde(default = "default_credential_scheme")]
+    pub credential_scheme: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+pub fn default_credential_scheme() -> String {
+    "bearer".into()
+}
+
+/// Validate a credential scheme string (`bearer`, `basic`, `header:<Name>`, `query:<param>`).
+pub fn validate_credential_scheme(scheme: &str) -> Result<(), String> {
+    let valid_token = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    match scheme {
+        "bearer" | "basic" => Ok(()),
+        s => {
+            if let Some(name) = s.strip_prefix("header:") {
+                let lower = name.to_ascii_lowercase();
+                if !valid_token(name)
+                    || lower == "host"
+                    || lower == "cookie"
+                    || lower == "content-length"
+                    || lower.starts_with("proxy-")
+                {
+                    return Err(format!("invalid credential header name '{name}'"));
+                }
+                Ok(())
+            } else if let Some(param) = s.strip_prefix("query:") {
+                if !valid_token(param) {
+                    return Err(format!("invalid credential query parameter '{param}'"));
+                }
+                Ok(())
+            } else {
+                Err(format!(
+                    "unknown credential scheme '{s}' (expected bearer, basic, header:<Name> or query:<param>)"
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,33 +350,61 @@ impl SqliteStore {
         plaintext: &str,
         allowed_bindings: &[String],
     ) -> Result<SecretMetadata, StoreError> {
+        self.set_secret_with_policy(name, description, plaintext, allowed_bindings, None, None)
+    }
+
+    /// Store (or rotate) a secret with its destination-host and credential-scheme policy.
+    /// `None` keeps the existing policy value (or the default for a new secret).
+    pub fn set_secret_with_policy(
+        &self,
+        name: &str,
+        description: &str,
+        plaintext: &str,
+        allowed_bindings: &[String],
+        allowed_hosts: Option<&[String]>,
+        credential_scheme: Option<&str>,
+    ) -> Result<SecretMetadata, StoreError> {
+        if let Some(scheme) = credential_scheme {
+            validate_credential_scheme(scheme).map_err(StoreError::InvalidInput)?;
+        }
         let now = Utc::now().to_rfc3339();
         let allowed_json = serde_json::to_string(allowed_bindings)?;
-        let (key_version, created_at) = self.with_conn_sync(|conn| {
-            let existing: Option<(i64, String)> = conn
+        let (key_version, created_at, prev_hosts, prev_scheme) = self.with_conn_sync(|conn| {
+            let existing: Option<(i64, String, String, String)> = conn
                 .query_row(
-                    "SELECT key_version, created_at FROM secret_metadata WHERE name = ?1",
+                    "SELECT key_version, created_at, allowed_hosts_json, credential_scheme
+                     FROM secret_metadata WHERE name = ?1",
                     params![name],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?;
             match existing {
-                Some((v, c)) => Ok((v + 1, c)),
-                None => Ok((1_i64, now.clone())),
+                Some((v, c, h, sc)) => Ok((
+                    v + 1,
+                    c,
+                    serde_json::from_str::<Vec<String>>(&h).unwrap_or_default(),
+                    sc,
+                )),
+                None => Ok((1_i64, now.clone(), Vec::new(), default_credential_scheme())),
             }
         })?;
+        let hosts: Vec<String> = allowed_hosts.map(|h| h.to_vec()).unwrap_or(prev_hosts);
+        let scheme: String = credential_scheme.map(str::to_string).unwrap_or(prev_scheme);
+        let hosts_json = serde_json::to_string(&hosts)?;
         let (nonce, ciphertext) = self.vault.encrypt(name, key_version, plaintext)?;
         self.with_conn_sync(|conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
-                "INSERT INTO secret_metadata (name, description, key_version, allowed_bindings_json, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO secret_metadata (name, description, key_version, allowed_bindings_json, created_at, updated_at, allowed_hosts_json, credential_scheme)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(name) DO UPDATE SET
                     description = excluded.description,
                     key_version = excluded.key_version,
                     allowed_bindings_json = excluded.allowed_bindings_json,
-                    updated_at = excluded.updated_at",
-                params![name, description, key_version, allowed_json, created_at, now],
+                    updated_at = excluded.updated_at,
+                    allowed_hosts_json = excluded.allowed_hosts_json,
+                    credential_scheme = excluded.credential_scheme",
+                params![name, description, key_version, allowed_json, created_at, now, hosts_json, scheme],
             )?;
             tx.execute(
                 "INSERT INTO encrypted_secret_blobs (name, key_version, nonce, ciphertext, updated_at)
@@ -347,6 +424,8 @@ impl SqliteStore {
             description: description.to_string(),
             key_version,
             allowed_bindings: allowed_bindings.to_vec(),
+            allowed_hosts: hosts,
+            credential_scheme: scheme,
             created_at,
             updated_at: now,
         })
@@ -355,17 +434,21 @@ impl SqliteStore {
     pub fn list_secrets(&self) -> Result<Vec<SecretMetadata>, StoreError> {
         self.with_conn_sync(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT name, description, key_version, allowed_bindings_json, created_at, updated_at
+                "SELECT name, description, key_version, allowed_bindings_json, created_at, updated_at,
+                        allowed_hosts_json, credential_scheme
                  FROM secret_metadata ORDER BY name ASC",
             )?;
             let rows = stmt.query_map([], |r| {
                 let allowed_raw: String = r.get(3)?;
                 let allowed: Vec<String> = serde_json::from_str(&allowed_raw).unwrap_or_default();
+                let hosts_raw: String = r.get(6)?;
                 Ok(SecretMetadata {
                     name: r.get(0)?,
                     description: r.get(1)?,
                     key_version: r.get(2)?,
                     allowed_bindings: allowed,
+                    allowed_hosts: serde_json::from_str(&hosts_raw).unwrap_or_default(),
+                    credential_scheme: r.get(7)?,
                     created_at: r.get(4)?,
                     updated_at: r.get(5)?,
                 })
@@ -383,7 +466,7 @@ impl SqliteStore {
             let row = conn
                 .query_row(
                     "SELECT m.name, m.description, m.key_version, m.allowed_bindings_json, m.created_at, m.updated_at,
-                            b.nonce, b.ciphertext
+                            b.nonce, b.ciphertext, m.allowed_hosts_json, m.credential_scheme
                      FROM secret_metadata m
                      JOIN encrypted_secret_blobs b ON m.name = b.name
                      WHERE m.name = ?1",
@@ -392,12 +475,15 @@ impl SqliteStore {
                         let allowed_raw: String = r.get(3)?;
                         let allowed: Vec<String> =
                             serde_json::from_str(&allowed_raw).unwrap_or_default();
+                        let hosts_raw: String = r.get(8)?;
                         Ok((
                             SecretMetadata {
                                 name: r.get(0)?,
                                 description: r.get(1)?,
                                 key_version: r.get(2)?,
                                 allowed_bindings: allowed,
+                                allowed_hosts: serde_json::from_str(&hosts_raw).unwrap_or_default(),
+                                credential_scheme: r.get(9)?,
                                 created_at: r.get(4)?,
                                 updated_at: r.get(5)?,
                             },
@@ -916,6 +1002,37 @@ impl SqliteStore {
         })
     }
 
+    /// Distinct `(principal_id, principal_kind)` pairs that recorded one of `operations` on
+    /// `target` (e.g. every Principal that edited a Draft, for activation-time authority checks).
+    pub fn list_audit_principals_for_target(
+        &self,
+        target: &str,
+        operations: &[&str],
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT principal_id, principal_kind, operation FROM audit_records WHERE target = ?1",
+            )?;
+            let rows = stmt.query_map(params![target], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out: Vec<(String, String)> = Vec::new();
+            for row in rows {
+                let (id, kind, op) = row?;
+                if operations.contains(&op.as_str())
+                    && !out.iter().any(|(i, k)| i == &id && k == &kind)
+                {
+                    out.push((id, kind));
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn list_audits(&self, limit: usize) -> Result<Vec<AuditRecord>, StoreError> {
         self.with_conn_sync(|conn| {
             let mut stmt = conn.prepare(
@@ -1015,6 +1132,44 @@ impl SqliteStore {
                 params![principal_id, json, granted_by, now],
             )?;
             Ok(())
+        })
+    }
+
+    /// Set the Administrator network ceiling (stored outside the Git Workspace, §11.3).
+    pub fn set_network_policy_ceiling(
+        &self,
+        policy: serde_json::Value,
+        granted_by: &str,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&policy)?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO network_policy_ceiling (id, policy_json, granted_by, granted_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    policy_json = excluded.policy_json,
+                    granted_by = excluded.granted_by,
+                    granted_at = excluded.granted_at",
+                params![json, granted_by, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Returns `(policy, granted_by, granted_at)` when the Administrator has set a network ceiling.
+    pub fn get_network_policy_ceiling(
+        &self,
+    ) -> Result<Option<(serde_json::Value, String, String)>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let row: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT policy_json, granted_by, granted_at FROM network_policy_ceiling WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.and_then(|(p, by, at)| serde_json::from_str(&p).ok().map(|v| (v, by, at))))
         })
     }
 
@@ -1646,6 +1801,62 @@ mod tests {
         drop(store);
         let reopened = SqliteStore::open(dir.path()).unwrap();
         assert!(reopened.list_secrets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_secret_policy_network_ceiling_and_draft_editor_audits() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let hosts = vec!["api.github.com".to_string()];
+        let meta = store
+            .set_secret_with_policy("jira", "", "user:tok", &[], Some(&hosts), Some("basic"))
+            .unwrap();
+        assert_eq!(meta.credential_scheme, "basic");
+        // Rotating through the legacy API keeps the Administrator's destination policy.
+        let rotated = store.set_secret("jira", "", "user:tok2", &[]).unwrap();
+        assert_eq!(rotated.key_version, 2);
+        assert_eq!(rotated.allowed_hosts, hosts);
+        assert_eq!(rotated.credential_scheme, "basic");
+        let (resolved, plain) = store.resolve_secret_plaintext("jira").unwrap();
+        assert_eq!(plain, "user:tok2");
+        assert_eq!(resolved.allowed_hosts, hosts);
+        assert!(store
+            .set_secret_with_policy("x", "", "v", &[], None, Some("header:Host"))
+            .is_err());
+        assert!(store
+            .set_secret_with_policy("x", "", "v", &[], None, Some("query:api_key"))
+            .is_ok());
+
+        assert!(store.get_network_policy_ceiling().unwrap().is_none());
+        store
+            .set_network_policy_ceiling(json!({"allowed_hosts": ["api.github.com"]}), "admin")
+            .unwrap();
+        let (policy, by, _) = store.get_network_policy_ceiling().unwrap().unwrap();
+        assert_eq!(policy["allowed_hosts"][0], "api.github.com");
+        assert_eq!(by, "admin");
+
+        store
+            .append_audit("agt_1", "agent", "draft.edit", "dft_1", "ok", json!({}))
+            .unwrap();
+        store
+            .append_audit("agt_1", "agent", "draft.edit", "dft_1", "ok", json!({}))
+            .unwrap();
+        store
+            .append_audit("admin", "administrator", "draft.begin", "dft_1", "ok", json!({}))
+            .unwrap();
+        store
+            .append_audit("agt_2", "agent", "draft.edit", "dft_2", "ok", json!({}))
+            .unwrap();
+        let mut editors = store
+            .list_audit_principals_for_target("dft_1", &["draft.edit", "draft.begin"])
+            .unwrap();
+        editors.sort();
+        assert_eq!(
+            editors,
+            vec![
+                ("admin".to_string(), "administrator".to_string()),
+                ("agt_1".to_string(), "agent".to_string())
+            ]
+        );
     }
 
     #[test]

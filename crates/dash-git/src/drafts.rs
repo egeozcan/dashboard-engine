@@ -100,7 +100,9 @@ impl DraftManager {
             let _ = store.upsert_activation_journal(&repaired);
         }
 
-        let mut graph = load_workspace_graph(&workspace_dir, &data_dir, &head, 1, use_mocks).await?;
+        // `--use-mocks` substitutes Mock connectors but keeps live authority (SQLite grants).
+        let mut graph = load_workspace_graph(&workspace_dir, &data_dir, &head, 1, false).await?;
+        graph.substitute_mocks = use_mocks;
         let gen_id = store
             .record_generation(&head, &graph.graph_digest())
             .map_err(|e| GitError::Workspace(e.to_string()))?;
@@ -300,7 +302,19 @@ impl DraftManager {
         let mut draft = self.draft_status(draft_id)?;
         let wt = Path::new(&draft.worktree_path);
         let graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, false).await?;
-        let report = validate_configured_graph(&graph, &self.store, false);
+        let mut report = validate_configured_graph(&graph, &self.store, false);
+        // Report grants the draft's editors lack (the activator is checked again on activation).
+        let editors = dash_core::draft_editor_principals(&self.store, draft_id, &draft.created_by);
+        let authz = dash_core::check_draft_activation_authority(
+            &self.store,
+            &self.engine.graph.load_full(),
+            &graph,
+            &editors,
+        );
+        if !authz.is_empty() {
+            report.valid = false;
+            report.issues.extend(authz);
+        }
 
         draft.validation_report = Some(serde_json::to_value(&report).unwrap());
         if report.valid {
@@ -501,6 +515,32 @@ impl DraftManager {
             )));
         }
 
+        // Principal-aware authority (§5.2, §11.3, ADR-0002): every editor of the draft and the
+        // activating Principal must hold the secrets / Service principal ceilings the change reaches.
+        let mut authz_principals =
+            dash_core::draft_editor_principals(&self.store, draft_id, &draft.created_by);
+        authz_principals.push(principal.clone());
+        let authz_issues = dash_core::check_draft_activation_authority(
+            &self.store,
+            &self.engine.graph.load_full(),
+            &candidate_graph,
+            &authz_principals,
+        );
+        if !authz_issues.is_empty() {
+            let _ = self.store.append_audit(
+                &principal.id,
+                principal.kind.as_str(),
+                "draft.activate",
+                draft_id,
+                "denied",
+                serde_json::json!({ "issues": authz_issues }),
+            );
+            return Err(GitError::Workspace(format!(
+                "activation denied (pending grant): {:?}",
+                authz_issues
+            )));
+        }
+
         // Persist activation journal (`started`)
         let journal_id = format!("jrn_{}", Uuid::now_v7().simple());
         self.store
@@ -558,9 +598,10 @@ impl DraftManager {
             &self.data_dir,
             &new_commit,
             old_graph.generation_id + 1,
-            self.use_mocks,
+            false,
         )
         .await?;
+        live_graph.substitute_mocks = self.use_mocks;
         let new_gen_id = self
             .store
             .record_generation(&new_commit, &live_graph.graph_digest())

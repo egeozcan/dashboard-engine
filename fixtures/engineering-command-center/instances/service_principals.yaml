@@ -9,6 +9,8 @@ service_principals:
       allowed_capabilities:
         - issues.read
         - issues.transition
+      allowed_secrets:
+        - jira-work
 
   pr_history_sampler:
     description: Samples open PR count aggregates for 30-day trend chart
@@ -19,3 +21,5 @@ service_principals:
         - github_reader
       allowed_capabilities:
         - pull_requests.read
+      allowed_secrets:
+        - github-work

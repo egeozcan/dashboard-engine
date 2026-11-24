@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use dash_core::{CapabilityCeiling, Principal};
+use dash_core::{CapabilityCeiling, NetworkPolicy, Principal};
 use dash_git::{run_preview_and_scenarios, DraftManager};
 use dash_luau::ResourceBudget;
 use dash_server::{build_router, generate_random_token, hash_password, AppServices};
@@ -77,6 +77,26 @@ enum Commands {
         #[arg(long)]
         ceiling: String,
     },
+    /// Show or grant the Administrator network ceiling (outbound HTTP is denied until granted)
+    Network {
+        #[command(subcommand)]
+        action: NetworkAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkAction {
+    /// Show the requested Workspace `[network]` policy and the Administrator ceiling
+    Show,
+    /// Set the Administrator network ceiling (stored in SQLite, outside the Git Workspace)
+    Grant {
+        /// Ceiling as JSON, e.g. '{"allowed_hosts":["api.github.com"],"allowed_methods":["GET"]}'
+        #[arg(long, conflicts_with = "from_workspace")]
+        policy: Option<String>,
+        /// Grant exactly the policy currently requested by the Workspace `dashboard.toml`
+        #[arg(long, default_value_t = false)]
+        from_workspace: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +115,12 @@ enum SecretAction {
         description: String,
         #[arg(long = "allowed-binding")]
         allowed_bindings: Vec<String>,
+        /// Destination hosts the credential may be attached to (default: any allowed host)
+        #[arg(long = "allowed-host")]
+        allowed_hosts: Vec<String>,
+        /// How the broker presents the credential: bearer | basic | header:<Name> | query:<param>
+        #[arg(long = "credential-scheme")]
+        credential_scheme: Option<String>,
     },
     List,
 }
@@ -262,9 +288,20 @@ async fn main() -> Result<()> {
                     value,
                     description,
                     allowed_bindings,
+                    allowed_hosts,
+                    credential_scheme,
                 } => {
+                    let hosts = (!allowed_hosts.is_empty()).then_some(allowed_hosts.as_slice());
                     let meta = services
-                        .secret_set(&name, &description, &value, &allowed_bindings, &admin)
+                        .secret_set_with_policy(
+                            &name,
+                            &description,
+                            &value,
+                            &allowed_bindings,
+                            hosts,
+                            credential_scheme.as_deref(),
+                            &admin,
+                        )
                         .map_err(|e| anyhow::anyhow!(e))?;
                     println!("{}", serde_json::to_string_pretty(&meta)?);
                 }
@@ -311,6 +348,29 @@ async fn main() -> Result<()> {
                 .service_principal_grant(&principal_id, parsed, &Principal::administrator())
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!("Granted ceiling to service principal '{principal_id}'");
+        }
+
+        Commands::Network { action } => {
+            let services = open_services(&cli.workspace, &cli.data_dir, vec![], false).await?;
+            match action {
+                NetworkAction::Show => {
+                    println!("{}", serde_json::to_string_pretty(&services.network_policy_status())?);
+                }
+                NetworkAction::Grant {
+                    policy,
+                    from_workspace,
+                } => {
+                    let parsed: NetworkPolicy = match (policy, from_workspace) {
+                        (Some(raw), false) => serde_json::from_str(&raw)?,
+                        (None, true) => services.graph().workspace.network.clone(),
+                        _ => bail!("pass either --policy '<json>' or --from-workspace"),
+                    };
+                    services
+                        .network_policy_grant(parsed, &Principal::administrator())
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    println!("{}", serde_json::to_string_pretty(&services.network_policy_status())?);
+                }
+            }
         }
     }
     Ok(())

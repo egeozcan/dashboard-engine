@@ -293,6 +293,18 @@ async fn ac05_secrets_zero_leakage_and_host_mediated_http() {
     store
         .set_secret("github-work", "PAT", secret, &["github_reader".into()])
         .unwrap();
+    // Outbound HTTP is deny-by-default: the Administrator network ceiling lives in SQLite,
+    // outside the agent-editable Workspace (§5.2, §11.3).
+    store
+        .set_network_policy_ceiling(
+            json!({
+                "allowed_hosts": ["127.0.0.1"],
+                "allowed_methods": ["GET"],
+                "allow_loopback_for_tests": true
+            }),
+            "admin",
+        )
+        .unwrap();
     let mgr = DraftManager::initialize(ws, data, store.clone(), ResourceBudget::default())
         .await
         .unwrap();
@@ -420,7 +432,8 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
         let admin = Principal::administrator();
 
         let mut g = (*mgr.engine().graph.load_full()).clone();
-        g.is_preview = true;
+        // Mock connectors on the live Generation: authority still comes from the SQLite grants below.
+        g.substitute_mocks = true;
         mgr.engine().graph.store(std::sync::Arc::new(g));
 
         // Grant both Service principals
@@ -472,7 +485,11 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
             .query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, true)
             .await
             .unwrap();
-        mgr.engine()
+        // Simulate the external merge through the host-side Mock state API: the reader-bound
+        // connector Instance must not be able to perform a merge (§17 AC4), and undeclared
+        // connector operations are denied by default (§20).
+        assert!(mgr
+            .engine()
             .queries
             .invoke_connector(
                 "github_reader",
@@ -482,7 +499,16 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
                 "poll_sim",
             )
             .await
-            .unwrap();
+            .unwrap_err()
+            .contains("undeclared operation"));
+        let mut prs = mgr.engine().queries.mock_state_get("github.mock", "prs");
+        for pr in prs.as_array_mut().unwrap() {
+            if pr["repository"] == "acme/platform" && pr["number"] == 42 {
+                pr["state"] = json!("merged");
+                pr["merged"] = json!(true);
+            }
+        }
+        mgr.engine().queries.mock_state_set("github.mock", "prs", prs);
         let after_poll = mgr
             .engine()
             .queries

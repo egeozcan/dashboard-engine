@@ -27,16 +27,56 @@ fn default_branch() -> String {
     "main".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Host I/O policy for host-mediated HTTP (§5.2).
+///
+/// The `[network]` section of the Git-versioned `dashboard.toml` is only a *requested* policy.
+/// The effective policy is its intersection with the Administrator network ceiling stored in
+/// SQLite (outside the agent-editable Workspace, §11.3). Without an Administrator ceiling every
+/// outbound request is denied (pending grant).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct NetworkPolicy {
-    /// Host allowlist for host-mediated HTTP requests (empty = deny all external unless matched).
+    /// Host allowlist: exact host names/IP literals, `*.example.com` (subdomains only) or `*`.
+    /// Empty = deny every destination (deny by default, §20).
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// HTTP method allowlist (case-insensitive, `*` = any). Empty = deny every method.
     #[serde(default)]
     pub allowed_methods: Vec<String>,
-    /// Explicit opt-in ONLY for local CI/test mock HTTP servers on loopback.
+    /// Explicit opt-in ONLY for local CI/test mock HTTP servers on loopback. Effective only when
+    /// both the requested policy and the Administrator ceiling enable it.
     #[serde(default)]
     pub allow_loopback_for_tests: bool,
+}
+
+impl NetworkPolicy {
+    /// Whether `host` matches one of `patterns` (`*`, `*.suffix`, or exact, case-insensitive).
+    pub fn pattern_list_matches(patterns: &[String], host: &str) -> bool {
+        let host = host.trim_end_matches('.');
+        patterns.iter().any(|p| {
+            let p = p.trim();
+            if p == "*" {
+                return true;
+            }
+            if let Some(suffix) = p.strip_prefix("*.") {
+                let lower = host.to_ascii_lowercase();
+                let suffix = suffix.to_ascii_lowercase();
+                return lower.len() > suffix.len() + 1
+                    && lower.ends_with(&suffix)
+                    && lower.as_bytes()[lower.len() - suffix.len() - 1] == b'.';
+            }
+            p.eq_ignore_ascii_case(host)
+        })
+    }
+
+    pub fn allows_host(&self, host: &str) -> bool {
+        Self::pattern_list_matches(&self.allowed_hosts, host)
+    }
+
+    pub fn allows_method(&self, method: &str) -> bool {
+        self.allowed_methods
+            .iter()
+            .any(|m| m.trim() == "*" || m.trim().eq_ignore_ascii_case(method))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +226,29 @@ impl CapabilityCeiling {
             || self.allowed_secrets.contains(secret_name)
     }
 
+    /// Whether every authority this ceiling confers is also conferred by `other` (used to stop
+    /// Agents from borrowing a Service principal whose ceiling exceeds their own, §5.1.5).
+    /// Draft/Git flags are not compared: they never apply to delegated background work.
+    pub fn is_subset_of(&self, other: &CapabilityCeiling) -> bool {
+        if other.unrestricted {
+            return true;
+        }
+        if self.unrestricted {
+            return false;
+        }
+        fn covered(mine: &BTreeSet<String>, theirs: &BTreeSet<String>) -> bool {
+            if theirs.contains("*") {
+                return true;
+            }
+            mine.iter().all(|m| theirs.contains(m))
+        }
+        covered(&self.allowed_connectors, &other.allowed_connectors)
+            && covered(&self.allowed_capabilities, &other.allowed_capabilities)
+            && covered(&self.allowed_actions, &other.allowed_actions)
+            && covered(&self.allowed_providers, &other.allowed_providers)
+            && covered(&self.allowed_secrets, &other.allowed_secrets)
+    }
+
     pub fn fingerprint(&self) -> String {
         let raw = serde_json::to_string(self).unwrap_or_default();
         let mut h = Sha256::new();
@@ -280,7 +343,11 @@ pub struct ConfiguredGraph {
     pub instances: BTreeMap<String, InstanceConfig>,
     pub dashboards: BTreeMap<String, DashboardDoc>,
     pub service_principals: BTreeMap<String, ServicePrincipalRequested>,
+    /// True only for an isolated Preview runtime (Preview capability context, §5.1.7, §10.3).
     pub is_preview: bool,
+    /// Live Generation that routes connector calls to their Mocks (`dash serve --use-mocks`).
+    /// Unlike `is_preview`, authority still comes from Administrator grants in SQLite.
+    pub substitute_mocks: bool,
 }
 
 impl ConfiguredGraph {
@@ -300,6 +367,28 @@ impl ConfiguredGraph {
             h.update(serde_json::to_string(dash).unwrap_or_default().as_bytes());
         }
         format!("graph:{}", hex::encode(h.finalize()))
+    }
+
+    /// Whether connector invocations are routed to Mock Definitions (Preview or `--use-mocks`).
+    pub fn routes_to_mocks(&self) -> bool {
+        self.is_preview || self.substitute_mocks
+    }
+
+    /// Content digest of a Definition including every Library it can `require` at runtime
+    /// (all Workspace Libraries are resolvable), so library edits count as code changes.
+    pub fn effective_code_digest(&self, definition_id: &str) -> Option<String> {
+        let def = self.definitions.get(definition_id)?;
+        let mut h = Sha256::new();
+        h.update(def.manifest.identity_version.as_bytes());
+        for (id, d) in &self.definitions {
+            if d.manifest.category == DefinitionCategory::Library {
+                h.update(b"|lib:");
+                h.update(id.as_bytes());
+                h.update(b"@");
+                h.update(d.manifest.identity_version.as_bytes());
+            }
+        }
+        Some(format!("code:{}", hex::encode(h.finalize())))
     }
 
     /// Find the Mock definition targeting `connector_def_id`, if any.
