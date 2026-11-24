@@ -159,6 +159,65 @@ impl StateKeyDeclaration {
     }
 }
 
+impl StateKeyDeclaration {
+    /// Declaration of an Instance State key from a Definition manifest (`state = { ... }`).
+    pub fn from_spec(spec: &dash_luau::manifest::StateKeySpec) -> Self {
+        let value_type = match spec.value_type.as_str() {
+            "string" => StateValueType::String,
+            "number" => StateValueType::Number,
+            "integer" => StateValueType::Integer,
+            "boolean" => StateValueType::Boolean,
+            "object" => StateValueType::Object,
+            "array" => StateValueType::Array,
+            _ => StateValueType::Any,
+        };
+        let migration = match spec.migration.as_str() {
+            "reset" => StateMigrationPolicy::Reset,
+            "reject" => StateMigrationPolicy::Reject,
+            _ => StateMigrationPolicy::Keep,
+        };
+        Self {
+            schema_version: spec.schema_version,
+            value_type,
+            nullable: spec.nullable,
+            max_bytes: spec.max_bytes,
+            migration,
+        }
+    }
+}
+
+/// Declaration of an Instance State key of `instance_id` in `graph` (§8).
+///
+/// A Definition that declares Instance State (`state = { ... }`) is held to it: undeclared keys
+/// are rejected. A Definition that declares none keeps implicit keys (schema v1, any type,
+/// default size limit), returned as `Ok(None)`.
+pub fn instance_state_declaration(
+    graph: &ConfiguredGraph,
+    instance_id: &str,
+    key: &str,
+) -> Result<Option<StateKeyDeclaration>, StateError> {
+    let Some(def) = graph
+        .instances
+        .get(instance_id)
+        .and_then(|inst| graph.definitions.get(&inst.definition))
+    else {
+        return Ok(None);
+    };
+    let declared = &def.manifest.instance_state;
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    declared
+        .get(key)
+        .map(|spec| Some(StateKeyDeclaration::from_spec(spec)))
+        .ok_or_else(|| {
+            StateError::Invalid(format!(
+                "Instance State key '{key}' is not declared by definition '{}'",
+                def.manifest.id
+            ))
+        })
+}
+
 /// Declaration of a Dashboard State key: explicit `state_schema` entry, or implicit (schema v1,
 /// any type) for keys that only have an `initial_state` default. `None` = undeclared.
 pub fn dashboard_state_declaration(doc: &DashboardDoc, key: &str) -> Option<StateKeyDeclaration> {
@@ -374,6 +433,142 @@ impl StateManager {
         Ok(rec)
     }
 
+    /// Mediated Instance State write (§8): stamps the declared schema version and enforces the
+    /// declared type and size limit of the owning Instance's Definition; undeclared keys of a
+    /// Definition that declares Instance State are rejected.
+    pub fn set_instance_state(
+        &self,
+        graph: &ConfiguredGraph,
+        instance_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<StateRecord, StateError> {
+        let decl = instance_state_declaration(graph, instance_id, key)?.unwrap_or_default();
+        self.set_declared(
+            "instance",
+            instance_id,
+            key,
+            &decl,
+            graph.generation_id,
+            value,
+            None,
+        )
+    }
+
+    /// Plan the Instance State migrations a Generation requires (§8, §12.2): for every stored
+    /// Instance State record whose Instance's Definition declares the key at another schema
+    /// version, apply the declared policy (`keep` validates, `reset` writes the declared default
+    /// or removes the record, `reject` refuses activation). Declared defaults are validated too.
+    /// Records of removed Instances or undeclared keys are left untouched.
+    pub fn plan_instance_state_migrations(
+        &self,
+        graph: &ConfiguredGraph,
+        generation_id: i64,
+    ) -> Result<(Vec<StateMigrationStep>, Vec<PlannedStateMigration>), StateError> {
+        let mut errors = Vec::new();
+        for def in graph.definitions.values() {
+            for (k, spec) in &def.manifest.instance_state {
+                if let Some(d) = &spec.default {
+                    if let Err(e) = StateKeyDeclaration::from_spec(spec).validate(k, d) {
+                        errors.push(format!(
+                            "definition '{}' Instance State default: {e}",
+                            def.manifest.id
+                        ));
+                    }
+                }
+            }
+        }
+        let mut steps = Vec::new();
+        let mut planned = Vec::new();
+        for rec in self.store.list_state_for_scope("instance")? {
+            let Some(spec) = graph
+                .instances
+                .get(&rec.owner)
+                .and_then(|inst| graph.definitions.get(&inst.definition))
+                .and_then(|def| def.manifest.instance_state.get(&rec.state_key))
+            else {
+                continue;
+            };
+            let decl = StateKeyDeclaration::from_spec(spec);
+            if rec.schema_version == decl.schema_version {
+                continue;
+            }
+            let new_value = match decl.migration {
+                StateMigrationPolicy::Keep => match decl.validate(&rec.state_key, &rec.value) {
+                    Ok(()) => Some(rec.value.clone()),
+                    Err(e) => {
+                        errors.push(format!(
+                            "instance '{}' key '{}' (schema v{} -> v{}, policy keep): {e}",
+                            rec.owner, rec.state_key, rec.schema_version, decl.schema_version
+                        ));
+                        continue;
+                    }
+                },
+                StateMigrationPolicy::Reset => spec.default.clone(),
+                StateMigrationPolicy::Reject => {
+                    errors.push(format!(
+                        "instance '{}' key '{}' is stored at schema v{} but declared v{} with policy 'reject'",
+                        rec.owner, rec.state_key, rec.schema_version, decl.schema_version
+                    ));
+                    continue;
+                }
+            };
+            let action = match (&decl.migration, &new_value) {
+                (StateMigrationPolicy::Keep, _) => "keep",
+                (_, Some(_)) => "reset",
+                (_, None) => "remove",
+            };
+            planned.push(PlannedStateMigration {
+                scope: rec.scope.clone(),
+                owner: rec.owner.clone(),
+                state_key: rec.state_key.clone(),
+                from_schema_version: rec.schema_version,
+                to_schema_version: decl.schema_version,
+                action: action.into(),
+            });
+            steps.push(StateMigrationStep {
+                scope: rec.scope,
+                owner: rec.owner,
+                state_key: rec.state_key,
+                expected_version: rec.version,
+                new_schema_version: decl.schema_version,
+                generation_id,
+                new_value,
+            });
+        }
+        if !errors.is_empty() {
+            return Err(StateError::Migration(errors.join("; ")));
+        }
+        Ok((steps, planned))
+    }
+
+    /// Check-only plan of every State migration (Dashboard and Instance State) a candidate
+    /// Generation requires; no writes. Run before committing a draft (§8, §12.2).
+    pub fn check_graph_state(
+        &self,
+        graph: &ConfiguredGraph,
+    ) -> Result<StateMigrationReport, StateError> {
+        let (_, mut migrations) = self.plan_dashboard_state_migrations(&graph.dashboards, 0)?;
+        let (_, inst) = self.plan_instance_state_migrations(graph, 0)?;
+        migrations.extend(inst);
+        Ok(StateMigrationReport {
+            migrations,
+            applied: 0,
+            seeded: 0,
+        })
+    }
+
+    /// Migrate Dashboard and Instance State for a new Generation in one transaction
+    /// (all-or-nothing), then seed missing Dashboard `initial_state` defaults (§8, §12.2).
+    pub fn apply_graph_state(
+        &self,
+        graph: &ConfiguredGraph,
+        generation_id: i64,
+        principal: &Principal,
+    ) -> Result<StateMigrationReport, StateError> {
+        self.apply_state_for(&graph.dashboards, Some(graph), generation_id, principal)
+    }
+
     /// Mediated Dashboard State write used by the HTTP and WebSocket APIs: checks that the
     /// dashboard exists, the Principal's authority, that the key is declared and the value
     /// valid, then performs a (optionally CAS) write. Denials are audited.
@@ -571,6 +766,16 @@ impl StateManager {
         generation_id: i64,
         principal: &Principal,
     ) -> Result<StateMigrationReport, StateError> {
+        self.apply_state_for(dashboards, None, generation_id, principal)
+    }
+
+    fn apply_state_for(
+        &self,
+        dashboards: &BTreeMap<String, DashboardDoc>,
+        graph: Option<&ConfiguredGraph>,
+        generation_id: i64,
+        principal: &Principal,
+    ) -> Result<StateMigrationReport, StateError> {
         let audit = |outcome: &str, detail: serde_json::Value| {
             let _ = self.store.append_audit(
                 &principal.id,
@@ -581,14 +786,23 @@ impl StateManager {
                 detail,
             );
         };
-        let (steps, migrations) =
-            match self.plan_dashboard_state_migrations(dashboards, generation_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    audit("failed", serde_json::json!({ "error": e.to_string() }));
-                    return Err(e);
+        let planned = self
+            .plan_dashboard_state_migrations(dashboards, generation_id)
+            .and_then(|(mut steps, mut migrations)| {
+                if let Some(g) = graph {
+                    let (s, m) = self.plan_instance_state_migrations(g, generation_id)?;
+                    steps.extend(s);
+                    migrations.extend(m);
                 }
-            };
+                Ok((steps, migrations))
+            });
+        let (steps, migrations) = match planned {
+            Ok(p) => p,
+            Err(e) => {
+                audit("failed", serde_json::json!({ "error": e.to_string() }));
+                return Err(e);
+            }
+        };
         let mut applied = 0;
         if !steps.is_empty() {
             let results = match self.store.apply_state_migrations(&steps) {
@@ -880,5 +1094,119 @@ mod tests {
         assert!(!serde_json::to_string(&plain)
             .unwrap()
             .contains("state_schema"));
+    }
+
+    fn instance_graph(state_decl: &str) -> ConfiguredGraph {
+        let decl = format!(
+            "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"gh.prs\", state = {{ {state_decl} }} }}"
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert("definition.luau".to_string(), decl.as_bytes().to_vec());
+        let manifest = dash_luau::evaluate_declaration(&decl, &sources).unwrap();
+        let mut g = ConfiguredGraph::default();
+        g.definitions.insert(
+            "gh.prs".into(),
+            crate::model::LoadedDefinition {
+                package_name: "gh".into(),
+                manifest,
+                definition_source: decl.clone(),
+                runtime_source: String::new(),
+                tests_source: None,
+                fixtures: BTreeMap::new(),
+                widget_assets: BTreeMap::new(),
+            },
+        );
+        let inst: InstanceConfig = serde_json::from_value(json!({
+            "id": "prs",
+            "category": DefinitionCategory::DataProvider,
+            "definition": "gh.prs",
+        }))
+        .unwrap();
+        g.instances.insert(inst.id.clone(), inst);
+        g
+    }
+
+    // SC-7: Instance State declarations drive migrations on activation, like Dashboard State.
+    #[test]
+    fn instance_state_migrations_reset_keep_and_reject() {
+        let (sm, _) = manager();
+        let admin = Principal::administrator();
+        // Written by an older Definition that declared nothing (implicit schema v1).
+        sm.set(
+            "instance",
+            "prs",
+            "cursor",
+            1,
+            1,
+            json!("2026-11-01T00:00Z"),
+            None,
+        )
+        .unwrap();
+        sm.set("instance", "prs", "seen", 1, 1, json!(["a"]), None)
+            .unwrap();
+
+        // v2 changes the cursor shape (reset to the declared default) and keeps `seen`.
+        let v2 = instance_graph(
+            r#"cursor = { schema_version = 2, type = "object", migration = "reset", default = { page = 1 } },
+               seen = { schema_version = 2, type = "array" }"#,
+        );
+        let check = sm.check_graph_state(&v2).unwrap();
+        assert_eq!(check.migrations.len(), 2);
+        assert_eq!(
+            sm.get("instance", "prs", "cursor").unwrap().unwrap().value,
+            json!("2026-11-01T00:00Z"),
+            "check-only plan writes nothing"
+        );
+        let report = sm.apply_graph_state(&v2, 2, &admin).unwrap();
+        assert_eq!(report.applied, 2);
+        let cursor = sm.get("instance", "prs", "cursor").unwrap().unwrap();
+        assert_eq!(
+            (cursor.value, cursor.schema_version),
+            (json!({"page": 1}), 2)
+        );
+        let seen = sm.get("instance", "prs", "seen").unwrap().unwrap();
+        assert_eq!((seen.value, seen.schema_version), (json!(["a"]), 2));
+
+        // Writes now follow the declaration: undeclared keys and wrong types are rejected.
+        assert!(sm
+            .set_instance_state(&v2, "prs", "other", json!(1))
+            .is_err());
+        assert!(sm
+            .set_instance_state(&v2, "prs", "cursor", json!("x"))
+            .is_err());
+        assert_eq!(
+            sm.set_instance_state(&v2, "prs", "cursor", json!({"page": 2}))
+                .unwrap()
+                .schema_version,
+            2
+        );
+
+        // v3: `keep` of a value that no longer validates, and `reject`, both refuse activation
+        // and leave live State untouched.
+        let keep_bad = instance_graph(
+            r#"cursor = { schema_version = 3, type = "string" }, seen = { schema_version = 2, type = "array" }"#,
+        );
+        assert!(matches!(
+            sm.apply_graph_state(&keep_bad, 3, &admin),
+            Err(StateError::Migration(_))
+        ));
+        let reject = instance_graph(
+            r#"cursor = { schema_version = 3, migration = "reject" }, seen = { schema_version = 3, migration = "reset" }"#,
+        );
+        let err = sm.check_graph_state(&reject).unwrap_err();
+        assert!(err.to_string().contains("reject"), "{err}");
+        assert!(sm.apply_graph_state(&reject, 3, &admin).is_err());
+        let cursor = sm.get("instance", "prs", "cursor").unwrap().unwrap();
+        assert_eq!(
+            (cursor.value, cursor.schema_version),
+            (json!({"page": 2}), 2)
+        );
+        assert!(sm.get("instance", "prs", "seen").unwrap().is_some());
+
+        // An invalid declared default is itself an activation error.
+        let bad_default = instance_graph(
+            r#"cursor = { schema_version = 4, type = "object", migration = "reset", default = "nope" }"#,
+        );
+        assert!(sm.check_graph_state(&bad_default).is_err());
     }
 }

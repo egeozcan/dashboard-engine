@@ -1045,7 +1045,7 @@ impl DraftManager {
             load_workspace_graph(&wt, &self.data_dir, &active_rev, 0, false).await?;
         self.engine
             .state
-            .check_generation_state(&candidate_graph.dashboards)
+            .check_graph_state(&candidate_graph)
             .map_err(|e| {
                 GitError::Workspace(format!("{e}; activation refused, live State preserved"))
             })?;
@@ -1262,10 +1262,10 @@ impl DraftManager {
 
         // Migrate State transactionally and seed defaults before touching the live runtime; a
         // failed migration rolls back and leaves the live Generation and its State untouched (§8).
-        if let Err(e) =
-            self.engine
-                .state
-                .apply_generation_state(&live_graph.dashboards, new_gen_id, principal)
+        if let Err(e) = self
+            .engine
+            .state
+            .apply_graph_state(&live_graph, new_gen_id, principal)
         {
             self.rollback_workspace(&active_rev, &new_commit, mode)
                 .await;

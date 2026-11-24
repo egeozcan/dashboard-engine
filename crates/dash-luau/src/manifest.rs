@@ -467,6 +467,92 @@ fn default_true() -> bool {
     true
 }
 
+/// Declared Instance State key (§8, `state = { <key> = { ... } }` on connectors, data providers
+/// and automations): schema version, value type, size limit and migration policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateKeySpec {
+    pub schema_version: i64,
+    /// `any | string | number | integer | boolean | object | array`.
+    #[serde(rename = "type", default = "default_state_type")]
+    pub value_type: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nullable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// `keep | reset | reject`: what activation does with records stored at another version.
+    #[serde(default = "default_state_migration")]
+    pub migration: String,
+    /// Value a `reset` migration writes (absent: the record is removed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+fn default_state_type() -> String {
+    "any".into()
+}
+
+fn default_state_migration() -> String {
+    "keep".into()
+}
+
+/// Accepted `StateKeySpec::value_type` values.
+pub const STATE_VALUE_TYPES: &[&str] = &[
+    "any", "string", "number", "integer", "boolean", "object", "array",
+];
+/// Accepted `StateKeySpec::migration` values.
+pub const STATE_MIGRATION_POLICIES: &[&str] = &["keep", "reset", "reject"];
+
+/// Provider-declared query capabilities (§6.1 "the scheduler batches compatible dependency
+/// queries and offers provider-declared filtering, pagination, sorting and projections").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct QueryCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchSpec>,
+    #[serde(default, skip_serializing_if = "PushdownSpec::is_empty")]
+    pub pushdown: PushdownSpec,
+}
+
+impl QueryCapabilities {
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_none() && self.pushdown.is_empty()
+    }
+}
+
+/// Concurrent dependency queries of one execution that differ only in the list parameter
+/// `param` are merged into one query (union of the lists); result rows are routed back to each
+/// caller by their `key_field` value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchSpec {
+    pub param: String,
+    pub key_field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_keys: Option<usize>,
+}
+
+/// Query options the source evaluates itself; any other requested option is applied by the host
+/// on the provider's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PushdownSpec {
+    /// Fields the source can filter by equality.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter: Vec<String>,
+    /// Fields the source can sort by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort: Vec<String>,
+    /// The source paginates (`offset`/`limit`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub page: bool,
+    /// The source returns only requested fields.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub projection: bool,
+}
+
+impl PushdownSpec {
+    pub fn is_empty(&self) -> bool {
+        self.filter.is_empty() && self.sort.is_empty() && !self.page && !self.projection
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorOperationSpec {
     pub description: String,
@@ -618,6 +704,12 @@ pub struct DefinitionManifest {
     pub libraries: Vec<String>,
     #[serde(default)]
     pub generated_luau_types: String,
+    /// Declared Instance State keys (§8). Empty: keys are implicit (schema v1, any type).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instance_state: BTreeMap<String, StateKeySpec>,
+    /// Data providers: batching and pushdown capabilities (§6.1).
+    #[serde(default, skip_serializing_if = "QueryCapabilities::is_empty")]
+    pub query_capabilities: QueryCapabilities,
 }
 
 impl DefinitionManifest {
@@ -905,6 +997,8 @@ mod tests {
             triggers: vec![],
             libraries: vec![],
             generated_luau_types: String::new(),
+            instance_state: BTreeMap::new(),
+            query_capabilities: QueryCapabilities::default(),
         }
     }
 

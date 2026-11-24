@@ -1527,6 +1527,15 @@ impl HostBridge for AutomationHostBridge {
             return Err("automation predicates are read-only and cannot write State".into());
         }
         let (scope, owner) = self.state_target(scope)?;
+        if scope == "instance" {
+            // Declared Instance State schema version, type and size limit (§8).
+            return self
+                .queries
+                .state_manager()
+                .set_instance_state(&self.graph, &owner, key, value)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
         // Write through the StateManager so a State Signal is published (§8).
         self.queries
             .state_manager()

@@ -5,8 +5,9 @@
 //! declarations and invalid contracts, producing a deterministic `DefinitionManifest`.
 
 use crate::manifest::{
-    compute_sources_digest, ConnectorOperationSpec, DefinitionCategory, DefinitionManifest,
-    EventDeclSpec, InputRefSpec, SchemaSpec, TriggerDeclSpec, UpdateModes,
+    compute_sources_digest, BatchSpec, ConnectorOperationSpec, DefinitionCategory,
+    DefinitionManifest, EventDeclSpec, InputRefSpec, PushdownSpec, QueryCapabilities, SchemaSpec,
+    StateKeySpec, TriggerDeclSpec, UpdateModes, STATE_MIGRATION_POLICIES, STATE_VALUE_TYPES,
 };
 use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use std::collections::BTreeMap;
@@ -429,6 +430,11 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
     let emits = parse_emits(tbl)?;
     let updates = parse_updates(tbl)?;
     let triggers = parse_triggers(tbl)?;
+    let instance_state = parse_instance_state(tbl)?;
+    let query_capabilities = QueryCapabilities {
+        batch: parse_batch(tbl)?,
+        pushdown: parse_pushdown(tbl)?,
+    };
 
     Ok(DefinitionManifest {
         id,
@@ -464,6 +470,8 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
         triggers,
         libraries,
         generated_luau_types: String::new(),
+        instance_state,
+        query_capabilities,
     })
 }
 
@@ -604,6 +612,21 @@ fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
             }
         },
         DefinitionCategory::DataProvider => {
+            if let (Some(b), Some(SchemaSpec::Object { fields })) =
+                (&m.query_capabilities.batch, &m.query)
+            {
+                let is_list = |s: &SchemaSpec| match s {
+                    SchemaSpec::List { .. } => true,
+                    SchemaSpec::Optional { inner } => matches!(**inner, SchemaSpec::List { .. }),
+                    _ => false,
+                };
+                if !fields.get(&b.param).is_some_and(is_list) {
+                    return Err(DeclarationError::InvalidContract(format!(
+                        "data_provider '{}': batch.param '{}' must be a list field of the query schema",
+                        m.id, b.param
+                    )));
+                }
+            }
             for (input_name, spec) in &m.inputs {
                 if matches!(spec, InputRefSpec::Action { .. }) {
                     return Err(DeclarationError::InvalidContract(format!(
@@ -705,6 +728,7 @@ fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static 
             "capabilities",
             "operations",
             "emits",
+            "state",
         ],
         C::Mock => &[
             "id",
@@ -734,6 +758,9 @@ fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static 
             "emits",
             "required_capabilities",
             "optional_capabilities",
+            "state",
+            "batch",
+            "pushdown",
         ],
         C::ActionProvider => &[
             "id",
@@ -787,6 +814,7 @@ fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static 
             "emits",
             "required_capabilities",
             "optional_capabilities",
+            "state",
         ],
     }
 }
@@ -1207,6 +1235,121 @@ fn parse_emits(tbl: &Table) -> Result<Vec<EventDeclSpec>, DeclarationError> {
     Ok(out)
 }
 
+/// `state = { cursor = { schema_version = 2, type = "string", max_bytes = 256,
+/// migration = "reset", default = "" } }` (§8 Instance State declarations).
+fn parse_instance_state(tbl: &Table) -> Result<BTreeMap<String, StateKeySpec>, DeclarationError> {
+    let mut out = BTreeMap::new();
+    let Value::Table(keys) = tbl.get::<Value>("state")? else {
+        return Ok(out);
+    };
+    let bad = |msg: String| DeclarationError::InvalidContract(format!("state: {msg}"));
+    for pair in keys.pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        let Value::String(k) = k else {
+            return Err(bad("keys must be strings".into()));
+        };
+        let key = k.to_str()?.to_string();
+        if key.is_empty() || key.len() > 128 {
+            return Err(bad(format!("invalid key '{key}'")));
+        }
+        let Value::Table(t) = v else {
+            return Err(bad(format!("key '{key}' must be declared with a table")));
+        };
+        check_known_keys(
+            &t,
+            &[
+                "schema_version",
+                "type",
+                "nullable",
+                "max_bytes",
+                "migration",
+                "default",
+            ],
+            &format!("state key '{key}'"),
+        )?;
+        let schema_version = get_opt_u64(&t, "schema_version")?.unwrap_or(1);
+        if schema_version == 0 || schema_version > i64::MAX as u64 {
+            return Err(bad(format!("key '{key}': schema_version must be >= 1")));
+        }
+        let value_type = get_opt_string(&t, "type")?.unwrap_or_else(|| "any".into());
+        if !STATE_VALUE_TYPES.contains(&value_type.as_str()) {
+            return Err(bad(format!(
+                "key '{key}': unknown type '{value_type}' (expected one of {STATE_VALUE_TYPES:?})"
+            )));
+        }
+        let migration = get_opt_string(&t, "migration")?.unwrap_or_else(|| "keep".into());
+        if !STATE_MIGRATION_POLICIES.contains(&migration.as_str()) {
+            return Err(bad(format!(
+                "key '{key}': unknown migration '{migration}' (expected keep | reset | reject)"
+            )));
+        }
+        let max_bytes = match get_opt_u64(&t, "max_bytes")? {
+            Some(0) => return Err(bad(format!("key '{key}': max_bytes must be positive"))),
+            Some(n) => Some(n as usize),
+            None => None,
+        };
+        let default = match t.get::<Value>("default")? {
+            Value::Nil => None,
+            v => Some(
+                serde_json::to_value(&v)
+                    .map_err(|e| bad(format!("key '{key}': invalid default: {e}")))?,
+            ),
+        };
+        out.insert(
+            key,
+            StateKeySpec {
+                schema_version: schema_version as i64,
+                value_type,
+                nullable: get_opt_bool(&t, "nullable")?.unwrap_or(false),
+                max_bytes,
+                migration,
+                default,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// `batch = { param = "keys", key_field = "key", max_keys = 100 }` (§6.1 batching).
+fn parse_batch(tbl: &Table) -> Result<Option<BatchSpec>, DeclarationError> {
+    let Value::Table(b) = tbl.get::<Value>("batch")? else {
+        return Ok(None);
+    };
+    check_known_keys(&b, &["param", "key_field", "max_keys"], "batch")?;
+    let req = |k: &str| -> Result<String, DeclarationError> {
+        get_opt_string(&b, k)?
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| DeclarationError::InvalidContract(format!("batch requires '{k}'")))
+    };
+    let max_keys = match get_opt_u64(&b, "max_keys")? {
+        Some(0) => {
+            return Err(DeclarationError::InvalidContract(
+                "batch.max_keys must be positive".into(),
+            ))
+        }
+        other => other.map(|n| n as usize),
+    };
+    Ok(Some(BatchSpec {
+        param: req("param")?,
+        key_field: req("key_field")?,
+        max_keys,
+    }))
+}
+
+/// `pushdown = { filter = { "state" }, sort = { "updated_at" }, page = true, projection = true }`.
+fn parse_pushdown(tbl: &Table) -> Result<PushdownSpec, DeclarationError> {
+    let Value::Table(p) = tbl.get::<Value>("pushdown")? else {
+        return Ok(PushdownSpec::default());
+    };
+    check_known_keys(&p, &["filter", "sort", "page", "projection"], "pushdown")?;
+    Ok(PushdownSpec {
+        filter: parse_string_vec(&p, "filter")?,
+        sort: parse_string_vec(&p, "sort")?,
+        page: get_opt_bool(&p, "page")?.unwrap_or(false),
+        projection: get_opt_bool(&p, "projection")?.unwrap_or(false),
+    })
+}
+
 fn parse_updates(tbl: &Table) -> Result<UpdateModes, DeclarationError> {
     let Value::Table(u) = tbl.get::<Value>("updates")? else {
         return Ok(UpdateModes::default());
@@ -1578,5 +1721,70 @@ return dash.connector { id = "p.c", capabilities = { "read" }, operations = { me
             scan_required_modules(src),
             vec!["eng.utils", "eng.more", "x.y"]
         );
+    }
+
+    // SC-7: Instance State declarations.
+    #[test]
+    fn instance_state_declarations_are_parsed_and_checked() {
+        let m = eval(&dp(
+            r#"state = { cursor = { schema_version = 2, type = "object", max_bytes = 512, migration = "reset", default = { page = 1 } } }"#,
+        ))
+        .unwrap();
+        let c = &m.instance_state["cursor"];
+        assert_eq!(c.schema_version, 2);
+        assert_eq!(c.value_type, "object");
+        assert_eq!(c.max_bytes, Some(512));
+        assert_eq!(c.migration, "reset");
+        assert_eq!(c.default, Some(serde_json::json!({ "page": 1 })));
+        for body in [
+            r#"state = { cursor = { type = "date" } }"#,
+            r#"state = { cursor = { migration = "drop" } }"#,
+            r#"state = { cursor = { schema_version = 0 } }"#,
+            r#"state = { cursor = { typo = 1 } }"#,
+            r#"state = { cursor = "string" }"#,
+        ] {
+            assert!(
+                matches!(eval(&dp(body)), Err(DeclarationError::InvalidContract(_))),
+                "{body} must be rejected"
+            );
+        }
+        // Adapters hold no Instance State (§8).
+        let adapter = r#"local dash = require("dash")
+return dash.adapter { id = "p.a", state = { k = {} } }"#;
+        assert!(eval(adapter).is_err());
+        // No declaration keeps the canonical manifest unchanged.
+        let plain = eval(&dp("")).unwrap();
+        assert!(plain.instance_state.is_empty());
+        assert!(!plain.canonical_json().unwrap().contains("instance_state"));
+    }
+
+    // SC-13: batching and pushdown capabilities.
+    #[test]
+    fn batch_and_pushdown_capabilities_are_parsed_and_checked() {
+        let m = eval(&dp(
+            r#"query = dash.object { keys = dash.list(dash.string()) },
+               batch = { param = "keys", key_field = "key", max_keys = 50 },
+               pushdown = { filter = { "state" }, sort = { "updated_at" }, page = true }"#,
+        ))
+        .unwrap();
+        let b = m.query_capabilities.batch.as_ref().unwrap();
+        assert_eq!(
+            (b.param.as_str(), b.key_field.as_str(), b.max_keys),
+            ("keys", "key", Some(50))
+        );
+        assert_eq!(m.query_capabilities.pushdown.filter, vec!["state"]);
+        assert!(m.query_capabilities.pushdown.page);
+        assert!(!m.query_capabilities.pushdown.projection);
+        for body in [
+            r#"query = dash.object { keys = dash.string() }, batch = { param = "keys", key_field = "key" }"#,
+            r#"batch = { param = "keys" }"#,
+            r#"pushdown = { limit = true }"#,
+            r#"pushdown = { filter = "state" }"#,
+        ] {
+            assert!(
+                matches!(eval(&dp(body)), Err(DeclarationError::InvalidContract(_))),
+                "{body} must be rejected"
+            );
+        }
     }
 }

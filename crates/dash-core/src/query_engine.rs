@@ -193,6 +193,12 @@ async fn wait_bounded<T>(fut: impl Future<Output = T>, wait: &WaitCtx) -> Result
     }
 }
 
+/// Result of verifying a provider delta: done, or a resync the caller performs or schedules.
+enum DeltaStep {
+    Done(Box<crate::signal::ProviderDeltaOutcome>),
+    NeedsResync(String),
+}
+
 /// One running computation shared by all of its waiters.
 struct Flight<X> {
     id: u64,
@@ -375,6 +381,9 @@ pub struct QueryEngine {
     render_in_flight: FlightMap<RenderOutcome>,
     /// widget_id -> owning Adapter Instance of the latest render per dashboard and Generation.
     rendered_widgets: Arc<RenderedWidgets>,
+    /// Active provider `subscribe` hooks (§6.1), one per subscribed query identity shared by all
+    /// its consumers; released when the query has no subscribers left.
+    provider_subscriptions: Arc<DashMap<String, CancelSignal>>,
 }
 
 /// dashboard_id -> (Generation, widget_id -> Adapter Instance).
@@ -423,6 +432,7 @@ impl QueryEngine {
             ))),
             render_in_flight: Arc::new(DashMap::new()),
             rendered_widgets: Arc::new(DashMap::new()),
+            provider_subscriptions: Arc::new(DashMap::new()),
         }
     }
 
@@ -538,6 +548,17 @@ impl QueryEngine {
         for f in self.render_in_flight.iter() {
             f.cancel.cancel();
             n += 1;
+        }
+        let subs: Vec<String> = self
+            .provider_subscriptions
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for k in subs {
+            if let Some((_, c)) = self.provider_subscriptions.remove(&k) {
+                c.cancel();
+                n += 1;
+            }
         }
         n
     }
@@ -689,6 +710,12 @@ impl QueryEngine {
             ));
         }
         call_stack.push(query_key.clone());
+
+        // A subscribed query of a provider with a `subscribe` hook starts that hook once for all
+        // of its consumers (§6.1 "identical subscribed queries share underlying subscriptions").
+        if def.manifest.updates.subscribe && self.signals.subscriber_count(&query_key) > 0 {
+            self.ensure_provider_subscription(&g, &inst, &def, &params, principal, &query_key);
+        }
 
         // Fast cache hit path (bounded LRU + TTL + generation match)
         if !force_refresh {
@@ -1512,8 +1539,10 @@ impl QueryEngine {
             recorded_state: Arc::new(Mutex::new(BTreeMap::new())),
             dashboard_id: None,
             operation: None,
-            deadline: Instant::now() + self.pool.budget().wall_timeout,
+            deadline: self.host_await_deadline(&inst.id),
             cancel: cancel.clone(),
+            outcome_unknown: Arc::new(AtomicBool::new(false)),
+            batches: BatchMap::default(),
         });
 
         let bundle = CompiledInstanceBundle {
@@ -1638,6 +1667,26 @@ impl QueryEngine {
         )
         .map_err(|e| e.to_string())?;
 
+        // The operation contract is the real connector Definition's, also when a Mock stands in
+        // for it (§4.1: a Mock offers the same operations as its target). Arguments are checked
+        // before anything runs, so a rejection here is provably pre-send (§4.2).
+        let op_spec = g
+            .definitions
+            .get(&conn_inst.definition)
+            .and_then(|d| d.manifest.operations.get(operation))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "undeclared operation '{operation}' on connector '{}'",
+                    conn_inst.definition
+                )
+            })?;
+        let mut args = args;
+        op_spec.args.normalize_empty_lists(&mut args);
+        op_spec.args.validate_value(&args).map_err(|e| {
+            format!("invalid args for connector '{connector_id}' operation '{operation}': {e}")
+        })?;
+
         if let Some(rule) = self.telemetry.take_injected_failure(connector_id) {
             return Err(format!(
                 "injected failure ({}): {}",
@@ -1687,6 +1736,7 @@ impl QueryEngine {
         // so an in-progress side effect is not interrupted mid-way.
         let _cancel_on_drop = cancel.clone().map(CancelOnDrop);
         let signal = cancel.unwrap_or_default();
+        let outcome_unknown = Arc::new(AtomicBool::new(false));
         let bridge = Arc::new(EngineHostBridge {
             engine: self.clone(),
             graph: Arc::clone(&g),
@@ -1701,8 +1751,10 @@ impl QueryEngine {
             recorded_state: Arc::new(Mutex::new(BTreeMap::new())),
             dashboard_id: None,
             operation: Some(operation.to_string()),
-            deadline: Instant::now() + self.pool.budget().wall_timeout,
+            deadline: self.host_await_deadline(&bundle.instance_id),
             cancel: signal.clone(),
+            outcome_unknown: Arc::clone(&outcome_unknown),
+            batches: BatchMap::default(),
         });
 
         let handler = if eff_def.manifest.handler.is_empty() {
@@ -1738,8 +1790,25 @@ impl QueryEngine {
                 Some(signal.vm_flag()),
             )
             .await;
-        self.record_runtime_outcome(&breaker_key, admission, &res, false);
-        res.map_err(|e| match e {
+        // Untrusted connector output is checked against the operation contract at the boundary
+        // (§4.2), for Mocks too; an invalid result counts as a fault for the breaker (§15.2).
+        let res = res.map(|mut v| {
+            op_spec.result.normalize_empty_lists(&mut v);
+            v
+        });
+        let contract_violation = res
+            .as_ref()
+            .ok()
+            .and_then(|v| op_spec.result.validate_value(v).err());
+        if contract_violation.is_some() {
+            if self.breaker_failure(&breaker_key) {
+                self.pool.evict(&breaker_key);
+            }
+        } else {
+            self.record_runtime_outcome(&breaker_key, admission, &res, false);
+        }
+        let possibly_sent = outcome_unknown.load(Ordering::SeqCst);
+        let val = res.map_err(|e| match e {
             // The connector handler was interrupted mid-flight: any request it issued may have
             // been processed upstream (§9.1 `unknown`).
             RuntimeError::Timeout(_) | RuntimeError::Cancelled => format!(
@@ -1747,8 +1816,43 @@ impl QueryEngine {
                 crate::actions::UNKNOWN_OUTCOME_CODE,
                 conn_inst.id
             ),
-            other => self.store.redactor().redact_str(&other.to_string()),
-        })
+            other => {
+                let msg = self.store.redactor().redact_str(&other.to_string());
+                // A write of this execution ended without a known outcome; whatever the handler
+                // raised afterwards, the effect may have happened (§9.1, Appendix A.4).
+                if possibly_sent && !crate::actions::is_unknown_outcome_error(&msg) {
+                    format!(
+                        "{}: connector '{}' operation '{operation}' failed after a request whose outcome is unknown: {msg}",
+                        crate::actions::UNKNOWN_OUTCOME_CODE,
+                        conn_inst.id
+                    )
+                } else {
+                    msg
+                }
+            }
+        })?;
+
+        // A side-effecting operation already ran, so its malformed result leaves the outcome
+        // unknown rather than proving the write did not happen.
+        if let Some(e) = contract_violation {
+            let msg = format!(
+                "output contract violation on connector '{connector_id}' operation '{operation}': {e}"
+            );
+            return Err(if op_spec.has_side_effects() {
+                format!("{}: {msg}", crate::actions::UNKNOWN_OUTCOME_CODE)
+            } else {
+                msg
+            });
+        }
+        Ok(val)
+    }
+
+    /// Fallback deadline for host awaits of an execution of `vm_instance_id` started now: the
+    /// Instance's effective wall budget (Workspace `[resources]` overrides included), never later
+    /// than the enclosing execution's deadline. While the VM runs, its own deadline applies.
+    fn host_await_deadline(&self, vm_instance_id: &str) -> Instant {
+        let own = Instant::now() + self.pool.effective_budget(vm_instance_id).wall_timeout;
+        dash_luau::current_execution_deadline().map_or(own, |d| d.min(own))
     }
 
     /// Update the breaker of a non-query execution. Timeouts and memory violations always count;
@@ -1844,6 +1948,28 @@ impl QueryEngine {
         source_sequence: u64,
         ops: Vec<crate::signal::DeltaOp>,
     ) -> Result<crate::signal::ProviderDeltaOutcome, String> {
+        match self.provider_delta_step(instance_id, params, principal, source_sequence, ops)? {
+            DeltaStep::Done(outcome) => Ok(*outcome),
+            DeltaStep::NeedsResync(reason) => {
+                let snapshot = self
+                    .query(instance_id, params.clone(), principal, true)
+                    .await?;
+                Ok(crate::signal::ProviderDeltaOutcome::Resynced { reason, snapshot })
+            }
+        }
+    }
+
+    /// Verify and apply a provider delta; returns the resync reason instead of resynchronizing,
+    /// so a caller running inside the provider's own VM (ctx:push_delta) can schedule the resync
+    /// rather than wait on its own Instance.
+    fn provider_delta_step(
+        &self,
+        instance_id: &str,
+        params: &serde_json::Value,
+        principal: &Principal,
+        source_sequence: u64,
+        ops: Vec<crate::signal::DeltaOp>,
+    ) -> Result<DeltaStep, String> {
         use crate::signal::{ProviderDeltaOutcome, SequenceCheck};
         let g = self.graph.load_full();
         let inst = g
@@ -1865,9 +1991,9 @@ impl QueryEngine {
 
         let resync_reason = match seqs.check_and_advance(&query_key, source_sequence) {
             SequenceCheck::Duplicate { last } => {
-                return Ok(ProviderDeltaOutcome::Duplicate {
+                return Ok(DeltaStep::Done(Box::new(ProviderDeltaOutcome::Duplicate {
                     last_sequence: last,
-                })
+                })))
             }
             SequenceCheck::Gap { expected, got } => Some(format!(
                 "source sequence gap: expected {expected}, got {got}"
@@ -1927,17 +2053,143 @@ impl QueryEngine {
                 .publish_delta_with_snapshot(delta.clone(), materialized);
             // Dynamic dependents of this query observe the change like any other commit.
             self.propagate_change(&query_key, &[]);
-            return Ok(ProviderDeltaOutcome::Applied(delta));
+            return Ok(DeltaStep::Done(Box::new(ProviderDeltaOutcome::Applied(
+                delta,
+            ))));
         }
 
         // Resynchronize from a snapshot; the next delta establishes the new sequence baseline.
         let reason = resync_reason
             .unwrap_or_else(|| "no cached snapshot to apply the delta onto".to_string());
         seqs.reset(&query_key, None);
-        let snapshot = self
-            .query(instance_id, params.clone(), principal, true)
-            .await?;
-        Ok(ProviderDeltaOutcome::Resynced { reason, snapshot })
+        Ok(DeltaStep::NeedsResync(reason))
+    }
+
+    /// Start the provider's `subscribe(params)` hook for a subscribed query unless it is already
+    /// active (§6.1). The hook runs as one bounded execution of the provider Instance with the
+    /// query's parameters; it may push snapshots or keyed deltas (ctx:push_snapshot /
+    /// ctx:push_delta) for the query. The subscription is released, and a running hook
+    /// cancelled, once the query has no subscribers left ([`Self::prune_idle`]); a later
+    /// subscriber starts it again. A failed hook is logged and released so the next subscriber
+    /// retries it; a Definition without a `subscribe` function keeps the (hook-less)
+    /// subscription so it is not looked up again while subscribed.
+    fn ensure_provider_subscription(
+        &self,
+        g: &Arc<ConfiguredGraph>,
+        inst: &InstanceConfig,
+        def: &LoadedDefinition,
+        params: &serde_json::Value,
+        principal: &Principal,
+        query_key: &str,
+    ) {
+        let cancel = CancelSignal::new();
+        match self.provider_subscriptions.entry(query_key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => return,
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(cancel.clone());
+            }
+        }
+        let engine = self.clone();
+        let graph = Arc::clone(g);
+        let inst = inst.clone();
+        let def = def.clone();
+        let params = params.clone();
+        let principal = principal.clone();
+        let query_key = query_key.to_string();
+        tokio::spawn(async move {
+            let trace_id = format!("tr_{}", Uuid::now_v7().simple());
+            let bridge = Arc::new(EngineHostBridge {
+                engine: engine.clone(),
+                graph: Arc::clone(&graph),
+                caller_inst: inst.clone(),
+                caller_def: def.clone(),
+                principal: principal.clone(),
+                trace_id: trace_id.clone(),
+                parent_query_key: Some(query_key.clone()),
+                call_stack: vec![query_key.clone()],
+                recorded_deps: Arc::new(Mutex::new(BTreeSet::new())),
+                recorded_upstreams: Arc::new(Mutex::new(Vec::new())),
+                recorded_state: Arc::new(Mutex::new(BTreeMap::new())),
+                dashboard_id: None,
+                operation: None,
+                deadline: engine.host_await_deadline(&inst.id),
+                cancel: cancel.clone(),
+                outcome_unknown: Arc::new(AtomicBool::new(false)),
+                batches: BatchMap::default(),
+            });
+            let bundle = CompiledInstanceBundle {
+                instance_id: inst.id.clone(),
+                manifest: def.manifest.clone(),
+                runtime_source: def.runtime_source.clone(),
+                config_digest: inst.config_digest(),
+                resolved_libraries: graph.resolved_libraries(),
+            };
+            let started = Instant::now();
+            let res = engine
+                .pool
+                .execute_handler(
+                    &bundle,
+                    "subscribe",
+                    ExecutionContextConfig {
+                        category: DefinitionCategory::DataProvider,
+                        instance_id: inst.id.clone(),
+                        input_names: inst.inputs.keys().cloned().collect(),
+                        config: inst.config.clone(),
+                        payload: params,
+                        operation: None,
+                        idempotency_key: None,
+                        allowed_emits: def
+                            .manifest
+                            .emits
+                            .iter()
+                            .map(|e| e.semantic_type.clone())
+                            .collect(),
+                        now_iso: Utc::now().to_rfc3339(),
+                        trace_id: trace_id.clone(),
+                        bridge,
+                    },
+                    Some(cancel.vm_flag()),
+                )
+                .await;
+            let status = match &res {
+                Ok(_) => "ok",
+                // `updates.subscribe` without a hook: consumers share the subscription and
+                // updates arrive through polling, push or on-demand refresh (§6.2).
+                Err(RuntimeError::HandlerNotFound(..)) => "no_hook",
+                Err(_) if cancel.is_cancelled() => "cancelled",
+                Err(_) => "error",
+            };
+            if let Err(e) = &res {
+                if status == "error" {
+                    let msg = engine.store.redactor().redact_str(&e.to_string());
+                    engine.telemetry.log(
+                        "warn",
+                        "query_engine",
+                        &principal.id,
+                        &trace_id,
+                        &format!("subscribe hook of '{}' failed: {msg}", inst.id),
+                    );
+                    // Release so the next subscriber retries (only our own registration).
+                    engine
+                        .provider_subscriptions
+                        .remove_if(&query_key, |_, c| Arc::ptr_eq(&c.flag, &cancel.flag));
+                }
+            }
+            engine.telemetry.record_span(
+                &trace_id,
+                None,
+                &format!("subscribe:{}", inst.id),
+                &principal.id,
+                serde_json::json!({ "query_key": query_key, "hook": status != "no_hook" }),
+                if status == "no_hook" { "ok" } else { status },
+                started.elapsed().as_millis() as i64,
+            );
+        });
+    }
+
+    /// Whether the provider `subscribe` hook of `query_key` is active.
+    pub fn provider_subscription_active(&self, query_key: &str) -> bool {
+        self.provider_subscriptions.contains_key(query_key)
     }
 
     /// Release idle query state (§6.1, §20 "no unbounded queues or caches"): expire cached
@@ -1947,6 +2199,18 @@ impl QueryEngine {
     /// expired cache entries. Called periodically by the server's maintenance loop.
     pub fn prune_idle(&self) -> usize {
         self.signals.sweep_idle();
+        // Release provider subscriptions nobody consumes any more (reference count zero, §6.1).
+        let unsubscribed: Vec<String> = self
+            .provider_subscriptions
+            .iter()
+            .filter(|e| !self.signals.is_query_subscribed(e.key()))
+            .map(|e| e.key().clone())
+            .collect();
+        for k in unsubscribed {
+            if let Some((_, c)) = self.provider_subscriptions.remove(&k) {
+                c.cancel();
+            }
+        }
         let g = self.graph.load_full();
         let expiry = self.cache_ttl * 20;
         let now = Utc::now();
@@ -2411,8 +2675,11 @@ impl QueryEngine {
             let out = self
                 .render_placement(&g, &dash, placement, principal, false)
                 .await?;
-            // Derive stable `widget_id`s and apply Dashboard layout overrides (§8)
+            // Derive stable `widget_id`s, apply Dashboard layout overrides (§8) and check every
+            // Widget node against its widget provider's contract (§4.2, §10.1).
+            let first_diag = diagnostics.len();
             let tree = annotate_widget_ids(
+                &g,
                 out.tree.clone(),
                 &placement.adapter_instance,
                 &dash.overrides,
@@ -2426,6 +2693,7 @@ impl QueryEngine {
                 "status": out.status,
                 "updated_at": out.updated_at.to_rfc3339(),
                 "signal_key": out.render_key,
+                "diagnostics": diagnostics[first_diag..],
             }));
         }
         for d in diagnostics {
@@ -2661,8 +2929,10 @@ impl QueryEngine {
             recorded_state: Arc::clone(&recorded_state),
             dashboard_id: Some(job.dashboard.id.clone()),
             operation: None,
-            deadline: Instant::now() + self.pool.budget().wall_timeout,
+            deadline: self.host_await_deadline(&job.inst.id),
             cancel: cancel.clone(),
+            outcome_unknown: Arc::new(AtomicBool::new(false)),
+            batches: BatchMap::default(),
         });
         let bundle = CompiledInstanceBundle {
             instance_id: job.inst.id.clone(),
@@ -2786,6 +3056,7 @@ impl QueryEngine {
                 let mut owners = HashMap::new();
                 let mut diags = Vec::new();
                 if let Ok(annotated) = annotate_widget_ids(
+                    &job.graph,
                     outcome.tree.clone(),
                     &adapter_id,
                     &job.dashboard.overrides,
@@ -2887,17 +3158,63 @@ fn instant_to_utc(at: Instant) -> DateTime<Utc> {
 /// one dashboard). Adapter-supplied `widget_id`/`layout_override` fields are ignored, keyless
 /// non-root nodes get a positional fallback key (reported in `diagnostics`), and any duplicate
 /// widget_id is a render error.
+///
+/// Adapter output is untrusted (§4.2): every node naming a `widget_type` is checked against the
+/// Generation (`graph`): the type must be a widget provider and `props` must satisfy its declared
+/// `props` schema. A violating node is replaced by a `dash.text` error node carrying
+/// `render_error` (same `widget_id`), and a `WIDGET_CONTRACT_VIOLATION` diagnostic is recorded,
+/// so the rest of the tree still renders and invalid props never reach a widget.
 fn annotate_widget_ids(
+    graph: &ConfiguredGraph,
     node: serde_json::Value,
     adapter_instance: &str,
     overrides: &BTreeMap<String, crate::model::LayoutOverride>,
     owners: &mut HashMap<String, String>,
     diagnostics: &mut Vec<String>,
 ) -> Result<serde_json::Value, String> {
-    annotate_node(node, adapter_instance, overrides, owners, diagnostics, None)
+    annotate_node(
+        graph,
+        node,
+        adapter_instance,
+        overrides,
+        owners,
+        diagnostics,
+        None,
+    )
+}
+
+/// Check one Widget node's `widget_type` and `props` (normalizing empty-list props in place).
+/// Built-in `dash.*` primitives are checked when the Generation registers them (Workspace graphs
+/// always do); bare graphs without the built-in catalog accept them unchecked.
+fn check_widget_contract(
+    graph: &ConfiguredGraph,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(widget_type) = obj.get("widget_type") else {
+        return Ok(());
+    };
+    let Some(widget_type) = widget_type.as_str().map(str::to_string) else {
+        return Err(format!("widget_type must be a string, got {widget_type}"));
+    };
+    if widget_type.starts_with("dash.") && !graph.definitions.contains_key(&widget_type) {
+        return Ok(());
+    }
+    if let Some(schema) = graph
+        .definitions
+        .get(&widget_type)
+        .and_then(|d| d.manifest.widget_props.as_ref())
+    {
+        if let Some(p) = obj.get_mut("props") {
+            schema.normalize_empty_lists(p);
+        }
+    }
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let props = obj.get("props").unwrap_or(&empty);
+    graph.check_widget_node(&widget_type, props)
 }
 
 fn annotate_node(
+    graph: &ConfiguredGraph,
     mut node: serde_json::Value,
     adapter_instance: &str,
     overrides: &BTreeMap<String, crate::model::LayoutOverride>,
@@ -2943,11 +3260,30 @@ fn annotate_node(
         );
     }
 
+    if let Err(e) = check_widget_contract(graph, obj) {
+        let msg = format!(
+            "WIDGET_CONTRACT_VIOLATION: widget '{widget_id}' of adapter '{adapter_instance}': {e}"
+        );
+        diagnostics.push(msg.clone());
+        let mut err_node = serde_json::json!({
+            "key": node_key,
+            "widget_id": widget_id,
+            "widget_type": "dash.text",
+            "props": { "title": "Widget unavailable", "text": msg },
+            "render_error": msg,
+        });
+        if let Some(ov) = obj.get("layout_override") {
+            err_node["layout_override"] = ov.clone();
+        }
+        return Ok(err_node);
+    }
+
     if let Some(children) = obj.get_mut("children").and_then(|v| v.as_array_mut()) {
         let taken = std::mem::take(children);
         let mut annotated = Vec::with_capacity(taken.len());
         for (idx, child) in taken.into_iter().enumerate() {
             annotated.push(annotate_node(
+                graph,
                 child,
                 adapter_instance,
                 overrides,
@@ -2986,6 +3322,275 @@ fn canonicalize_json(v: &serde_json::Value) -> String {
     }
 }
 
+/// Reserved dependency-query parameter carrying query options (§6.1 pushdown):
+/// `{ filter = { field = value }, sort = { { field = "f", desc = true } } | { "f" },
+/// page = { offset = 0, limit = 50 }, fields = { "f", ... } }`. Options the target provider
+/// declares (`pushdown = { ... }`) are passed to it under this key; the host applies the rest
+/// to the provider's result, so a consumer gets the same rows either way.
+pub const PUSHDOWN_PARAM: &str = "_pushdown";
+
+/// Parsed query options of one dependency query.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct QueryOptions {
+    filter: Option<serde_json::Map<String, serde_json::Value>>,
+    sort: Option<Vec<(String, bool)>>,
+    page: Option<(usize, Option<usize>)>,
+    fields: Option<Vec<String>>,
+}
+
+impl QueryOptions {
+    fn is_empty(&self) -> bool {
+        self.filter.is_none() && self.sort.is_none() && self.page.is_none() && self.fields.is_none()
+    }
+
+    fn parse(v: &serde_json::Value) -> Result<Self, String> {
+        let bad = |m: &str| format!("invalid {PUSHDOWN_PARAM}: {m}");
+        let Some(obj) = v.as_object() else {
+            return Err(bad("expected a table"));
+        };
+        let mut out = QueryOptions::default();
+        for (k, val) in obj {
+            match k.as_str() {
+                "filter" => {
+                    let f = val
+                        .as_object()
+                        .ok_or_else(|| bad("filter must map fields to values"))?;
+                    if !f.is_empty() {
+                        out.filter = Some(f.clone());
+                    }
+                }
+                "sort" => {
+                    let items = val.as_array().ok_or_else(|| bad("sort must be a list"))?;
+                    let mut keys = Vec::new();
+                    for item in items {
+                        match item {
+                            serde_json::Value::String(f) => keys.push((f.clone(), false)),
+                            serde_json::Value::Object(o) => {
+                                let f = o
+                                    .get("field")
+                                    .and_then(|x| x.as_str())
+                                    .ok_or_else(|| bad("sort entries need a 'field'"))?;
+                                let desc = o.get("desc").and_then(|x| x.as_bool()).unwrap_or(false);
+                                keys.push((f.to_string(), desc));
+                            }
+                            _ => return Err(bad("sort entries must be names or { field, desc }")),
+                        }
+                    }
+                    if !keys.is_empty() {
+                        out.sort = Some(keys);
+                    }
+                }
+                "page" => {
+                    let p = val
+                        .as_object()
+                        .ok_or_else(|| bad("page must be { offset, limit }"))?;
+                    let num = |name: &str| -> Result<Option<usize>, String> {
+                        match p.get(name) {
+                            None | Some(serde_json::Value::Null) => Ok(None),
+                            Some(x) => x.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
+                                bad(&format!("page.{name} must be a non-negative integer"))
+                            }),
+                        }
+                    };
+                    out.page = Some((num("offset")?.unwrap_or(0), num("limit")?));
+                }
+                "fields" => {
+                    let items = val
+                        .as_array()
+                        .ok_or_else(|| bad("fields must be a list of names"))?;
+                    let names = items
+                        .iter()
+                        .map(|x| x.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| bad("fields must be a list of names"))?;
+                    out.fields = Some(names);
+                }
+                other => return Err(bad(&format!("unknown option '{other}'"))),
+            }
+        }
+        Ok(out)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut o = serde_json::Map::new();
+        if let Some(f) = &self.filter {
+            o.insert("filter".into(), serde_json::Value::Object(f.clone()));
+        }
+        if let Some(s) = &self.sort {
+            o.insert(
+                "sort".into(),
+                serde_json::Value::Array(
+                    s.iter()
+                        .map(|(f, d)| serde_json::json!({ "field": f, "desc": d }))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some((offset, limit)) = self.page {
+            o.insert(
+                "page".into(),
+                serde_json::json!({ "offset": offset, "limit": limit }),
+            );
+        }
+        if let Some(f) = &self.fields {
+            o.insert("fields".into(), serde_json::json!(f));
+        }
+        serde_json::Value::Object(o)
+    }
+
+    /// Split into the options the provider evaluates (declared in `spec`) and the ones the host
+    /// applies. Options compose in the fixed order filter, sort, page, projection: once a stage
+    /// stays on the host, every later stage does too, so pushing never changes the result.
+    fn split(&self, spec: &dash_luau::manifest::PushdownSpec) -> (QueryOptions, QueryOptions) {
+        let mut pushed = QueryOptions::default();
+        let mut host = QueryOptions::default();
+        let mut chain = true;
+        if let Some(f) = &self.filter {
+            chain = f.keys().all(|k| spec.filter.iter().any(|d| d == k));
+            if chain {
+                pushed.filter = Some(f.clone());
+            } else {
+                host.filter = Some(f.clone());
+            }
+        }
+        if let Some(s) = &self.sort {
+            chain = chain && s.iter().all(|(k, _)| spec.sort.iter().any(|d| d == k));
+            if chain {
+                pushed.sort = Some(s.clone());
+            } else {
+                host.sort = Some(s.clone());
+            }
+        }
+        if let Some(p) = self.page {
+            chain = chain && spec.page;
+            if chain {
+                pushed.page = Some(p);
+            } else {
+                host.page = Some(p);
+            }
+        }
+        if let Some(f) = &self.fields {
+            chain = chain && spec.projection;
+            if chain {
+                pushed.fields = Some(f.clone());
+            } else {
+                host.fields = Some(f.clone());
+            }
+        }
+        (pushed, host)
+    }
+
+    /// Apply the options on the host, in order filter, sort, page, projection.
+    fn apply(&self, value: serde_json::Value) -> Result<serde_json::Value, String> {
+        if self.is_empty() {
+            return Ok(value);
+        }
+        let serde_json::Value::Array(mut rows) = value else {
+            return Err(format!(
+                "{PUSHDOWN_PARAM} options require a list result from the provider"
+            ));
+        };
+        if let Some(f) = &self.filter {
+            rows.retain(|r| f.iter().all(|(k, v)| r.get(k) == Some(v)));
+        }
+        if let Some(keys) = &self.sort {
+            rows.sort_by(|a, b| {
+                for (k, desc) in keys {
+                    let ord = cmp_json(
+                        a.get(k).unwrap_or(&serde_json::Value::Null),
+                        b.get(k).unwrap_or(&serde_json::Value::Null),
+                    );
+                    let ord = if *desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if let Some((offset, limit)) = self.page {
+            let end = limit.map_or(rows.len(), |l| offset.saturating_add(l).min(rows.len()));
+            rows = if offset >= rows.len() {
+                Vec::new()
+            } else {
+                rows[offset..end].to_vec()
+            };
+        }
+        if let Some(fields) = &self.fields {
+            for r in rows.iter_mut() {
+                if let Some(o) = r.as_object_mut() {
+                    o.retain(|k, _| fields.iter().any(|f| f == k));
+                }
+            }
+        }
+        Ok(serde_json::Value::Array(rows))
+    }
+}
+
+/// Total order over JSON scalars used by host-side sorting: null < bool < number < string <
+/// other; values of one kind compare naturally.
+fn cmp_json(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value as V;
+    fn rank(v: &V) -> u8 {
+        match v {
+            V::Null => 0,
+            V::Bool(_) => 1,
+            V::Number(_) => 2,
+            V::String(_) => 3,
+            _ => 4,
+        }
+    }
+    match (a, b) {
+        (V::Bool(x), V::Bool(y)) => x.cmp(y),
+        (V::Number(x), V::Number(y)) => x
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&y.as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (V::String(x), V::String(y)) => x.cmp(y),
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// Comparable identity of a batch key / row key value.
+fn batch_key_repr(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+type BatchWaiter = (
+    Vec<serde_json::Value>,
+    tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+);
+
+/// Dependency queries of one execution waiting to be merged into one batched query (§6.1).
+#[derive(Default)]
+struct BatchSlot {
+    keys: Vec<serde_json::Value>,
+    seen: HashSet<String>,
+    waiters: Vec<BatchWaiter>,
+}
+
+type BatchMap = Arc<Mutex<HashMap<String, BatchSlot>>>;
+
+/// Removes a batch group if its leader is dropped before dispatching it, so followers observe a
+/// closed channel instead of waiting forever.
+struct BatchLeaderGuard {
+    map: BatchMap,
+    group: String,
+    armed: bool,
+}
+
+impl Drop for BatchLeaderGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.map.lock().unwrap().remove(&self.group);
+        }
+    }
+}
+
 pub(crate) struct EngineHostBridge {
     pub engine: QueryEngine,
     pub graph: Arc<ConfiguredGraph>,
@@ -3002,34 +3607,42 @@ pub(crate) struct EngineHostBridge {
     /// Dashboard being rendered; Dashboard State reads resolve against it only.
     pub dashboard_id: Option<String>,
     pub operation: Option<String>,
-    /// Deadline of this execution; bounds every nested `ctx:await` on host calls (§6.3).
+    /// Fallback deadline of this execution (the Instance's effective budget, §2.1 `[resources]`)
+    /// for host awaits polled outside the VM's own deadline scope. Inside a Luau invocation the
+    /// VM's deadline (task-local, set after admission) bounds every nested `ctx:await` (§6.3).
     pub deadline: Instant,
     cancel: CancelSignal,
+    /// Set when a possibly side-effecting HTTP request of this execution ended without a known
+    /// outcome (abandoned in flight, or the broker reported `UNKNOWN_OUTCOME`), so the connector
+    /// invocation reports `unknown` even if the handler swallowed the error (§9.1).
+    outcome_unknown: Arc<AtomicBool>,
+    /// Dependency queries of this execution waiting to be merged by batch-capable providers.
+    batches: BatchMap,
 }
 
 impl EngineHostBridge {
     fn wait_ctx(&self) -> WaitCtx {
         WaitCtx {
-            deadline: Some(self.deadline),
+            deadline: Some(dash_luau::current_execution_deadline().unwrap_or(self.deadline)),
             cancel: Some(self.cancel.clone()),
         }
     }
 }
 
-#[async_trait]
-impl HostBridge for EngineHostBridge {
-    async fn query_input(
+/// Safe HTTP methods have no upstream side effect, so abandoning one never makes an outcome
+/// uncertain.
+fn is_safe_http_method(method_upper: &str) -> bool {
+    matches!(method_upper, "GET" | "HEAD" | "OPTIONS")
+}
+
+impl EngineHostBridge {
+    /// Run one dependency query against `target_id` under this execution's Generation,
+    /// deadline and cancellation, recording the dependency edge (also when it fails).
+    async fn query_dependency(
         &self,
-        input_name: &str,
+        target_id: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
-            format!(
-                "input '{input_name}' not bound on '{}'",
-                self.caller_inst.id
-            )
-        })?;
-
         let result = self
             .engine
             .query_inner(
@@ -3083,6 +3696,150 @@ impl HostBridge for EngineHostBridge {
                 Err(e)
             }
         }
+    }
+
+    /// §6.1 batching: concurrent dependency queries of this execution (e.g. `ctx:await_all`)
+    /// to a batch-capable provider that differ only in its list parameter are merged into one
+    /// query over the union of the lists; each caller receives the rows whose `key_field` is
+    /// one of its own keys.
+    async fn query_batched(
+        &self,
+        target_id: &str,
+        spec: &dash_luau::manifest::BatchSpec,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let Some(my_keys) = params.get(&spec.param).and_then(|v| v.as_array()).cloned() else {
+            return self.query_dependency(target_id, params).await;
+        };
+        let mut base = params.clone();
+        if let Some(o) = base.as_object_mut() {
+            o.remove(&spec.param);
+        }
+        let group = format!("{target_id}\u{1f}{}", canonicalize_json(&base));
+        let fits = |n: usize| spec.max_keys.is_none_or(|m| n <= m);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // `None`: the batch would exceed `max_keys`, so this query runs on its own.
+        let role: Option<bool> = {
+            let mut map = self.batches.lock().unwrap();
+            match map.get_mut(&group) {
+                Some(slot) => {
+                    let new: Vec<&serde_json::Value> = my_keys
+                        .iter()
+                        .filter(|k| !slot.seen.contains(&batch_key_repr(k)))
+                        .collect();
+                    if fits(slot.keys.len() + new.len()) {
+                        for k in new {
+                            slot.seen.insert(batch_key_repr(k));
+                            slot.keys.push(k.clone());
+                        }
+                        slot.waiters.push((my_keys.clone(), tx));
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    let mut slot = BatchSlot::default();
+                    for k in &my_keys {
+                        if slot.seen.insert(batch_key_repr(k)) {
+                            slot.keys.push(k.clone());
+                        }
+                    }
+                    if fits(slot.keys.len()) {
+                        slot.waiters.push((my_keys.clone(), tx));
+                        map.insert(group.clone(), slot);
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        let Some(leader) = role else {
+            return self.query_dependency(target_id, params).await;
+        };
+        if leader {
+            let mut guard = BatchLeaderGuard {
+                map: Arc::clone(&self.batches),
+                group: group.clone(),
+                armed: true,
+            };
+            // One scheduler turn: sibling awaits of this execution join the batch meanwhile.
+            tokio::task::yield_now().await;
+            let slot = self.batches.lock().unwrap().remove(&group);
+            guard.armed = false;
+            if let Some(slot) = slot {
+                let mut merged = base;
+                if let Some(o) = merged.as_object_mut() {
+                    o.insert(spec.param.clone(), serde_json::Value::Array(slot.keys));
+                }
+                let res = self.query_dependency(target_id, merged).await;
+                for (keys, tx) in slot.waiters {
+                    let wanted: HashSet<String> = keys.iter().map(batch_key_repr).collect();
+                    let part = res.clone().and_then(|v| match v {
+                        serde_json::Value::Array(rows) => Ok(serde_json::Value::Array(
+                            rows.into_iter()
+                                .filter(|r| {
+                                    r.get(&spec.key_field)
+                                        .is_some_and(|k| wanted.contains(&batch_key_repr(k)))
+                                })
+                                .collect(),
+                        )),
+                        _ => Err(format!(
+                            "batch-capable provider '{target_id}' must return a list"
+                        )),
+                    });
+                    let _ = tx.send(part);
+                }
+            }
+        }
+        match wait_bounded(rx, &self.wait_ctx()).await? {
+            Ok(r) => r,
+            Err(_) => Err("batched dependency query was abandoned".into()),
+        }
+    }
+}
+
+#[async_trait]
+impl HostBridge for EngineHostBridge {
+    async fn query_input(
+        &self,
+        input_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
+            format!(
+                "input '{input_name}' not bound on '{}'",
+                self.caller_inst.id
+            )
+        })?;
+        let mut params = params;
+        let options = match params
+            .as_object_mut()
+            .and_then(|o| o.remove(PUSHDOWN_PARAM))
+        {
+            Some(v) => QueryOptions::parse(&v)?,
+            None => QueryOptions::default(),
+        };
+        let caps = self
+            .graph
+            .instances
+            .get(target_id)
+            .and_then(|i| self.graph.definitions.get(&i.definition))
+            .map(|d| d.manifest.query_capabilities.clone())
+            .unwrap_or_default();
+        // Provider-declared options go to the source; the rest are applied here (§6.1).
+        let (pushed, host) = options.split(&caps.pushdown);
+        if !pushed.is_empty() {
+            if let Some(o) = params.as_object_mut() {
+                o.insert(PUSHDOWN_PARAM.into(), pushed.to_json());
+            }
+        }
+        let value = match &caps.batch {
+            Some(b) if options.is_empty() => self.query_batched(target_id, b, params).await?,
+            _ => self.query_dependency(target_id, params).await?,
+        };
+        host.apply(value)
     }
 
     async fn call_input(
@@ -3144,6 +3901,18 @@ impl HostBridge for EngineHostBridge {
     }
 
     async fn http_request(&self, req: HttpHostRequest) -> Result<HttpHostResponse, String> {
+        let method = req.method.to_ascii_uppercase();
+        let destination = url::Url::parse(&req.url)
+            .map(|u| {
+                format!(
+                    "{}://{}:{}{}",
+                    u.scheme(),
+                    u.host_str().unwrap_or(""),
+                    u.port_or_known_default().unwrap_or(0),
+                    u.path()
+                )
+            })
+            .unwrap_or_else(|_| "<invalid url>".into());
         let call = self.engine.http.execute_traced(
             &self.principal,
             &self.caller_inst,
@@ -3152,9 +3921,45 @@ impl HostBridge for EngineHostBridge {
             req,
             Some(&self.trace_id),
         );
-        wait_bounded(call, &self.wait_ctx())
-            .await?
-            .map_err(|e| e.to_string())
+        match wait_bounded(call, &self.wait_ctx()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if crate::actions::is_unknown_outcome_error(&msg) {
+                    self.outcome_unknown.store(true, Ordering::SeqCst);
+                }
+                Err(msg)
+            }
+            // The broker future was dropped (deadline or cancellation): it writes no audit of its
+            // own, and a non-safe request may already have reached the upstream (§9.1).
+            Err(wait_err) => {
+                let unsafe_method = !is_safe_http_method(&method);
+                if unsafe_method {
+                    self.outcome_unknown.store(true, Ordering::SeqCst);
+                }
+                let _ = self.engine.store.append_audit(
+                    &self.principal.id,
+                    self.principal.kind.as_str(),
+                    "http.request",
+                    &self.caller_inst.id,
+                    if unsafe_method { "unknown" } else { "error" },
+                    serde_json::json!({
+                        "operation": self.operation,
+                        "method": method,
+                        "destination": destination,
+                        "error": format!("abandoned in flight: {wait_err}"),
+                    }),
+                );
+                Err(if unsafe_method {
+                    format!(
+                        "{}: {method} request abandoned in flight ({wait_err}); it may have reached the upstream",
+                        crate::actions::UNKNOWN_OUTCOME_CODE
+                    )
+                } else {
+                    wait_err
+                })
+            }
+        }
     }
 
     async fn emit_event(
@@ -3202,9 +4007,10 @@ impl HostBridge for EngineHostBridge {
             let dashboard_id = self.dashboard_id.as_deref().ok_or_else(|| {
                 "dashboard_state is only readable while rendering a Dashboard".to_string()
             })?;
+            // Deny by default (§4.1, §20): an Adapter reads only the keys it declares, also
+            // when it declares none, exactly as in Request handling (actions.rs).
             let declared = &self.caller_def.manifest.dashboard_state_reads;
             if self.caller_def.manifest.category == DefinitionCategory::Adapter
-                && !declared.is_empty()
                 && !declared.iter().any(|k| k == key)
             {
                 return Err(format!(
@@ -3242,6 +4048,15 @@ impl HostBridge for EngineHostBridge {
             return Err("adapters hold no writable state (ADR-0001)".into());
         }
         let owner = self.caller_inst.id.clone();
+        if scope == "instance" {
+            // Declared schema version, type and size limit of the Definition (§8).
+            return self
+                .engine
+                .state
+                .set_instance_state(&self.graph, &owner, key, value)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
         self.engine
             .state
             .set(scope, &owner, key, 1, self.graph.generation_id, value, None)
@@ -3275,6 +4090,102 @@ impl HostBridge for EngineHostBridge {
     async fn mock_state_set(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
         let namespaced = format!("{}:{key}", self.caller_def.manifest.id);
         self.engine.mock_kv.insert(namespaced, value);
+        Ok(())
+    }
+
+    async fn push_snapshot(
+        &self,
+        params: serde_json::Value,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.check_push_allowed(&params)?;
+        let mut value = value;
+        if let Some(out_schema) = &self.caller_def.manifest.output {
+            out_schema.normalize_empty_lists(&mut value);
+            out_schema.validate_value(&value).map_err(|e| {
+                format!(
+                    "output contract violation on pushed snapshot of '{}': {e}",
+                    self.caller_inst.id
+                )
+            })?;
+        }
+        let env =
+            self.engine
+                .push_query_value(&self.caller_inst.id, &params, &self.principal, value)?;
+        // A pushed snapshot is a new baseline for provider sequences.
+        self.engine
+            .signals
+            .source_sequences()
+            .reset(&env.query_key, None);
+        Ok(serde_json::json!({ "outcome": "applied", "version": env.version }))
+    }
+
+    async fn push_delta(
+        &self,
+        params: serde_json::Value,
+        source_sequence: u64,
+        ops: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use crate::signal::ProviderDeltaOutcome;
+        self.check_push_allowed(&params)?;
+        let ops: Vec<crate::signal::DeltaOp> =
+            serde_json::from_value(ops).map_err(|e| format!("ctx:push_delta: invalid ops: {e}"))?;
+        let step = self.engine.provider_delta_step(
+            &self.caller_inst.id,
+            &params,
+            &self.principal,
+            source_sequence,
+            ops,
+        )?;
+        let step = match step {
+            DeltaStep::Done(outcome) => Ok(*outcome),
+            DeltaStep::NeedsResync(reason) => Err(reason),
+        };
+        Ok(match step {
+            Ok(ProviderDeltaOutcome::Applied(env)) => serde_json::json!({
+                "outcome": "applied",
+                "version": env.version,
+                "base_version": env.base_version,
+            }),
+            Ok(ProviderDeltaOutcome::Duplicate { last_sequence }) => {
+                serde_json::json!({ "outcome": "duplicate", "last_sequence": last_sequence })
+            }
+            Ok(ProviderDeltaOutcome::Resynced { reason, .. }) | Err(reason) => {
+                // The provider's own VM is busy running this hook: resynchronize from a fresh
+                // snapshot once it is free instead of waiting on it here.
+                let engine = self.engine.clone();
+                let instance_id = self.caller_inst.id.clone();
+                let principal = self.principal.clone();
+                tokio::spawn(async move {
+                    let _ = engine.query(&instance_id, params, &principal, true).await;
+                });
+                serde_json::json!({ "outcome": "resync_scheduled", "reason": reason })
+            }
+        })
+    }
+}
+
+impl EngineHostBridge {
+    /// Pushes are scoped to the calling data provider's own queries and require the Definition
+    /// to declare `updates.push` (§6.1).
+    fn check_push_allowed(&self, params: &serde_json::Value) -> Result<(), String> {
+        if self.caller_def.manifest.category != DefinitionCategory::DataProvider {
+            return Err("only data providers push query updates (§6.1)".into());
+        }
+        if !self.caller_def.manifest.updates.push {
+            return Err(format!(
+                "definition '{}' does not declare push updates (updates.push)",
+                self.caller_def.manifest.id
+            ));
+        }
+        if let Some(q) = &self.caller_def.manifest.query {
+            q.validate_value(params).map_err(|e| {
+                format!(
+                    "invalid query parameters for push on '{}': {e}",
+                    self.caller_inst.id
+                )
+            })?;
+        }
         Ok(())
     }
 }
@@ -4307,7 +5218,15 @@ return R
             "layout_override": {"w": 99},
             "children": [{ "key": "t", "widget_id": "spoofed" }, {}, {}],
         });
-        let out = annotate_widget_ids(tree, "a", &overrides, &mut owners, &mut diags).unwrap();
+        let out = annotate_widget_ids(
+            &ConfiguredGraph::default(),
+            tree,
+            "a",
+            &overrides,
+            &mut owners,
+            &mut diags,
+        )
+        .unwrap();
         let mut got = Vec::new();
         ids(&out, &mut got);
         assert_eq!(got, vec!["a_root", "a_t", "a_root/1", "a_root/2"]);
@@ -4323,13 +5242,21 @@ return R
     fn duplicate_widget_keys_are_render_errors() {
         let overrides = BTreeMap::new();
         let dup = json!({ "key": "root", "children": [{ "key": "x" }, { "key": "x" }] });
-        let err = annotate_widget_ids(dup, "a", &overrides, &mut HashMap::new(), &mut Vec::new())
-            .unwrap_err();
+        let err = annotate_widget_ids(
+            &ConfiguredGraph::default(),
+            dup,
+            "a",
+            &overrides,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(err.starts_with("DUPLICATE_WIDGET_KEY"));
 
         // Ambiguous `_` joins across Adapters of one dashboard are detected, not merged.
         let mut owners = HashMap::new();
         annotate_widget_ids(
+            &ConfiguredGraph::default(),
             json!({ "key": "b_c" }),
             "a",
             &overrides,
@@ -4338,6 +5265,7 @@ return R
         )
         .unwrap();
         let err = annotate_widget_ids(
+            &ConfiguredGraph::default(),
             json!({ "key": "c" }),
             "a_b",
             &overrides,
@@ -4353,10 +5281,24 @@ return R
         let overrides = BTreeMap::new();
         let a = json!({ "key": "root", "children": [{ "key": "x" }, { "key": "y" }] });
         let b = json!({ "key": "root", "children": [{ "key": "y" }, { "key": "x" }] });
-        let ta =
-            annotate_widget_ids(a, "ad", &overrides, &mut HashMap::new(), &mut Vec::new()).unwrap();
-        let tb =
-            annotate_widget_ids(b, "ad", &overrides, &mut HashMap::new(), &mut Vec::new()).unwrap();
+        let ta = annotate_widget_ids(
+            &ConfiguredGraph::default(),
+            a,
+            "ad",
+            &overrides,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let tb = annotate_widget_ids(
+            &ConfiguredGraph::default(),
+            b,
+            "ad",
+            &overrides,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             ta["children"][0]["widget_id"],
             tb["children"][1]["widget_id"]
@@ -4600,5 +5542,1016 @@ return R
             !q.circuit_open("spin"),
             "rebuilt Instance starts with a closed breaker"
         );
+    }
+
+    // ---- F1b regression tests ----
+
+    /// Loopback HTTP server: every request is answered after `delay` (or never, when `None`).
+    async fn slow_http_server(delay: Option<Duration>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    match delay {
+                        Some(d) => {
+                            tokio::time::sleep(d).await;
+                            let body = r#"{"ok":true}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                        None => {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    const HTTP_CONN_DECL: &str = r#"
+local dash = require("dash")
+return dash.connector {
+    id = "t.http",
+    operations = {
+        fetch = { read_only = true },
+        merge = {},
+        merge_swallowing = {},
+    },
+}
+"#;
+    const HTTP_CONN_RT: &str = r#"
+local R = {}
+function R.call(ctx)
+    local method = (ctx.operation == "fetch") and "GET" or "POST"
+    local req = { method = method, url = ctx.config.url, body = { merge = true } }
+    if ctx.operation == "merge_swallowing" then
+        local ok = pcall(function() return ctx:await(ctx.http:request(req)) end)
+        error("upstream failed")
+    end
+    local r = ctx:await(ctx.http:request(req))
+    return { status = r.status }
+end
+return R
+"#;
+
+    /// Graph with an HTTP connector (`conn`), a data provider and an action using it, with
+    /// loopback egress allowed; the store gets a matching Administrator ceiling.
+    fn http_graph(url: &str, resources: crate::model::WorkspaceResources) -> ConfiguredGraph {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.workspace.network.allowed_hosts = vec!["127.0.0.1".into()];
+        g.workspace.network.allowed_methods = vec!["GET".into(), "POST".into()];
+        g.workspace.network.allow_loopback_for_tests = true;
+        g.workspace.resources = resources;
+        g.definitions
+            .insert("t.http".into(), load_def(HTTP_CONN_DECL, HTTP_CONN_RT));
+        g.instances.insert(
+            "conn".into(),
+            instance(
+                "conn",
+                DefinitionCategory::Connector,
+                "t.http",
+                &[],
+                json!({ "url": url }),
+            ),
+        );
+        g.definitions.insert(
+            "t.reader".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.data_provider { id = "t.reader", inputs = { c = dash.connector_ref("t.http") } }"#,
+                r#"local R = {}
+function R.query(ctx) return ctx:await(ctx.inputs.c:call("fetch", {})) end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "reader".into(),
+            instance(
+                "reader",
+                DefinitionCategory::DataProvider,
+                "t.reader",
+                &[("c", "conn")],
+                json!({}),
+            ),
+        );
+        g.definitions.insert(
+            "t.merge".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.action_provider { id = "t.merge", inputs = { c = dash.connector_ref("t.http") } }"#,
+                r#"local R = {}
+function R.execute(ctx) return ctx:await(ctx.inputs.c:call(ctx.args.op, {})) end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "merge".into(),
+            instance(
+                "merge",
+                DefinitionCategory::ActionProvider,
+                "t.merge",
+                &[("c", "conn")],
+                json!({}),
+            ),
+        );
+        g
+    }
+
+    fn http_engine(g: ConfiguredGraph, budget: ResourceBudget) -> RuntimeEngine {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .set_network_policy_ceiling(
+                json!({
+                    "allowed_hosts": ["127.0.0.1"],
+                    "allowed_methods": ["GET", "POST"],
+                    "allow_loopback_for_tests": true
+                }),
+                "admin",
+            )
+            .unwrap();
+        RuntimeEngine::new(g, store, budget).unwrap()
+    }
+
+    fn timeout_override(ms: u64) -> crate::model::WorkspaceResources {
+        crate::model::WorkspaceResources {
+            defaults: dash_luau::ResourceOverrides {
+                timeout_ms: Some(ms),
+                ..Default::default()
+            },
+            instances: BTreeMap::new(),
+        }
+    }
+
+    // engine-bridge-deadline-ignores-instance-budget / ACT-DEADLINE-1: host awaits are bounded
+    // by the Instance's effective budget (`[resources]`), not the pool's base budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_awaits_honor_raised_resource_timeouts() {
+        let addr = slow_http_server(Some(Duration::from_millis(700))).await;
+        let base = ResourceBudget {
+            wall_timeout: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let e = http_engine(
+            http_graph(&format!("http://{addr}/x"), timeout_override(5000)),
+            base,
+        );
+        let admin = Principal::administrator();
+        // Nested connector call of a data provider (query_input/call_input/http_request awaits).
+        let env = e
+            .queries
+            .query("reader", json!({}), &admin, false)
+            .await
+            .unwrap();
+        assert_eq!(env.value.unwrap()["status"], 200);
+        // The failure scenario: a slow merge with raised timeouts succeeds instead of being
+        // cut at the base budget and recorded as a retry-safe `failed`.
+        let rec = e
+            .actions
+            .invoke("merge", json!({ "op": "merge" }), &admin, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rec.status, "succeeded", "{:?}", rec.reason);
+    }
+
+    // ACT-DEADLINE-1: with raised `[resources]` timeouts, a write still in flight when the base
+    // budget elapses is no longer abandoned early as a plain (retry-safe) failure; when it is cut
+    // at the effective deadline the outcome is `unknown`, also when the connector swallows the
+    // host error and raises its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_in_flight_write_is_unknown_outcome() {
+        let addr = slow_http_server(None).await;
+        let base = ResourceBudget {
+            wall_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let e = http_engine(
+            http_graph(&format!("http://{addr}/merge"), timeout_override(1000)),
+            base,
+        );
+        let admin = Principal::administrator();
+        for op in ["merge", "merge_swallowing"] {
+            let started = Instant::now();
+            let err = e
+                .queries
+                .invoke_connector("conn", op, json!({}), &admin, "tr_t")
+                .await
+                .unwrap_err();
+            assert!(
+                started.elapsed() >= Duration::from_millis(900),
+                "{op}: the effective 1000ms budget applies, not the 200ms base"
+            );
+            assert!(
+                crate::actions::is_unknown_outcome_error(&err),
+                "{op}: {err}"
+            );
+            let rec = e
+                .actions
+                .invoke("merge", json!({ "op": op }), &admin, None, None)
+                .await
+                .unwrap();
+            assert_eq!(rec.status, "unknown", "{op}: {:?}", rec.reason);
+            assert!(!rec.retry_safe, "{op}: the key must not be released");
+        }
+    }
+
+    // ACT-DEADLINE-1: an HTTP await abandoned by the bridge (deadline or cancellation) reports a
+    // non-safe request as UNKNOWN_OUTCOME, flags the execution, and audits the request.
+    #[tokio::test]
+    async fn bridge_abandoning_a_write_reports_unknown_outcome_and_audits_it() {
+        let addr = slow_http_server(None).await;
+        let e = http_engine(
+            http_graph(&format!("http://{addr}/merge"), Default::default()),
+            ResourceBudget::default(),
+        );
+        let g = e.queries.graph();
+        let mk = |deadline: Instant| EngineHostBridge {
+            engine: e.queries.clone(),
+            graph: Arc::clone(&g),
+            caller_inst: g.instances["conn"].clone(),
+            caller_def: g.definitions["t.http"].clone(),
+            principal: Principal::administrator(),
+            trace_id: "tr_b".into(),
+            parent_query_key: None,
+            call_stack: Vec::new(),
+            recorded_deps: Arc::new(Mutex::new(BTreeSet::new())),
+            recorded_upstreams: Arc::new(Mutex::new(Vec::new())),
+            recorded_state: Arc::new(Mutex::new(BTreeMap::new())),
+            dashboard_id: None,
+            operation: Some("merge".into()),
+            deadline,
+            cancel: CancelSignal::new(),
+            outcome_unknown: Arc::new(AtomicBool::new(false)),
+            batches: BatchMap::default(),
+        };
+        let req = |method: &str| HttpHostRequest {
+            method: method.into(),
+            url: format!("http://{addr}/merge"),
+            headers: BTreeMap::new(),
+            body: None,
+            credential: None,
+        };
+        let post = mk(Instant::now() + Duration::from_millis(150));
+        let err = post.http_request(req("POST")).await.unwrap_err();
+        assert!(crate::actions::is_unknown_outcome_error(&err), "{err}");
+        assert!(post.outcome_unknown.load(Ordering::SeqCst));
+        let get = mk(Instant::now() + Duration::from_millis(150));
+        let err = get.http_request(req("GET")).await.unwrap_err();
+        assert!(!crate::actions::is_unknown_outcome_error(&err), "{err}");
+        assert!(!get.outcome_unknown.load(Ordering::SeqCst));
+        let audits = e.store.list_audits(200).unwrap();
+        let outcomes: Vec<&str> = audits
+            .iter()
+            .filter(|a| a.operation == "http.request" && a.target == "conn")
+            .map(|a| a.outcome.as_str())
+            .collect();
+        assert!(outcomes.contains(&"unknown"), "{outcomes:?}");
+        assert!(outcomes.contains(&"error"), "{outcomes:?}");
+    }
+
+    const TYPED_CONN_DECL: &str = r#"
+local dash = require("dash")
+return dash.connector {
+    id = "t.typed",
+    operations = {
+        get = {
+            read_only = true,
+            args = dash.object { id = dash.string(), bad = dash.optional(dash.boolean()) },
+            result = dash.object { id = dash.string(), n = dash.integer() },
+        },
+        write = {
+            args = dash.object { bad = dash.optional(dash.boolean()) },
+            result = dash.object { ok = dash.boolean() },
+        },
+        calls = { read_only = true },
+    },
+}
+"#;
+    const TYPED_CONN_RT: &str = r#"
+local calls = 0
+local R = {}
+function R.call(ctx)
+    if ctx.operation == "calls" then return { calls = calls } end
+    calls = calls + 1
+    if ctx.operation == "get" then
+        if ctx.args.bad then return { items = {} } end
+        return { id = ctx.args.id, n = 1 }
+    end
+    if ctx.args.bad then return { ok = "yes" } end
+    return { ok = true }
+end
+return R
+"#;
+
+    fn typed_graph() -> ConfiguredGraph {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions
+            .insert("t.typed".into(), load_def(TYPED_CONN_DECL, TYPED_CONN_RT));
+        g.instances.insert(
+            "typed".into(),
+            instance(
+                "typed",
+                DefinitionCategory::Connector,
+                "t.typed",
+                &[],
+                json!({}),
+            ),
+        );
+        g
+    }
+
+    // SC-3: connector operation args and results are validated at the boundary.
+    #[tokio::test]
+    async fn connector_operation_args_and_results_are_validated() {
+        let (e, q) = engine_for(typed_graph(), ResourceBudget::default());
+        let admin = Principal::administrator();
+        let call = |op: &'static str, args: serde_json::Value| {
+            let q = q.clone();
+            let admin = admin.clone();
+            async move { q.invoke_connector("typed", op, args, &admin, "tr").await }
+        };
+        let err = call("get", json!({ "id": 5 })).await.unwrap_err();
+        assert!(err.contains("invalid args"), "{err}");
+        assert_eq!(
+            call("calls", json!({})).await.unwrap()["calls"],
+            0,
+            "invalid args are rejected before the handler runs"
+        );
+        assert_eq!(call("get", json!({ "id": "a" })).await.unwrap()["n"], 1);
+
+        let err = call("get", json!({ "id": "a", "bad": true }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("output contract violation"), "{err}");
+        assert!(!crate::actions::is_unknown_outcome_error(&err), "{err}");
+
+        // A malformed result of a write cannot prove the write did not happen.
+        let err = call("write", json!({ "bad": true })).await.unwrap_err();
+        assert!(err.contains("output contract violation"), "{err}");
+        assert!(crate::actions::is_unknown_outcome_error(&err), "{err}");
+        drop(e);
+    }
+
+    // SC-3: a Mock standing in for a connector is held to the target's operation contract.
+    #[tokio::test]
+    async fn mock_results_are_validated_against_the_target_contract() {
+        let mut g = typed_graph();
+        g.is_preview = true;
+        g.definitions.insert(
+            "t.typed_mock".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.mock { id = "t.typed_mock", ["for"] = "t.typed", operations = { get = {} } }"#,
+                r#"local R = {}
+function R.call(ctx)
+    if ctx.args.id == "drift" then return { items = {} } end
+    return { id = ctx.args.id, n = 7 }
+end
+return R"#,
+            ),
+        );
+        let (_e, q) = engine_for(g, ResourceBudget::default());
+        let admin = Principal::administrator();
+        let ok = q
+            .invoke_connector("typed", "get", json!({ "id": "a" }), &admin, "tr")
+            .await
+            .unwrap();
+        assert_eq!(ok["n"], 7);
+        let err = q
+            .invoke_connector("typed", "get", json!({ "id": "drift" }), &admin, "tr")
+            .await
+            .unwrap_err();
+        assert!(err.contains("output contract violation"), "{err}");
+    }
+
+    fn widget_graph() -> ConfiguredGraph {
+        let mut g = list_and_count_graph();
+        g.definitions.insert(
+            "t.badge".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.widget_provider { id = "t.badge", asset = "index.html", props = dash.object { count = dash.integer() } }"#,
+                "",
+            ),
+        );
+        g
+    }
+
+    // SC-4: Adapter output is checked against widget provider contracts during render.
+    #[test]
+    fn invalid_widget_nodes_are_replaced_with_error_nodes() {
+        let g = widget_graph();
+        let tree = json!({
+            "key": "root",
+            "widget_type": "dash.container",
+            "children": [
+                { "key": "ok", "widget_type": "t.badge", "props": { "count": 3 } },
+                { "key": "bad", "widget_type": "t.badge", "props": { "count": "x" } },
+                { "key": "notwidget", "widget_type": "test.list", "props": {} },
+                { "key": "unknown", "widget_type": "t.missing" },
+            ]
+        });
+        let mut diags = Vec::new();
+        let out = annotate_widget_ids(
+            &g,
+            tree,
+            "adp",
+            &BTreeMap::new(),
+            &mut HashMap::new(),
+            &mut diags,
+        )
+        .unwrap();
+        let kids = out["children"].as_array().unwrap();
+        assert_eq!(kids[0]["widget_type"], "t.badge");
+        assert_eq!(kids[0]["props"]["count"], 3);
+        for (i, needle) in [
+            (1, "props"),
+            (2, "not a widget provider"),
+            (3, "unknown widget type"),
+        ] {
+            assert_eq!(kids[i]["widget_type"], "dash.text", "{:?}", kids[i]);
+            assert!(kids[i].get("props").unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains(needle));
+            assert!(kids[i]["render_error"]
+                .as_str()
+                .unwrap()
+                .starts_with("WIDGET_CONTRACT_VIOLATION"));
+            assert!(kids[i]["widget_id"].as_str().unwrap().starts_with("adp_"));
+        }
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.starts_with("WIDGET_CONTRACT_VIOLATION"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn render_reports_widget_contract_violations() {
+        let mut g = widget_graph();
+        g.definitions.insert(
+            "test.badges".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.adapter { id = "test.badges", inputs = { list = dash.data_ref("test.list") } }"#,
+                r#"local R = {}
+function R.render(ctx)
+    local rows = ctx:await(ctx.inputs.list:query({}))
+    return { key = "badge", widget_type = "t.badge", props = { count = "many" } }
+end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "badges".into(),
+            instance(
+                "badges",
+                DefinitionCategory::Adapter,
+                "test.badges",
+                &[("list", "inst_list")],
+                json!({}),
+            ),
+        );
+        g.dashboards.insert(
+            "d".into(),
+            DashboardDoc {
+                id: "d".into(),
+                title: "d".into(),
+                layout: "grid".into(),
+                adapters: vec![DashboardAdapterPlacement {
+                    adapter_instance: "badges".into(),
+                    area: "main".into(),
+                    query_params: json!({}),
+                }],
+                initial_state: BTreeMap::new(),
+                overrides: BTreeMap::new(),
+                state_schema: BTreeMap::new(),
+            },
+        );
+        let (_e, q) = engine_for(g, ResourceBudget::default());
+        let out = q
+            .render_dashboard("d", &Principal::administrator())
+            .await
+            .unwrap();
+        let tree = &out["adapters"][0]["tree"];
+        assert_eq!(tree["widget_type"], "dash.text");
+        assert_eq!(tree["widget_id"], "badges_badge");
+        assert!(out["adapters"][0]["diagnostics"][0]
+            .as_str()
+            .unwrap()
+            .contains("WIDGET_CONTRACT_VIOLATION"));
+    }
+
+    // SC-8: an Adapter that declares no dashboard_state_reads reads no Dashboard State.
+    #[tokio::test]
+    async fn adapter_without_declared_reads_cannot_read_dashboard_state() {
+        let (_e, q) = engine_for(
+            dashboards_graph("", "selected_repository"),
+            ResourceBudget::default(),
+        );
+        let err = q
+            .render_dashboard("alpha", &Principal::administrator())
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not declare"), "{err}");
+    }
+
+    // SC-12: shutdown cancellation stops running reads well before their wall timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_all_in_flight_stops_running_queries() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        provider(
+            &mut g,
+            "inst_spin",
+            "test.spin",
+            &[],
+            "local R = {}; function R.query(ctx) while true do end end; return R",
+        );
+        let budget = ResourceBudget {
+            wall_timeout: Duration::from_secs(30),
+            max_interrupts: u64::MAX,
+            ..Default::default()
+        };
+        let (_e, q) = engine_for(g, budget);
+        let q1 = q.clone();
+        let started = Instant::now();
+        let caller = tokio::spawn(async move {
+            q1.query("inst_spin", json!({}), &Principal::administrator(), false)
+                .await
+        });
+        while q.in_flight.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(q.cancel_all_in_flight(), 1);
+        let res = tokio::time::timeout(Duration::from_secs(10), caller)
+            .await
+            .expect("query must stop after cancellation")
+            .unwrap();
+        assert!(res.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    const PUSH_DECL: &str = r#"
+local dash = require("dash")
+return dash.data_provider { id = "test.pushy", updates = { subscribe = true, push = true } }
+"#;
+    const PUSH_RT: &str = r#"
+local R = {}
+function R.query(ctx) return { { id = "1", state = "open" } } end
+function R.subscribe(ctx)
+    local a = ctx:push_delta({ sequence = 1, ops = { { op = "update", key = "1", value = { id = "1", state = "merged" } } } })
+    local b = ctx:push_delta({ sequence = 1, ops = { { op = "delete", key = "1" } } })
+    local c = ctx:push_delta({ sequence = 2, ops = { { op = "insert", key = "2", value = { id = "2", state = "open" } } } })
+    if a.outcome ~= "applied" or b.outcome ~= "duplicate" or c.outcome ~= "applied" then
+        error("unexpected outcomes " .. a.outcome .. "/" .. b.outcome .. "/" .. c.outcome)
+    end
+    return true
+end
+return R
+"#;
+
+    // SC-6: provider subscribe hooks run for subscribed queries and push sequence-checked keyed
+    // deltas through ctx:push_delta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_hook_pushes_keyed_deltas() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions
+            .insert("test.pushy".into(), load_def(PUSH_DECL, PUSH_RT));
+        g.instances.insert(
+            "pushy".into(),
+            instance(
+                "pushy",
+                DefinitionCategory::DataProvider,
+                "test.pushy",
+                &[],
+                json!({}),
+            ),
+        );
+        let (e, q) = engine_for(g, ResourceBudget::default());
+        let admin = Principal::administrator();
+        let first = q.query("pushy", json!({}), &admin, false).await.unwrap();
+        assert!(
+            !q.provider_subscription_active(&first.query_key),
+            "no subscribers: no subscription"
+        );
+        let mut rx = e.signals.subscribe_stream(&first.query_key);
+        q.query("pushy", json!({}), &admin, false).await.unwrap();
+        assert!(q.provider_subscription_active(&first.query_key));
+
+        let mut deltas = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while deltas.len() < 2 {
+            let env = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("pushed deltas")
+                .unwrap();
+            if env.kind == crate::signal::EnvelopeKind::Delta {
+                deltas.push(env);
+            }
+        }
+        assert_eq!(deltas[0].source_sequence, Some(1));
+        assert_eq!(deltas[1].source_sequence, Some(2));
+        let now = q.query("pushy", json!({}), &admin, false).await.unwrap();
+        assert_eq!(
+            now.value.unwrap(),
+            json!([{ "id": "1", "state": "merged" }, { "id": "2", "state": "open" }])
+        );
+        // Shared: further queries do not start the hook again; exactly one run is recorded.
+        let runs = || {
+            e.telemetry
+                .recent_spans(50)
+                .iter()
+                .filter(|s| s.name == "subscribe:pushy")
+                .count()
+        };
+        for _ in 0..100 {
+            if runs() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        q.query("pushy", json!({}), &admin, false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runs(), 1);
+
+        // Reference count zero releases the subscription.
+        drop(rx);
+        let mut released = false;
+        for _ in 0..100 {
+            q.prune_idle();
+            if !q.provider_subscription_active(&first.query_key) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(released, "subscription released once unsubscribed");
+    }
+
+    // SC-6: `updates.subscribe` without a `subscribe` function keeps one shared, hook-less
+    // subscription per query (looked up once, not retried on every query).
+    #[tokio::test]
+    async fn subscribe_mode_without_hook_is_shared_without_retries() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions.insert(
+            "test.subonly".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.data_provider { id = "test.subonly", updates = { subscribe = true } }"#,
+                r#"local R = {}; function R.query(ctx) return {} end; return R"#,
+            ),
+        );
+        g.instances.insert(
+            "subonly".into(),
+            instance(
+                "subonly",
+                DefinitionCategory::DataProvider,
+                "test.subonly",
+                &[],
+                json!({}),
+            ),
+        );
+        let (e, q) = engine_for(g, ResourceBudget::default());
+        let admin = Principal::administrator();
+        let qk = q.resolve_query_key("subonly", &json!({}), &admin).unwrap();
+        let _rx = e.signals.subscribe_stream(&qk);
+        for _ in 0..3 {
+            q.query("subonly", json!({}), &admin, true).await.unwrap();
+        }
+        let spans = || {
+            e.telemetry
+                .recent_spans(50)
+                .into_iter()
+                .filter(|s| s.name == "subscribe:subonly")
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..100 {
+            if !spans().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let spans = spans();
+        assert_eq!(spans.len(), 1, "looked up once");
+        assert_eq!(spans[0].status, "ok");
+        assert!(q.provider_subscription_active(&qk));
+    }
+
+    // SC-6: pushing requires `updates.push` and is limited to data providers.
+    #[tokio::test]
+    async fn push_requires_declared_push_updates() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        provider(
+            &mut g,
+            "nopush",
+            "test.nopush",
+            &[],
+            r#"local R = {}
+function R.query(ctx)
+    ctx:push_snapshot({ value = {} })
+    return {}
+end
+return R"#,
+        );
+        let (_e, q) = engine_for(g, ResourceBudget::default());
+        let err = q
+            .query("nopush", json!({}), &Principal::administrator(), false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not declare push updates"), "{err}");
+    }
+
+    // SC-13: dependency-query options are pushed to providers that declare them and applied by
+    // the host otherwise, with identical results.
+    #[tokio::test]
+    async fn pushdown_options_are_pushed_when_declared_and_applied_by_host_otherwise() {
+        let rows_rt = |pushdown_aware: bool| {
+            format!(
+                r#"
+local ROWS = {{
+    {{ id = "a", state = "open", n = 3, title = "A" }},
+    {{ id = "b", state = "closed", n = 1, title = "B" }},
+    {{ id = "c", state = "open", n = 2, title = "C" }},
+    {{ id = "d", state = "open", n = 5, title = "D" }},
+}}
+local R = {{}}
+function R.query(ctx)
+    local pd = ctx.query._pushdown
+    if {pushdown_aware} and pd ~= nil then
+        local out = {{}}
+        for _, r in ipairs(ROWS) do
+            if pd.filter == nil or r.state == pd.filter.state then table.insert(out, r) end
+        end
+        table.sort(out, function(x, y) return x.n > y.n end)
+        local res = {{}}
+        for i = pd.page.offset + 1, math.min(#out, pd.page.offset + pd.page.limit) do
+            table.insert(res, {{ id = out[i].id, n = out[i].n, pushed = true }})
+        end
+        return res
+    end
+    return ROWS
+end
+return R
+"#
+            )
+        };
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        for (def_id, inst_id, decl_extra, aware) in [
+            (
+                "test.smart",
+                "smart",
+                r#", pushdown = { filter = { "state" }, sort = { "n" }, page = true, projection = true }"#,
+                true,
+            ),
+            ("test.plain", "plain", "", false),
+        ] {
+            g.definitions.insert(
+                def_id.into(),
+                load_def(
+                    &format!(
+                        "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"{def_id}\"{decl_extra} }}"
+                    ),
+                    &rows_rt(aware),
+                ),
+            );
+            g.instances.insert(
+                inst_id.into(),
+                instance(
+                    inst_id,
+                    DefinitionCategory::DataProvider,
+                    def_id,
+                    &[],
+                    json!({}),
+                ),
+            );
+        }
+        let consumer_rt = r#"local R = {}
+function R.query(ctx)
+    local opts = { filter = { state = "open" }, sort = { { field = "n", desc = true } }, page = { offset = 1, limit = 2 }, fields = { "id", "n" } }
+    local a = ctx:await(ctx.inputs.smart:query({ _pushdown = opts }))
+    local b = ctx:await(ctx.inputs.plain:query({ _pushdown = opts }))
+    return { smart = a, plain = b }
+end
+return R"#;
+        provider(
+            &mut g,
+            "consumer",
+            "test.consumer",
+            &[("smart", "smart"), ("plain", "plain")],
+            consumer_rt,
+        );
+        let (_e, q) = engine_for(g, ResourceBudget::default());
+        let out = q
+            .query("consumer", json!({}), &Principal::administrator(), false)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        // The declaring provider evaluated every stage itself (rows carry `pushed`).
+        assert_eq!(
+            out["smart"],
+            json!([{ "id": "a", "n": 3, "pushed": true }, { "id": "c", "n": 2, "pushed": true }])
+        );
+        // The plain provider returned everything; the host filtered, sorted, paged, projected.
+        assert_eq!(
+            out["plain"],
+            json!([{ "id": "a", "n": 3 }, { "id": "c", "n": 2 }])
+        );
+    }
+
+    #[test]
+    fn pushdown_split_keeps_stage_order() {
+        let opts = QueryOptions::parse(&json!({
+            "filter": { "state": "open" },
+            "sort": ["n"],
+            "page": { "offset": 0, "limit": 1 },
+        }))
+        .unwrap();
+        // Page is declared but filter is not: filtering stays on the host, so paging must too.
+        let spec = dash_luau::manifest::PushdownSpec {
+            page: true,
+            sort: vec!["n".into()],
+            ..Default::default()
+        };
+        let (pushed, host) = opts.split(&spec);
+        assert!(pushed.is_empty());
+        assert_eq!(host, opts);
+        assert!(QueryOptions::parse(&json!({ "bogus": 1 })).is_err());
+    }
+
+    // SC-13: concurrent dependency queries to a batch-capable provider are merged into one.
+    #[tokio::test]
+    async fn concurrent_dependency_queries_are_batched() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions.insert(
+            "test.issues".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.data_provider {
+    id = "test.issues",
+    query = dash.object { keys = dash.list(dash.string()) },
+    batch = { param = "keys", key_field = "key" },
+}"#,
+                r#"local runs = 0
+local R = {}
+function R.query(ctx)
+    runs = runs + 1
+    local out = {}
+    for _, k in ipairs(ctx.query.keys) do
+        table.insert(out, { key = k, runs = runs, batch = #ctx.query.keys })
+    end
+    return out
+end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "issues".into(),
+            instance(
+                "issues",
+                DefinitionCategory::DataProvider,
+                "test.issues",
+                &[],
+                json!({}),
+            ),
+        );
+        provider(
+            &mut g,
+            "linked",
+            "test.linked",
+            &[("issues", "issues")],
+            r#"local R = {}
+function R.query(ctx)
+    local res = ctx:await_all({
+        ctx.inputs.issues:query({ keys = { "A", "B" } }),
+        ctx.inputs.issues:query({ keys = { "B", "C" } }),
+        ctx.inputs.issues:query({ keys = { "D" } }),
+    })
+    return res
+end
+return R"#,
+        );
+        let (_e, q) = engine_for(g, ResourceBudget::default());
+        let out = q
+            .query("linked", json!({}), &Principal::administrator(), false)
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let keys = |i: usize| -> Vec<String> {
+            out[i]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(keys(0), vec!["A", "B"]);
+        assert_eq!(keys(1), vec!["B", "C"]);
+        assert_eq!(keys(2), vec!["D"]);
+        for i in 0..3 {
+            for r in out[i].as_array().unwrap() {
+                assert_eq!(r["runs"], 1, "one provider run served every caller");
+                assert_eq!(r["batch"], 4, "merged union of keys A, B, C, D");
+            }
+        }
+    }
+
+    // SC-7: Instance State writes follow the Definition's declaration.
+    #[tokio::test]
+    async fn instance_state_writes_follow_declarations() {
+        let mut g = ConfiguredGraph {
+            generation_id: 1,
+            ..Default::default()
+        };
+        g.definitions.insert(
+            "test.cursor".into(),
+            load_def(
+                r#"local dash = require("dash")
+return dash.data_provider {
+    id = "test.cursor",
+    state = { cursor = { schema_version = 2, type = "object", max_bytes = 64, migration = "reset" } },
+}"#,
+                r#"local R = {}
+function R.query(ctx)
+    if ctx.query.mode == "ok" then ctx:await(ctx.state:set("cursor", { page = 1 })) end
+    if ctx.query.mode == "type" then ctx:await(ctx.state:set("cursor", "2026-11-01")) end
+    if ctx.query.mode == "undeclared" then ctx:await(ctx.state:set("other", 1)) end
+    if ctx.query.mode == "big" then ctx:await(ctx.state:set("cursor", { pad = string.rep("x", 100) })) end
+    return {}
+end
+return R"#,
+            ),
+        );
+        g.instances.insert(
+            "cursor".into(),
+            instance(
+                "cursor",
+                DefinitionCategory::DataProvider,
+                "test.cursor",
+                &[],
+                json!({}),
+            ),
+        );
+        let (e, q) = engine_for(g, ResourceBudget::default());
+        let admin = Principal::administrator();
+        q.query("cursor", json!({ "mode": "ok" }), &admin, false)
+            .await
+            .unwrap();
+        let rec = e
+            .state
+            .get("instance", "cursor", "cursor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.schema_version, 2, "declared schema version is stamped");
+        for (mode, needle) in [
+            ("type", "expects type 'object'"),
+            ("undeclared", "not declared"),
+            ("big", "limit is 64"),
+        ] {
+            let err = q
+                .query("cursor", json!({ "mode": mode }), &admin, false)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{mode}: {err}");
+        }
     }
 }

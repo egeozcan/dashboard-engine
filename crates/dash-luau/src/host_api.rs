@@ -98,6 +98,30 @@ pub trait HostBridge: Send + Sync {
     async fn mock_state_set(&self, _key: &str, _value: serde_json::Value) -> Result<(), String> {
         Ok(())
     }
+
+    /// Provider push (§6.1 push hook): replace the cached result of the calling data provider's
+    /// own query `params` with a new snapshot. Returns `{ outcome, version }`. Only data
+    /// providers that declare `updates.push` may push; the default bridge has no query graph.
+    async fn push_snapshot(
+        &self,
+        _params: serde_json::Value,
+        _value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("provider push is not available in this context".into())
+    }
+
+    /// Provider keyed delta (§6.2): `ops` is a list of `{ op = "insert" | "update" | "delete",
+    /// key, value? }` applied to the calling data provider's own query `params`, ordered by the
+    /// provider's monotonic source-local `source_sequence`. Returns `{ outcome, ... }` where
+    /// outcome is `applied`, `duplicate` or `resync_scheduled`.
+    async fn push_delta(
+        &self,
+        _params: serde_json::Value,
+        _source_sequence: u64,
+        _ops: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("provider push is not available in this context".into())
+    }
 }
 
 /// Default no-op host bridge for pure unit execution.
@@ -317,6 +341,21 @@ impl HostBridge for CallTrackingBridge {
     }
     async fn mock_state_set(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
         self.inner.mock_state_set(key, value).await
+    }
+    async fn push_snapshot(
+        &self,
+        params: serde_json::Value,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.push_snapshot(params, value).await
+    }
+    async fn push_delta(
+        &self,
+        params: serde_json::Value,
+        source_sequence: u64,
+        ops: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.push_delta(params, source_sequence, ops).await
     }
 }
 
@@ -592,6 +631,63 @@ impl UserData for LuaContext {
             },
         );
 
+        // §6.1/§6.2 push hooks: a data provider declaring `updates.push` pushes snapshots or
+        // keyed deltas for its own query (`params` defaults to the current `ctx.query`).
+        methods.add_async_method("push_snapshot", |lua, this, spec: Table| async move {
+            if this.cfg.category != DefinitionCategory::DataProvider {
+                return Err(mlua::Error::runtime(
+                    "ctx:push_snapshot is only available to data providers (§6.1)",
+                ));
+            }
+            let value: serde_json::Value = match spec.get::<Value>("value")? {
+                Value::Nil => serde_json::Value::Null,
+                v => lua.from_value(v)?,
+            };
+            let params = push_params(&lua, &spec, &this.cfg.payload)?;
+            let out = this
+                .cfg
+                .bridge
+                .push_snapshot(params, value)
+                .await
+                .map_err(mlua::Error::runtime)?;
+            lua.to_value(&out)
+        });
+
+        methods.add_async_method("push_delta", |lua, this, spec: Table| async move {
+            if this.cfg.category != DefinitionCategory::DataProvider {
+                return Err(mlua::Error::runtime(
+                    "ctx:push_delta is only available to data providers (§6.2)",
+                ));
+            }
+            let sequence = match spec.get::<Value>("sequence")? {
+                Value::Integer(n) if n >= 0 => n as u64,
+                Value::Number(n) if n >= 0.0 && n.fract() == 0.0 => n as u64,
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "ctx:push_delta requires a non-negative integer 'sequence', got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            let ops: serde_json::Value = match spec.get::<Value>("ops")? {
+                Value::Table(t) if t.raw_len() == 0 => serde_json::Value::Array(Vec::new()),
+                Value::Table(t) => lua.from_value(Value::Table(t))?,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "ctx:push_delta requires an 'ops' list",
+                    ))
+                }
+            };
+            let params = push_params(&lua, &spec, &this.cfg.payload)?;
+            let out = this
+                .cfg
+                .bridge
+                .push_delta(params, sequence, ops)
+                .await
+                .map_err(mlua::Error::runtime)?;
+            lua.to_value(&out)
+        });
+
         methods.add_async_method("fixture", |lua, this, path: String| async move {
             if this.cfg.category != DefinitionCategory::Mock {
                 return Err(mlua::Error::runtime(
@@ -643,6 +739,21 @@ impl UserData for LuaContext {
                 Ok(())
             },
         );
+    }
+}
+
+/// `params` of a push call: explicit `spec.params`, else the executing query's parameters.
+fn push_params(
+    lua: &Lua,
+    spec: &Table,
+    current: &serde_json::Value,
+) -> mlua::Result<serde_json::Value> {
+    match spec.get::<Value>("params")? {
+        Value::Nil => Ok(current.clone()),
+        Value::Table(t) if t.clone().pairs::<Value, Value>().next().is_none() => {
+            Ok(serde_json::json!({}))
+        }
+        v => lua.from_value(v),
     }
 }
 
