@@ -816,70 +816,7 @@ async fn ac14_git_transaction_single_commit_unsynced_retry_and_crash_recovery() 
     // journal stage are covered in `ac_11_14.rs`.
 }
 
-#[tokio::test]
-async fn ac15_sandbox_denials_and_runaway_isolation() {
-    let tmp = TempDir::new().unwrap();
-    let (services, addr, h) = boot_http_app(&tmp, vec![]).await;
-    let admin = Principal::administrator();
-
-    let draft = services.draft_begin(&admin).await.unwrap();
-    services
-        .definition_upsert_in_draft(
-            &draft.draft_id,
-            "engineering",
-            "runaway",
-            "local dash = require(\"dash\"); return dash.data_provider { id = \"engineering.runaway\", handler = \"query\" }",
-            Some("local R = {}; function R.query(ctx) while true do end end; return R"),
-            None,
-            &admin,
-        )
-        .unwrap();
-    services
-        .instance_upsert_in_draft(
-            &draft.draft_id,
-            &InstanceConfig {
-                id: "runaway_inst".into(),
-                category: DefinitionCategory::DataProvider,
-                definition: "engineering.runaway".into(),
-                inputs: BTreeMap::new(),
-                config: json!({}),
-                secrets: BTreeMap::new(),
-                capabilities: vec![],
-                run_as: None,
-                enabled: None,
-            },
-            &admin,
-        )
-        .unwrap();
-    services
-        .draft_activate(&draft.draft_id, &admin)
-        .await
-        .unwrap();
-
-    let eng = services.engine().clone();
-    let loop_task = tokio::spawn(async move {
-        eng.queries
-            .query(
-                "runaway_inst",
-                json!({}),
-                &Principal::administrator(),
-                false,
-            )
-            .await
-    });
-
-    // HTTP /healthz remains fast (< 50ms) while Luau infinite loop spins on blocking worker pool!
-    let t0 = Instant::now();
-    let hz = reqwest::get(format!("http://{addr}/healthz"))
-        .await
-        .unwrap();
-    assert_eq!(hz.status(), 200);
-    assert!(t0.elapsed() < Duration::from_millis(100));
-
-    let res = loop_task.await.unwrap();
-    assert!(res.is_err());
-    h.abort();
-}
+// Criterion 15 (Sandbox): see `ac_15_17.rs` (escape probes, network policy, runaway isolation).
 
 #[tokio::test]
 async fn ac16_tailnet_loopback_auth_csrf_origin_and_trusted_proxy() {
@@ -929,48 +866,8 @@ async fn ac16_tailnet_loopback_auth_csrf_origin_and_trusted_proxy() {
     h.abort();
 }
 
-#[tokio::test]
-async fn ac17_benchmark_gates_sanity() {
-    let t0 = Instant::now();
-    let tmp = TempDir::new().unwrap();
-    let (services, addr, h) = boot_http_app(&tmp, vec![]).await;
-    let hz = reqwest::get(format!("http://{addr}/healthz"))
-        .await
-        .unwrap();
-    assert_eq!(hz.status(), 200);
-    assert!(
-        t0.elapsed() < Duration::from_secs(2),
-        "startup took {:?}",
-        t0.elapsed()
-    );
-
-    // Warm cache query under 5ms
-    let admin = Principal::administrator();
-    let mut g = (*services.graph()).clone();
-    g.is_preview = true;
-    services.engine().graph.store(std::sync::Arc::new(g));
-    let _ = services
-        .provider_query(
-            "open_prs",
-            json!({"repository": "acme/platform", "state": "open"}),
-            &admin,
-            false,
-        )
-        .await
-        .unwrap();
-    let q0 = Instant::now();
-    let _ = services
-        .provider_query(
-            "open_prs",
-            json!({"repository": "acme/platform", "state": "open"}),
-            &admin,
-            false,
-        )
-        .await
-        .unwrap();
-    assert!(q0.elapsed() < Duration::from_millis(5));
-    h.abort();
-}
+// Criterion 17 (Benchmark gates): `ac_15_17.rs::ac17_fresh_daemon_and_warm_query_sanity` in the
+// debug suite; the measured release gates are in `benchmarks.rs`.
 
 #[tokio::test]
 async fn pr_badge_widget_refresh_request_succeeds() {

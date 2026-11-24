@@ -126,12 +126,26 @@ If a reverse proxy on the Docker host terminates TLS, pass its bridge address, e
 
 ## Measured Benchmark Gates (§15.3)
 
-Measured in `--release` mode via `cargo test --release -p dash --test benchmarks -- --nocapture` on **Apple M4 Pro (`Darwin 24.6.0 arm64`, 48 GiB RAM)** against [`apps/dash/tests/benchmarks.rs`](./apps/dash/tests/benchmarks.rs):
+Measured with `cargo test --release -p dash --test benchmarks -- --nocapture` (prints one
+`BENCHMARK_REPORT=` JSON line) against [`apps/dash/tests/benchmarks.rs`](./apps/dash/tests/benchmarks.rs).
+Hardware: **Apple M4 Pro, 14 cores, 48 GiB RAM, macOS 15.6.1 (Darwin 24.6.0, arm64)**, rustc 1.97.1.
+This is not the §15.3 reference Linux x86-64 machine, so the RSS figure is indicative only.
+Numbers are from one run; the range over three consecutive runs is in brackets.
 
-| Metric | §15.3 Target | Measured (`--release`) |
-| --- | --- | --- |
-| Fresh daemon startup to `/healthz` (0 Instances) | `<= 2,000 ms` | **32.03 ms** |
-| Baseline idle RSS (0 active subscriptions) | `<= 100 MiB` | **13.97 MiB** |
-| Warm in-memory provider cache query (p95, 200 samples) | `<= 5 ms` | **0.005 ms** |
-| Signal propagation to 100 local subscribers (p95) | `<= 100 ms` | **0.022 ms** |
-| `/healthz` latency under load | fast isolation | **0.401 ms** |
+| Metric (§15.3) | Target | Method | Measured (`--release`) |
+| --- | --- | --- | --- |
+| Fresh daemon startup | `<= 2 s` to `/healthz` | spawned `dash serve` on a fresh `dash init` Workspace (0 Instances); spawn until the first `200`; max of 3 runs | **37.95 ms** [37.9 – 43.7] |
+| Baseline idle RSS | `<= 100 MiB` | `ps -o rss` of that daemon 1.5 s after it is ready; max of 3 runs; fails if RSS cannot be read | **19.53 MiB** [19.5 – 19.9] |
+| Warm in-memory provider cache query | p95 `<= 5 ms` | 1,000 in-process `provider_query` cache hits on `open_prs` (asserted: no Luau execution) | **0.0042 ms** [0.0042 – 0.0043] |
+| Signal propagation | p95 `<= 100 ms` | already-computed snapshot published to 100 in-process `SignalHub` subscribers, until all 100 received it; 50 rounds (no WebSocket serialization) | **0.0152 ms** [0.0151 – 0.0156] |
+| Shared query deduplication | 1 computation | 100 identical concurrent `force_refresh` queries, all joined before the provider is released by a gate; counted by the provider in Instance State and by the VM pool | **1 computation** (0.90 ms for all 100) |
+| Failure isolation | no stall (gated here at p95 `<= 50 ms` for `/healthz`, `<= 100 ms` for the unrelated provider; §15.3 sets no number) | while an actual `while true do end` Instance (80 queued queries, more than the 64 pool permits) and an actual Instance holding 5 MiB of a 16 MiB budget run: 100 × `GET /healthz` and 100 × `POST /api/queries/open_prs` with `force_refresh` (Luau plus Mock connector each time) over HTTP. Then the hog exceeds its limit (`memory budget exceeded`) and the loop is interrupted (`timed out` after 1.17 s, when it reached the 50 M interrupt budget before its 3 s deadline) | `/healthz` p95 **0.124 ms** (idle baseline 0.118 ms); unrelated provider p95 **0.787 ms** (idle baseline 0.400 ms) |
+| Idle VM reclamation | back to baseline after the TTL | `idle_ttl_secs = 1`; VMs used last are kept by an immediate `reclaim_idle`; the pool then returns to 0 VMs | **8 VMs reclaimed, 1,006 ms** after last use; cold re-boot query 0.41 ms |
+| Live graph replacement | no partial graph; old graph kept on failure | 4 readers query a two-Instance pair (`b` reads `a`) during a draft activation that changes both; then a draft whose runtime fails to initialise is activated | **0 mixed results** in 31,261 reader queries (p95 0.091 ms); activation 218 ms; failed activation kept the Generation |
+
+`cargo test` (debug) runs the same scenarios. Functional gates (one computation, interruption,
+reclamation, no mixed Generation) are identical in both profiles. Latency bounds are multiplied by
+10 in unoptimized builds (`debug_slack()` in `apps/dash/tests/common_t4/mod.rs`), so only the
+`--release` run enforces the §15.3 numbers. The debug criterion 17 sanity check
+(`ac17_fresh_daemon_and_warm_query_sanity` in `apps/dash/tests/ac_15_17.rs`) times the same
+zero-Instance spawned daemon.

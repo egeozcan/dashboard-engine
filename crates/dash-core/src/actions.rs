@@ -4327,6 +4327,6 @@ return R
             "{:?}",
             report.cases
         );
-        assert_eq!(self_contained.len(), 6, "{:?}", report.cases);
+        assert_eq!(self_contained.len(), 5, "{:?}", report.cases);
     }
 }

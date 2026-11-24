@@ -13,3 +13,12 @@ aggregator = "count"
 cadence_secs = 3600
 retention_days = 30
 service_principal = "pr_history_sampler"
+
+[[history]]
+series_id = "open_prs_30d_payments"
+instance_id = "open_prs"
+params = { repository = "acme/payments", state = "open" }
+aggregator = "count"
+cadence_secs = 3600
+retention_days = 30
+service_principal = "pr_history_sampler"

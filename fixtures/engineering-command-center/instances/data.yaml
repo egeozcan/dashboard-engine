@@ -18,4 +18,7 @@ data:
   pr_count_history:
     definition: dash.history_series
     config:
-      series_id: open_prs_30d
+      # One sampled series per selectable repository; the trend Adapter selects by `params`.
+      series_ids:
+        - open_prs_30d
+        - open_prs_30d_payments
