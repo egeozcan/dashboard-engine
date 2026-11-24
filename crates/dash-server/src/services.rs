@@ -101,6 +101,18 @@ impl AppServices {
         self.engine().graph.load_full()
     }
 
+    /// Graceful-shutdown step (§15.2): once HTTP and WebSocket readers are gone, cancel every
+    /// running query and Adapter render so read work stops holding VM capacity while admitted
+    /// actions drain. Reads have no side effects, so cancelling them is always safe. Returns the
+    /// number of computations signalled.
+    pub fn cancel_inflight_reads_for_shutdown(&self) -> usize {
+        let n = self.engine().queries.cancel_all_in_flight();
+        if n > 0 {
+            tracing::info!("shutdown: cancelled {n} in-flight read computation(s)");
+        }
+        n
+    }
+
     /// Audit a denial (§14.3 "Audit all capability denials") and return its message.
     fn deny(&self, principal: &Principal, operation: &str, target: &str, msg: &str) -> String {
         dash_core::audit_denial(self.store(), principal, operation, target, msg);

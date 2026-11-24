@@ -478,6 +478,7 @@ impl HostBridge for MockTestBridge {
                 "connector input '{input_name}' names no connector Definition; cannot pick a Mock"
             )
         })?;
+        let mut result_schema = None;
         if let Some(conn) = self.shared.graph.definitions.get(conn_id) {
             let spec = conn.manifest.operations.get(operation).ok_or_else(|| {
                 format!("connector '{conn_id}' declares no operation '{operation}'")
@@ -496,6 +497,7 @@ impl HostBridge for MockTestBridge {
             if let Err(e) = spec.args.validate_value(&args) {
                 return Err(format!("invalid args for '{conn_id}.{operation}': {e}"));
             }
+            result_schema = Some(spec.result.clone());
         }
         let mock = self
             .shared
@@ -503,15 +505,24 @@ impl HostBridge for MockTestBridge {
             .find_mock_for(conn_id)
             .cloned()
             .ok_or_else(|| format!("no Mock declared for connector '{conn_id}' (§10.3)"))?;
-        self.run_nested(
-            &mock,
-            DefinitionCategory::Mock,
-            "call",
-            args,
-            Some(operation.to_string()),
-            None,
-        )
-        .await
+        let mut out = self
+            .run_nested(
+                &mock,
+                DefinitionCategory::Mock,
+                "call",
+                args,
+                Some(operation.to_string()),
+                None,
+            )
+            .await?;
+        // A Mock must honour its target's operation contract (§4.1, §4.2).
+        if let Some(schema) = result_schema {
+            schema.normalize_empty_lists(&mut out);
+            schema.validate_value(&out).map_err(|e| {
+                format!("output contract violation on Mock of '{conn_id}.{operation}': {e}")
+            })?;
+        }
+        Ok(out)
     }
 
     async fn invoke_action(
@@ -1492,6 +1503,38 @@ end)
             .await
             .unwrap_err();
         assert!(err.contains("ctx.http is unavailable"), "{err}");
+    }
+
+    // A Mock is held to its target connector's operation `result` contract (§4.1, §4.2).
+    #[tokio::test]
+    async fn mock_results_must_satisfy_the_target_operation_contract() {
+        let (_tmp, ws, data) = fixture_ws();
+        let mut graph = load_workspace_graph(&ws, &data, "preview", 1, true)
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "repository": "acme/platform", "state": "open" });
+        let ok_bridge =
+            MockTestBridge::new(Arc::new(graph.clone()), "github.pull_requests").unwrap();
+        ok_bridge
+            .call_input("github", "list_prs", args.clone())
+            .await
+            .unwrap();
+        // The target now declares a result shape the Mock's fixture rows do not have.
+        graph
+            .definitions
+            .get_mut("github.connector")
+            .unwrap()
+            .manifest
+            .operations
+            .get_mut("list_prs")
+            .unwrap()
+            .result = dash_luau::SchemaSpec::String;
+        let bridge = MockTestBridge::new(Arc::new(graph), "github.pull_requests").unwrap();
+        let err = bridge
+            .call_input("github", "list_prs", args)
+            .await
+            .unwrap_err();
+        assert!(err.contains("output contract violation on Mock"), "{err}");
     }
 
     #[tokio::test]

@@ -363,6 +363,10 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Readers are gone: stop read computations first so they free VM capacity for the
+            // admitted actions still draining (§15.2).
+            services.cancel_inflight_reads_for_shutdown();
+
             // Stop the background worker: it finishes its current iteration (e.g. an
             // automation-initiated action) within the remaining drain budget, then is aborted.
             let remaining = drain.saturating_sub(started_drain.elapsed());

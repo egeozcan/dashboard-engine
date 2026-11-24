@@ -362,6 +362,8 @@ fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
         triggers: vec![],
         libraries: vec![],
         generated_luau_types: String::new(),
+        instance_state: Default::default(),
+        query_capabilities: Default::default(),
     };
     hist_manifest.generate_luau_types();
     out.insert(
@@ -413,6 +415,8 @@ fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
             triggers: vec![],
             libraries: vec![],
             generated_luau_types: String::new(),
+            instance_state: Default::default(),
+            query_capabilities: Default::default(),
         };
         m.generate_luau_types();
         out.insert(
