@@ -686,7 +686,13 @@ impl ActionManager {
                 req.adapter_instance, req.dashboard_id
             ));
         }
-        if !req.widget_id.starts_with(&format!("{}_", req.adapter_instance)) {
+        // The widget_id must be bound to this Adapter in the dashboard's current render (A.3),
+        // not merely share its prefix.
+        let owner = self
+            .queries
+            .widget_owner(&req.dashboard_id, &req.widget_id, principal)
+            .await?;
+        if owner.as_deref() != Some(req.adapter_instance.as_str()) {
             return Err(format!(
                 "widget_id '{}' is not owned by adapter '{}'",
                 req.widget_id, req.adapter_instance
