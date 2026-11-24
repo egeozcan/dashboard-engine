@@ -13,8 +13,8 @@ pub mod state;
 pub mod telemetry;
 
 pub use actions::{
-    ActionManager, DryRunReport, InvocationContext, WidgetRequestEnvelope, WidgetRequestOutcome,
-    UNKNOWN_OUTCOME_CODE,
+    ActionManager, DryRunReport, InvocationContext, WidgetRequestDryRun, WidgetRequestEnvelope,
+    WidgetRequestOutcome, UNKNOWN_OUTCOME_CODE,
 };
 pub use authority::{
     check_action_authority, check_connector_operation_authority, check_provider_access,

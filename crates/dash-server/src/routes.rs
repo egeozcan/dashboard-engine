@@ -91,6 +91,7 @@ pub fn build_router(services: AppServices) -> Router {
         .route("/api/doctor", get(doctor_handler))
         .route("/api/network-policy", get(network_policy_status_handler))
         .route("/api/network-policy/grant", post(network_policy_grant_handler))
+        .merge(ui_api_routes())
         .with_state(state.clone());
 
     Router::new()
@@ -302,7 +303,7 @@ async fn dashboard_get_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.dashboard_get(&id, &p).await {
+    match st.services.dashboard_get_for_ui(&id, &p).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
     }
@@ -1258,6 +1259,7 @@ async fn widget_asset_handler(
     let Some(def) = g.definitions.get(&def_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Only widget provider Definitions publish browser assets (§10.1).
     if def.manifest.category != dash_luau::DefinitionCategory::WidgetProvider {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -1312,4 +1314,102 @@ async fn embedded_ui_handler(uri: axum::http::Uri) -> Response {
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     resp
+}
+
+// ---- Read-only endpoints backing the Web UI editors and the widget Request Dry run ----
+
+fn ui_api_routes() -> Router<ServerState> {
+    Router::new()
+        .route(
+            "/api/widget-request/dry-run",
+            post(widget_request_dry_run_handler),
+        )
+        .route("/api/definitions", get(definitions_summary_handler))
+        .route("/api/definitions/{id}/sources", get(definition_sources_handler))
+        .route("/api/drafts/{id}/graph", get(draft_graph_handler))
+        .route("/api/drafts/{id}/diff", get(draft_diff_handler))
+}
+
+/// Resolve a widget Request through its Adapter and Dry-run the resolved action. This is
+/// side-effect free; it is a POST only because it carries the Request envelope.
+async fn widget_request_dry_run_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<WidgetRequestEnvelope>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.widget_request_dry_run(req, &p).await {
+        Ok(rep) => Json(rep).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn definitions_summary_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
+        return r;
+    }
+    Json(st.services.definition_summaries()).into_response()
+}
+
+#[derive(Deserialize)]
+struct DraftScopeParams {
+    draft_id: Option<String>,
+}
+
+async fn definition_sources_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<DraftScopeParams>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let draft_id = q.draft_id.as_deref().filter(|s| !s.is_empty());
+    match st.services.definition_sources(&id, draft_id, &p) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn draft_graph_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_graph_inspect(&id, &p) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+async fn draft_diff_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.draft_diff(&id, &p).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
 }

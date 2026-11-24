@@ -1875,3 +1875,392 @@ fn draft_instance_exists(draft: &DraftRecord, instance_id: &str) -> Result<bool,
     }
     Ok(false)
 }
+
+// ---- Read-only helpers for the Web UI (Dashboard Designer, Dependency Graph Editor,
+// ---- Package Studio and live Dashboard Signals, §10.2) ----
+
+/// Sources of one Definition as stored in the Workspace (or a Draft worktree), for Package Studio.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionSources {
+    pub definition_id: String,
+    pub package: String,
+    pub category: String,
+    /// Directory under `packages/` holding the Package when the Definition belongs to a local
+    /// Workspace Package; pass it as `package` when saving the Definition into a Draft.
+    pub package_dir: Option<String>,
+    /// Definition directory relative to `package_dir`; pass it as `name` when saving.
+    pub definition_dir: Option<String>,
+    /// False for built-ins and locked external Git Packages, which are not edited in place.
+    pub editable: bool,
+    pub draft_id: Option<String>,
+    pub definition_luau: String,
+    pub runtime_file: String,
+    pub runtime_luau: String,
+    pub tests_luau: Option<String>,
+    pub generated_luau_types: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftDiffFile {
+    pub path: String,
+    /// `added` | `modified` | `deleted` | `renamed` (relative to the Draft's base Revision).
+    pub status: String,
+    pub patch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftDiff {
+    pub draft_id: String,
+    pub base_revision: String,
+    pub files: Vec<DraftDiffFile>,
+    /// True when the combined patch text exceeded the response budget and was cut.
+    pub truncated: bool,
+}
+
+const MAX_DRAFT_DIFF_BYTES: usize = 1024 * 1024;
+
+/// Find the Definition directory inside `workspace_dir/packages` whose `definition.luau` has the
+/// given content. Returns `(package_dir, definition_dir)` relative to `packages/`.
+pub(crate) fn locate_definition_dir(
+    workspace_dir: &std::path::Path,
+    definition_source: &str,
+) -> Option<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if dir.join("definition.luau").is_file() {
+            out.push(dir.to_path_buf());
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut children: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != ".git")
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        children.sort();
+        for c in children {
+            walk(&c, out);
+        }
+    }
+    let pkgs = workspace_dir.join("packages");
+    let mut pkg_dirs: Vec<PathBuf> = std::fs::read_dir(&pkgs)
+        .ok()?
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    pkg_dirs.sort();
+    for pkg_dir in pkg_dirs {
+        let mut defs = Vec::new();
+        walk(&pkg_dir, &mut defs);
+        for d in defs {
+            let Ok(src) = std::fs::read_to_string(d.join("definition.luau")) else {
+                continue;
+            };
+            if src == definition_source {
+                let pkg_name = pkg_dir.file_name()?.to_string_lossy().to_string();
+                let rel = d
+                    .strip_prefix(&pkg_dir)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel.is_empty() {
+                    return None;
+                }
+                return Some((pkg_name, rel));
+            }
+        }
+    }
+    None
+}
+
+/// Per-Definition contract summary the Graph Editor needs to show required capabilities and
+/// input expectations inline (§10.2.2).
+pub(crate) fn definition_contract_summaries(g: &ConfiguredGraph) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (id, def) in &g.definitions {
+        out.insert(
+            id.clone(),
+            serde_json::json!({
+                "package": def.package_name,
+                "category": def.manifest.category.as_str(),
+                "description": def.manifest.description,
+                "capabilities": def.manifest.capabilities,
+                "required_capabilities": def.manifest.required_capabilities,
+                "optional_capabilities": def.manifest.optional_capabilities,
+                "inputs": def.manifest.inputs,
+                "accepts_requests": def.manifest.accepts_requests,
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Add `asset_url` to every rendered Widget node whose widget provider ships a custom asset, so
+/// the browser loads the provider's declared entry point rather than guessing (§10.1).
+pub(crate) fn annotate_widget_asset_urls(g: &ConfiguredGraph, rendered: &mut serde_json::Value) {
+    fn walk(g: &ConfiguredGraph, node: &mut serde_json::Value) {
+        let Some(obj) = node.as_object_mut() else {
+            return;
+        };
+        if let Some(wt) = obj.get("widget_type").and_then(|v| v.as_str()).map(str::to_string) {
+            if let Some(def) = g.definitions.get(&wt) {
+                let safe_id = wt
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if def.manifest.category == DefinitionCategory::WidgetProvider && safe_id {
+                    if let Some(asset) = def.manifest.widget_asset.as_deref() {
+                        if def.widget_assets.contains_key(asset) {
+                            obj.insert(
+                                "asset_url".into(),
+                                serde_json::Value::String(format!("/widgets/{wt}/{asset}")),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(children) = obj.get_mut("children").and_then(|v| v.as_array_mut()) {
+            for c in children.iter_mut() {
+                walk(g, c);
+            }
+        }
+    }
+    if let Some(adapters) = rendered.get_mut("adapters").and_then(|v| v.as_array_mut()) {
+        for a in adapters.iter_mut() {
+            if let Some(tree) = a.get_mut("tree") {
+                walk(g, tree);
+            }
+        }
+    }
+}
+
+/// Every Instance a Dashboard's Adapters (transitively) read from in the configured graph.
+pub(crate) fn dashboard_upstream_instances(
+    g: &ConfiguredGraph,
+    dashboard_id: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let Some(dash) = g.dashboards.get(dashboard_id) else {
+        return seen;
+    };
+    let mut stack: Vec<String> = dash
+        .adapters
+        .iter()
+        .map(|p| p.adapter_instance.clone())
+        .collect();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(inst) = g.instances.get(&id) {
+            stack.extend(inst.inputs.values().cloned());
+        }
+    }
+    seen
+}
+
+impl AppServices {
+    /// Resolve a widget Request through its Adapter without side effects and Dry-run the
+    /// resolved action (no execution record is created).
+    pub async fn widget_request_dry_run(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+    ) -> Result<dash_core::WidgetRequestDryRun, String> {
+        self.engine()
+            .actions
+            .dry_run_widget_request(req, principal)
+            .await
+    }
+
+    /// `dashboard_get` plus custom widget asset URLs on rendered nodes.
+    pub async fn dashboard_get_for_ui(
+        &self,
+        dashboard_id: &str,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
+        let mut data = self.dashboard_get(dashboard_id, principal).await?;
+        let g = self.graph();
+        if let Some(rendered) = data.get_mut("rendered") {
+            annotate_widget_asset_urls(&g, rendered);
+        }
+        Ok(data)
+    }
+
+    /// Instances whose Query Signals can change what a Dashboard renders.
+    pub fn dashboard_upstream_instances(
+        &self,
+        dashboard_id: &str,
+    ) -> std::collections::BTreeSet<String> {
+        dashboard_upstream_instances(&self.graph(), dashboard_id)
+    }
+
+    fn load_draft_graph(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<(DraftRecord, ConfiguredGraph), String> {
+        // Draft ownership is enforced like every other draft read (§5.1, §11.3).
+        let draft = self.draft_status_as(draft_id, principal)?;
+        if draft.status == "aborted" || draft.status == "activated" {
+            return Err(format!("draft '{draft_id}' is {}", draft.status));
+        }
+        let g = dash_git::load_workspace_graph(
+            std::path::Path::new(&draft.worktree_path),
+            self.drafts.data_dir(),
+            &draft.base_revision,
+            0,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((draft, g))
+    }
+
+    /// The configured graph as it exists in a Draft worktree, with its validation report, so
+    /// editors show and build on cumulative Draft edits rather than the active Generation.
+    pub fn draft_graph_inspect(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
+        let (draft, g) = self.load_draft_graph(draft_id, principal)?;
+        let validation = validate_configured_graph(&g, self.store(), false);
+        Ok(serde_json::json!({
+            "draft_id": draft.draft_id,
+            "base_revision": draft.base_revision,
+            "revision_commit": draft.base_revision,
+            "generation_id": self.graph().generation_id,
+            "graph_digest": g.graph_digest(),
+            "instances": g.instances,
+            "dashboards": g.dashboards,
+            "definitions": definition_contract_summaries(&g),
+            "service_principals": self.service_principal_list(),
+            "validation": validation,
+        }))
+    }
+
+    /// Contract summaries of every Definition in the active Generation.
+    pub fn definition_summaries(&self) -> serde_json::Value {
+        definition_contract_summaries(&self.graph())
+    }
+
+    /// Read a Definition's Luau sources from the active Workspace or from a Draft worktree.
+    pub fn definition_sources(
+        &self,
+        definition_id: &str,
+        draft_id: Option<&str>,
+        principal: &Principal,
+    ) -> Result<DefinitionSources, String> {
+        let (ws_dir, def) = match draft_id {
+            Some(id) => {
+                let (draft, g) = self.load_draft_graph(id, principal)?;
+                let def = g
+                    .definitions
+                    .get(definition_id)
+                    .cloned()
+                    .ok_or_else(|| format!("definition '{definition_id}' not found in draft"))?;
+                (PathBuf::from(draft.worktree_path), def)
+            }
+            None => {
+                let g = self.graph();
+                let def = g
+                    .definitions
+                    .get(definition_id)
+                    .cloned()
+                    .ok_or_else(|| format!("definition '{definition_id}' not found"))?;
+                (self.drafts.workspace_dir().to_path_buf(), def)
+            }
+        };
+        let located = locate_definition_dir(&ws_dir, &def.definition_source);
+        let runtime_file = if def.manifest.runtime.is_empty() {
+            "runtime.luau".to_string()
+        } else {
+            def.manifest.runtime.clone()
+        };
+        Ok(DefinitionSources {
+            definition_id: definition_id.to_string(),
+            package: def.package_name.clone(),
+            category: def.manifest.category.as_str().to_string(),
+            editable: located.is_some(),
+            package_dir: located.as_ref().map(|(p, _)| p.clone()),
+            definition_dir: located.map(|(_, d)| d),
+            draft_id: draft_id.map(str::to_string),
+            definition_luau: def.definition_source.clone(),
+            runtime_file,
+            runtime_luau: def.runtime_source.clone(),
+            tests_luau: def.tests_source.clone(),
+            generated_luau_types: def.manifest.generated_luau_types.clone(),
+        })
+    }
+
+    /// Unified diff of a Draft worktree against its base Revision (tracked and new files).
+    pub async fn draft_diff(&self, draft_id: &str, principal: &Principal) -> Result<DraftDiff, String> {
+        use dash_git::git_cli::{run_git, run_git_allow_exit_1};
+        let draft = self.draft_status_as(draft_id, principal)?;
+        if draft.status == "aborted" || draft.status == "activated" {
+            return Err(format!("draft '{draft_id}' is {}", draft.status));
+        }
+        let wt = PathBuf::from(&draft.worktree_path);
+        let base = draft.base_revision.clone();
+        let mut files: Vec<DraftDiffFile> = Vec::new();
+        let mut budget = MAX_DRAFT_DIFF_BYTES;
+        let mut truncated = false;
+        let mut push_patch = |files: &mut Vec<DraftDiffFile>, path: String, status: String, patch: String| {
+            let patch = if patch.len() > budget {
+                truncated = true;
+                let mut cut = budget;
+                while cut > 0 && !patch.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                patch[..cut].to_string()
+            } else {
+                patch
+            };
+            budget -= patch.len();
+            files.push(DraftDiffFile { path, status, patch });
+        };
+
+        let name_status = run_git(&wt, &["diff", "--name-status", "--no-renames", &base, "--"])
+            .await
+            .map_err(|e| e.to_string())?;
+        for line in name_status.lines().filter(|l| !l.trim().is_empty()) {
+            let mut parts = line.splitn(2, '\t');
+            let code = parts.next().unwrap_or("").trim();
+            let Some(path) = parts.next().map(|p| p.trim().to_string()) else {
+                continue;
+            };
+            let status = match code.chars().next() {
+                Some('A') => "added",
+                Some('D') => "deleted",
+                Some('R') => "renamed",
+                _ => "modified",
+            };
+            let patch = run_git(&wt, &["diff", "--no-color", "--no-renames", &base, "--", &path])
+                .await
+                .map_err(|e| e.to_string())?;
+            push_patch(&mut files, path, status.into(), patch);
+        }
+
+        let untracked = run_git(&wt, &["ls-files", "--others", "--exclude-standard"])
+            .await
+            .map_err(|e| e.to_string())?;
+        for path in untracked.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (_code, patch) = run_git_allow_exit_1(
+                &wt,
+                &["diff", "--no-color", "--no-index", "--", "/dev/null", path],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            push_patch(&mut files, path.to_string(), "added".into(), patch);
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(DraftDiff {
+            draft_id: draft.draft_id,
+            base_revision: base,
+            files,
+            truncated,
+        })
+    }
+}

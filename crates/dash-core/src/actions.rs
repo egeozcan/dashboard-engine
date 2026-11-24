@@ -1761,11 +1761,14 @@ impl ActionManager {
     /// widget_id is produced by the Adapter's current render, that the Request is declared
     /// (deny by default) and its payload matches the declared schema. Actions and invalidations
     /// resolve only through the Adapter's own bound inputs.
-    pub async fn dispatch_widget_request_outcome(
+    /// Host-side validation shared by dispatch and Dry run of a widget Request (Appendix A.3):
+    /// protocol/kind, active Generation, Adapter placement, widget_id bound by the Adapter's
+    /// current render, declared Request (deny by default) and payload schemas.
+    async fn validate_widget_request_binding(
         &self,
-        req: WidgetRequestEnvelope,
+        req: &WidgetRequestEnvelope,
         principal: &Principal,
-    ) -> Result<WidgetRequestOutcome, String> {
+    ) -> Result<(Arc<ConfiguredGraph>, InstanceConfig, LoadedDefinition), String> {
         if req.protocol != WIDGET_PROTOCOL {
             return Err(format!(
                 "unsupported widget protocol '{}' (expected '{WIDGET_PROTOCOL}')",
@@ -1831,7 +1834,7 @@ impl ActionManager {
                 .map_err(|e| format!("invalid payload for request '{}': {e}", req.request))?;
         }
 
-        let widget_type = self.ensure_widget_bound(&req, principal).await?;
+        let widget_type = self.ensure_widget_bound(req, principal).await?;
         if let Some(wdef) = widget_type.as_ref().and_then(|t| g.definitions.get(t)) {
             if let Some(schema) = wdef.manifest.request_schemas.get(&req.request) {
                 schema.validate_value(&req.payload).map_err(|e| {
@@ -1842,6 +1845,17 @@ impl ActionManager {
                 })?;
             }
         }
+
+        Ok((g, adapter_inst, adapter_def))
+    }
+
+    pub async fn dispatch_widget_request_outcome(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+    ) -> Result<WidgetRequestOutcome, String> {
+        let (g, adapter_inst, adapter_def) =
+            self.validate_widget_request_binding(&req, principal).await?;
 
         let trace_id = format!("tr_{}", Uuid::now_v7().simple());
         let span_id = format!("spn_{}", Uuid::now_v7().simple());
@@ -2152,6 +2166,165 @@ fn connector_operation_is_read_only(g: &ConfiguredGraph, conn: &InstanceConfig, 
         .and_then(|d| d.manifest.operations.get(operation))
         .map(|op| op.is_read_only())
         .unwrap_or(false)
+}
+
+/// Result of resolving a widget Request through its Adapter binding without side effects,
+/// followed by the resolved action's optional Dry run (§9.1 step 2, Appendix A.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetRequestDryRun {
+    pub protocol: String, // "dash.widget/1"
+    pub dashboard_id: String,
+    pub adapter_instance: String,
+    pub widget_id: String,
+    pub request: String,
+    /// `action`: the Request resolves to an action Instance (see `action_instance`/`args`).
+    /// `refresh`: the Request only invalidates/refreshes queries; nothing to confirm.
+    /// `unresolved`: the Adapter could not be evaluated read-only (for example it invokes the
+    /// action imperatively); `dry_run_error` explains why.
+    pub resolution: String,
+    #[serde(default)]
+    pub action_instance: Option<String>,
+    #[serde(default)]
+    pub args: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dry_run: Option<DryRunReport>,
+    #[serde(default)]
+    pub dry_run_error: Option<String>,
+    /// Whether the UI should ask the Administrator to confirm before dispatching the Request.
+    pub requires_confirmation: bool,
+}
+
+impl ActionManager {
+    /// Resolve a widget Request through the Adapter's `on_request` (evaluated read-only: nested
+    /// action invocation and mutating connector operations are refused) or its direct action
+    /// binding, then run the resolved action's Dry run. Performs no side effects and creates no
+    /// execution record. The Request is validated exactly like a dispatch.
+    pub async fn dry_run_widget_request(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+    ) -> Result<WidgetRequestDryRun, String> {
+        let (g, adapter_inst, adapter_def) =
+            self.validate_widget_request_binding(&req, principal).await?;
+
+        let mut out = WidgetRequestDryRun {
+            protocol: WIDGET_PROTOCOL.into(),
+            dashboard_id: req.dashboard_id.clone(),
+            adapter_instance: req.adapter_instance.clone(),
+            widget_id: req.widget_id.clone(),
+            request: req.request.clone(),
+            resolution: "unresolved".into(),
+            action_instance: None,
+            args: None,
+            dry_run: None,
+            dry_run_error: None,
+            requires_confirmation: true,
+        };
+
+        let (target_action, args) = if let Some(ref on_req) = adapter_def.manifest.request_handler {
+            let trace_id = format!("reqdry_{}", Uuid::now_v7().simple());
+            let mut bridge = self.bridge(
+                &g,
+                &adapter_inst,
+                &adapter_def,
+                principal,
+                &trace_id,
+                true,
+                Arc::new(SideEffectTracker::default()),
+            );
+            bridge.dashboard_id = Some(req.dashboard_id.clone());
+            let bridge = Arc::new(bridge);
+            let bundle = CompiledInstanceBundle {
+                instance_id: format!("dryrun:{}", adapter_inst.id),
+                manifest: adapter_def.manifest.clone(),
+                runtime_source: adapter_def.runtime_source.clone(),
+                config_digest: adapter_inst.config_digest(),
+                resolved_libraries: g.resolved_libraries(),
+            };
+            let evaluated = self
+                .pool
+                .execute_handler(
+                    &bundle,
+                    on_req,
+                    ExecutionContextConfig {
+                        category: DefinitionCategory::Adapter,
+                        instance_id: adapter_inst.id.clone(),
+                        input_names: adapter_inst.inputs.keys().cloned().collect(),
+                        config: adapter_inst.config.clone(),
+                        payload: serde_json::json!({
+                            "dashboard_id": req.dashboard_id,
+                            "widget_id": req.widget_id,
+                            "request": req.request,
+                            "payload": req.payload,
+                            "generation": req.generation,
+                            "sequence": req.sequence,
+                        }),
+                        operation: None,
+                        idempotency_key: None,
+                        allowed_emits: vec![],
+                        now_iso: Utc::now().to_rfc3339(),
+                        trace_id,
+                        bridge,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| self.store.redactor().redact_str(&e.to_string()));
+            let val = match evaluated {
+                Ok(v) => v,
+                Err(e) => {
+                    out.dry_run_error = Some(format!(
+                        "adapter on_request could not be evaluated without side effects: {e}"
+                    ));
+                    return Ok(out);
+                }
+            };
+            if let Some(action_slot) = val.get("action").and_then(|v| v.as_str()) {
+                // Same resolution as dispatch: only the Adapter's own bound action inputs.
+                let target = match resolve_bound_action(&adapter_inst, &adapter_def, &g, action_slot) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        out.dry_run_error = Some(e);
+                        return Ok(out);
+                    }
+                };
+                let args = val.get("args").cloned().unwrap_or(req.payload.clone());
+                (target, args)
+            } else if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("invalidate").is_some()
+            {
+                out.resolution = "refresh".into();
+                out.requires_confirmation = false;
+                return Ok(out);
+            } else {
+                out.dry_run_error =
+                    Some("adapter on_request handler did not specify an action".into());
+                return Ok(out);
+            }
+        } else {
+            let slot = if adapter_inst.inputs.contains_key(&req.request) {
+                req.request.clone()
+            } else {
+                "action".to_string()
+            };
+            let target = resolve_bound_action(&adapter_inst, &adapter_def, &g, &slot).map_err(|_| {
+                format!(
+                    "adapter '{}' has no action binding for request '{}'",
+                    adapter_inst.id, req.request
+                )
+            })?;
+            (target, req.payload.clone())
+        };
+
+        out.resolution = "action".into();
+        out.action_instance = Some(target_action.clone());
+        out.args = Some(self.store.redactor().redact_json(&args));
+        match self.dry_run(&target_action, args, principal).await {
+            Ok(rep) => out.dry_run = Some(rep),
+            Err(e) => out.dry_run_error = Some(e),
+        }
+        Ok(out)
+    }
 }
 
 fn resolve_invalidations(

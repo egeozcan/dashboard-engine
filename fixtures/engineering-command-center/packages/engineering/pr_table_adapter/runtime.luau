@@ -51,12 +51,17 @@ end
 function Runtime.on_request(ctx)
     if ctx.request.request == "merge_requested" then
         local p = ctx.request.payload or {}
+        -- Never guess the target: a Request without repository/number is rejected.
+        if p.repository == nil or p.number == nil then
+            error("merge_requested requires payload.repository and payload.number")
+        end
         return {
             action = "merge",
             args = {
-                repository = p.repository or "acme/platform",
+                repository = p.repository,
                 number = p.number,
-                issue_key = p.issue_key,
+                -- Table rows carry the linked issue as `jira_key`.
+                issue_key = p.issue_key or p.jira_key,
             },
         }
     elseif ctx.request.request == "refresh_requested" then

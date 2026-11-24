@@ -1,6 +1,17 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { WidgetNode } from "../../lib/api";
-import { useClientState } from "../../lib/clientState";
+import { scopedClientStateKey, useClientState } from "../../lib/clientState";
+import {
+  GRID_COLUMNS,
+  ROW_UNIT_PX,
+  containerItemStyle,
+  effectiveProps,
+  gridItemStyle,
+  moveFromDrag,
+  resizeFromDrag,
+  type DragStart,
+  type OverridePatch,
+} from "../../lib/designer";
 
 export interface WidgetRequestContext {
   adapterInstance: string;
@@ -20,37 +31,117 @@ interface RendererProps {
   onSelectWidget?: (widgetId: string) => void;
   selectedWidgetId?: string | null;
   layoutStyle?: React.CSSProperties;
+  /** Dashboard the node is rendered on (namespaces Client State). */
+  dashboardId?: string;
+  /** Designer: drag/resize handles report new grid geometry for a widget. */
+  onLayoutChange?: (widgetId: string, patch: OverridePatch) => void;
+  /** Whether the node sits in a 12-column grid (drag/resize handles apply). */
+  inGrid?: boolean;
 }
 
-export const WidgetRenderer: React.FC<RendererProps> = ({
-  node,
-  adapterInstance,
-  generation,
-  onWidgetRequest,
-  onDashboardStateChange,
-  designerMode,
-  onSelectWidget,
-  selectedWidgetId,
-  layoutStyle,
-}) => {
+type DragMode = "move" | "resize";
+
+export const WidgetRenderer: React.FC<RendererProps> = (rp) => {
+  const {
+    node,
+    adapterInstance,
+    generation,
+    onWidgetRequest,
+    onDashboardStateChange,
+    designerMode,
+    onSelectWidget,
+    selectedWidgetId,
+    layoutStyle,
+    dashboardId,
+    onLayoutChange,
+    inGrid,
+  } = rp;
+  const [drag, setDrag] = useState<{ mode: DragMode; dx: number; dy: number; w: number; h: number } | null>(
+    null
+  );
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
   if (node.layout_override?.visible === false && !designerMode) {
     return null;
   }
 
-  const props = node.props ?? {};
+  const props = effectiveProps(node);
   const isSelected = designerMode && selectedWidgetId === node.widget_id;
   const designerStyle: React.CSSProperties | undefined = designerMode
     ? {
         outline: isSelected ? "2px solid var(--accent)" : "1px dashed var(--border)",
         outlineOffset: 2,
         opacity: node.layout_override?.visible === false ? 0.5 : 1,
+        position: "relative",
       }
     : undefined;
+  const dragStyle: React.CSSProperties | undefined = drag
+    ? drag.mode === "move"
+      ? { transform: `translate(${drag.dx}px, ${drag.dy}px)`, zIndex: 5 }
+      : { width: Math.max(24, drag.w + drag.dx), height: Math.max(24, drag.h + drag.dy), zIndex: 5 }
+    : undefined;
   const wrapperStyle: React.CSSProperties | undefined =
-    layoutStyle || designerStyle ? { ...layoutStyle, ...designerStyle } : undefined;
+    layoutStyle || designerStyle || dragStyle
+      ? { ...layoutStyle, ...designerStyle, ...dragStyle }
+      : undefined;
+
+  const childCommon = {
+    adapterInstance,
+    generation,
+    onWidgetRequest,
+    onDashboardStateChange,
+    designerMode,
+    onSelectWidget,
+    selectedWidgetId,
+    dashboardId,
+    onLayoutChange,
+  };
+
+  const startDrag = (mode: DragMode) => (e: React.PointerEvent) => {
+    if (!onLayoutChange) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const el = wrapperRef.current;
+    const parent = el?.parentElement;
+    const pr = parent?.getBoundingClientRect();
+    const er = el?.getBoundingClientRect();
+    const colW = pr && pr.width > 0 ? pr.width / GRID_COLUMNS : 0;
+    const ov = node.layout_override ?? {};
+    const start: DragStart = {
+      x: typeof ov.x === "number" ? ov.x : colW && pr && er ? Math.round((er.left - pr.left) / colW) : 0,
+      y: typeof ov.y === "number" ? ov.y : pr && er ? Math.round((er.top - pr.top) / ROW_UNIT_PX) : 0,
+      w: typeof ov.w === "number" ? ov.w : colW && er ? Math.max(1, Math.round(er.width / colW)) : GRID_COLUMNS,
+      h: typeof ov.h === "number" ? ov.h : er ? Math.max(1, Math.round(er.height / ROW_UNIT_PX)) : 1,
+    };
+    const sx = Number.isFinite(e.clientX) ? e.clientX : 0;
+    const sy = Number.isFinite(e.clientY) ? e.clientY : 0;
+    const baseW = er?.width ?? 0;
+    const baseH = er?.height ?? 0;
+    setDrag({ mode, dx: 0, dy: 0, w: baseW, h: baseH });
+    const onMove = (ev: PointerEvent) => {
+      setDrag({ mode, dx: ev.clientX - sx, dy: ev.clientY - sy, w: baseW, h: baseH });
+    };
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setDrag(null);
+      const dx = ev.clientX - sx;
+      const dy = ev.clientY - sy;
+      if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+      onLayoutChange(
+        node.widget_id,
+        mode === "resize" ? resizeFromDrag(start, dx, dy, colW) : moveFromDrag(start, dx, dy, colW)
+      );
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  const showHandles = designerMode && inGrid && Boolean(onLayoutChange);
 
   const wrap = (inner: React.ReactNode) => (
     <div
+      ref={wrapperRef}
       key={node.widget_id}
       data-widget-id={node.widget_id}
       style={wrapperStyle}
@@ -64,11 +155,33 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
       }
     >
       {designerMode && (
-        <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>
+        <div className="designer-node-label">
+          {showHandles && (
+            <span
+              role="button"
+              tabIndex={-1}
+              aria-label={`Move ${node.widget_id}`}
+              title="Drag to move (sets x/y)"
+              className="designer-handle move"
+              onPointerDown={startDrag("move")}
+            >
+              ⠿
+            </span>
+          )}
           {node.widget_id} ({node.widget_type})
         </div>
       )}
       {inner}
+      {showHandles && (
+        <span
+          role="button"
+          tabIndex={-1}
+          aria-label={`Resize ${node.widget_id}`}
+          title="Drag to resize (sets w/h)"
+          className="designer-handle resize"
+          onPointerDown={startDrag("resize")}
+        />
+      )}
     </div>
   );
 
@@ -78,27 +191,14 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
       const gap = typeof props.gap === "number" ? props.gap : 12;
       return wrap(
         <div style={{ display: "flex", flexDirection: dir, gap }}>
-          {(node.children ?? []).map((child) => {
-            const w = child.layout_override?.w;
-            const childLayout: React.CSSProperties | undefined =
-              typeof w === "number" && w < 12
-                ? { width: `${(Math.min(12, Math.max(1, w)) / 12) * 100}%` }
-                : undefined;
-            return (
-              <WidgetRenderer
-                key={child.widget_id}
-                node={child}
-                adapterInstance={adapterInstance}
-                generation={generation}
-                onWidgetRequest={onWidgetRequest}
-                onDashboardStateChange={onDashboardStateChange}
-                designerMode={designerMode}
-                onSelectWidget={onSelectWidget}
-                selectedWidgetId={selectedWidgetId}
-                layoutStyle={childLayout}
-              />
-            );
-          })}
+          {(node.children ?? []).map((child) => (
+            <WidgetRenderer
+              key={child.widget_id}
+              node={child}
+              {...childCommon}
+              layoutStyle={containerItemStyle(child.layout_override)}
+            />
+          ))}
         </div>
       );
     }
@@ -115,43 +215,34 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
       for (const child of visibleChildren) {
         const w = child.layout_override?.w;
         if (typeof w === "number") {
-          explicitSum += Math.min(12, Math.max(1, w));
+          explicitSum += Math.min(GRID_COLUMNS, Math.max(1, w));
         } else {
           unsetCount += 1;
         }
       }
       const fallbackUnsetSpan =
-        explicitSum < 12 && unsetCount > 0 && visibleChildren.length <= cols
-          ? Math.max(1, Math.floor((12 - explicitSum) / unsetCount))
-          : Math.max(1, Math.floor(12 / cols));
+        explicitSum < GRID_COLUMNS && unsetCount > 0 && visibleChildren.length <= cols
+          ? Math.max(1, Math.floor((GRID_COLUMNS - explicitSum) / unsetCount))
+          : Math.max(1, Math.floor(GRID_COLUMNS / cols));
 
       return wrap(
         <div
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(12, minmax(0, 1fr))",
+            gridAutoRows: `minmax(${ROW_UNIT_PX}px, auto)`,
             gap,
           }}
         >
-          {children.map((child) => {
-            const w = child.layout_override?.w;
-            const span =
-              typeof w === "number" ? Math.min(12, Math.max(1, w)) : fallbackUnsetSpan;
-            return (
-              <WidgetRenderer
-                key={child.widget_id}
-                node={child}
-                adapterInstance={adapterInstance}
-                generation={generation}
-                onWidgetRequest={onWidgetRequest}
-                onDashboardStateChange={onDashboardStateChange}
-                designerMode={designerMode}
-                onSelectWidget={onSelectWidget}
-                selectedWidgetId={selectedWidgetId}
-                layoutStyle={{ gridColumn: `span ${span}` }}
-              />
-            );
-          })}
+          {children.map((child) => (
+            <WidgetRenderer
+              key={child.widget_id}
+              node={child}
+              {...childCommon}
+              inGrid
+              layoutStyle={gridItemStyle(child.layout_override, fallbackUnsetSpan)}
+            />
+          ))}
         </div>
       );
     }
@@ -164,13 +255,7 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
             label: String(c.props?.title ?? c.key ?? `Tab ${idx + 1}`),
             node: c,
           }))}
-          adapterInstance={adapterInstance}
-          generation={generation}
-          onWidgetRequest={onWidgetRequest}
-          onDashboardStateChange={onDashboardStateChange}
-          designerMode={designerMode}
-          onSelectWidget={onSelectWidget}
-          selectedWidgetId={selectedWidgetId}
+          common={childCommon}
         />
       );
 
@@ -215,14 +300,15 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
         />
       );
 
-    case "dash.table":
+    case "dash.table": {
+      const scope = { dashboardId, widgetId: node.widget_id };
       return wrap(
         <TableWidget
           title={String(props.title ?? "Table")}
           columns={(Array.isArray(props.columns) ? props.columns : []) as Array<{ key: string; label: string; type?: string }>}
           rows={(Array.isArray(props.rows) ? props.rows : []) as Array<Record<string, unknown>>}
-          sortStateKey={String(props.client_sort_state_key ?? `${node.widget_id}_sort`)}
-          filterStateKey={String(props.client_filter_state_key ?? `${node.widget_id}_filter`)}
+          sortStateKey={scopedClientStateKey(scope, String(props.client_sort_state_key ?? "sort"))}
+          filterStateKey={scopedClientStateKey(scope, String(props.client_filter_state_key ?? "filter"))}
           rowAction={props.row_action as { label: string; request: string } | undefined}
           onRowAction={(row) =>
             onWidgetRequest({
@@ -235,6 +321,7 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
           }
         />
       );
+    }
 
     case "dash.button":
       return wrap(
@@ -294,6 +381,7 @@ export const WidgetRenderer: React.FC<RendererProps> = ({
           adapterInstance={adapterInstance}
           generation={generation}
           props={props}
+          assetUrl={node.asset_url}
           onWidgetRequest={onWidgetRequest}
         />
       );
@@ -549,23 +637,8 @@ const MapWidget: React.FC<{ title: string; points: Array<Record<string, unknown>
 
 const TabsWidget: React.FC<{
   tabs: Array<{ id: string; label: string; node: WidgetNode }>;
-  adapterInstance: string;
-  generation: number;
-  onWidgetRequest: (ctx: WidgetRequestContext) => Promise<void>;
-  onDashboardStateChange?: (key: string, value: unknown) => Promise<void>;
-  designerMode?: boolean;
-  onSelectWidget?: (widgetId: string) => void;
-  selectedWidgetId?: string | null;
-}> = ({
-  tabs,
-  adapterInstance,
-  generation,
-  onWidgetRequest,
-  onDashboardStateChange,
-  designerMode,
-  onSelectWidget,
-  selectedWidgetId,
-}) => {
+  common: Omit<RendererProps, "node" | "layoutStyle" | "inGrid">;
+}> = ({ tabs, common }) => {
   const [selectedIdx, setSelectedIdx] = useState(0);
   return (
     <div className="widget-tabs card" style={{ marginBottom: 0 }}>
@@ -592,16 +665,7 @@ const TabsWidget: React.FC<{
           tabIndex={i === selectedIdx ? 0 : undefined}
         >
           <div style={{ paddingTop: 12 }}>
-            <WidgetRenderer
-              node={t.node}
-              adapterInstance={adapterInstance}
-              generation={generation}
-              onWidgetRequest={onWidgetRequest}
-              onDashboardStateChange={onDashboardStateChange}
-              designerMode={designerMode}
-              onSelectWidget={onSelectWidget}
-              selectedWidgetId={selectedWidgetId}
-            />
+            <WidgetRenderer node={t.node} {...common} />
           </div>
         </div>
       ))}
@@ -660,8 +724,24 @@ const FormWidget: React.FC<{
   );
 };
 
+/** Default entry point when the server did not supply the provider's declared asset. */
+export function defaultWidgetAssetUrl(defId: string): string {
+  return `/widgets/${encodeURIComponent(defId)}/assets/index.html`;
+}
+
+/** Only same-origin asset URLs of this widget provider are loaded into the frame. */
+export function resolveWidgetAssetUrl(defId: string, assetUrl?: string): string {
+  const prefix = `/widgets/${encodeURIComponent(defId)}/assets/`;
+  if (assetUrl && assetUrl.startsWith(prefix) && !assetUrl.includes("..")) return assetUrl;
+  return defaultWidgetAssetUrl(defId);
+}
+
 /**
  * Sandboxed custom widget iframe (`sandbox="allow-scripts"` WITHOUT `allow-same-origin`, §10.1).
+ *
+ * Requests from the frame are tied to the host-rendered `widget_id` and Generation: the
+ * Generation the frame reports is never trusted, and messages claiming another Generation are
+ * dropped (the frame is showing an outdated render).
  */
 export const SandboxedWidgetFrame: React.FC<{
   defId: string;
@@ -669,10 +749,11 @@ export const SandboxedWidgetFrame: React.FC<{
   adapterInstance: string;
   generation: number;
   props: Record<string, unknown>;
+  assetUrl?: string;
   onWidgetRequest: (ctx: WidgetRequestContext) => Promise<void>;
-}> = ({ defId, widgetId, adapterInstance, generation, props, onWidgetRequest }) => {
+}> = ({ defId, widgetId, adapterInstance, generation, props, assetUrl, onWidgetRequest }) => {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  const src = `/widgets/${encodeURIComponent(defId)}/assets/index.html`;
+  const src = resolveWidgetAssetUrl(defId, assetUrl);
 
   const pushProps = () => {
     frameRef.current?.contentWindow?.postMessage(
@@ -701,16 +782,28 @@ export const SandboxedWidgetFrame: React.FC<{
         d.protocol !== "dash.widget/1" ||
         d.kind !== "request" ||
         d.widget_id !== widgetId ||
+        typeof d.request !== "string" ||
+        d.request.length === 0 ||
         JSON.stringify(d).length > 16384
       ) {
         return;
       }
+      if (d.generation !== undefined && Number(d.generation) !== generation) {
+        console.warn(
+          `dropping widget Request from ${widgetId}: frame reported Generation ${String(d.generation)}, host rendered ${generation}`
+        );
+        return;
+      }
+      const payload =
+        d.payload && typeof d.payload === "object" && !Array.isArray(d.payload)
+          ? (d.payload as Record<string, unknown>)
+          : {};
       void onWidgetRequest({
         adapterInstance,
         widgetId,
-        generation: Number(d.generation ?? generation),
-        request: String(d.request ?? ""),
-        payload: (d.payload as Record<string, unknown>) ?? {},
+        generation,
+        request: d.request,
+        payload,
       });
     };
     window.addEventListener("message", onMessage);

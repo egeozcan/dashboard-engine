@@ -18,6 +18,7 @@ COPY GLOSSARY.md ./
 COPY docs/ ./docs/
 COPY crates/ ./crates/
 COPY apps/ ./apps/
+COPY builtins/ ./builtins/
 COPY --from=web-builder /app/web/dist ./web/dist
 RUN cargo build --release --bin dash
 

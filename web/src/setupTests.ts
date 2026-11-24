@@ -1,4 +1,13 @@
 import "@testing-library/jest-dom";
+import { InertWebSocket } from "./test/mockWebSocket";
+
+// Views open the `/ws` Signal connection; tests never dial the network unless a test installs
+// its own client (see `setSignalClient`).
+Object.defineProperty(globalThis, "WebSocket", {
+  value: InertWebSocket,
+  configurable: true,
+  writable: true,
+});
 
 // Node 25 built-in experimental localStorage lacks methods without --localstorage-file;
 // provide a standard in-memory Web Storage implementation in tests if missing.

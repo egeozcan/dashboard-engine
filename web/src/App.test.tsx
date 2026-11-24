@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
 import { WidgetRenderer } from "./components/widgets/BuiltInWidgets";
 import { GraphEditorView } from "./views/GraphEditorView";
-import { getOrCreateClientId, clientStateStorageKey } from "./lib/clientState";
+import { getOrCreateClientId, clientStateStorageKey, scopedClientStateKey } from "./lib/clientState";
 
 describe("dash Web UI", () => {
   beforeEach(() => {
@@ -89,7 +89,11 @@ describe("dash Web UI", () => {
     expect(sortBtn.closest("th")).toHaveAttribute("aria-sort", "ascending");
 
     // Simulate another tab updating Client filter in localStorage
-    const storageKey = clientStateStorageKey(clientId, "pr_filter");
+    // Client State keys are namespaced by Dashboard and widget_id (§8)
+    const storageKey = clientStateStorageKey(
+      clientId,
+      scopedClientStateKey({ widgetId: "pr_table_adapter_pr_table" }, "pr_filter")
+    );
     fireEvent(
       window,
       new StorageEvent("storage", {
@@ -167,14 +171,19 @@ describe("dash Web UI", () => {
 
     const dragInput = screen.getByLabelText("Target input slot for drag-connect:") as HTMLInputElement;
     const formSlotInput = screen.getByPlaceholderText("input slot (e.g. prs)") as HTMLInputElement;
-    expect(dragInput.value).toBe("prs");
+    // Drag-connect slot defaults to automatic selection from the target's declared inputs.
+    expect(dragInput.value).toBe("");
     expect(formSlotInput.value).toBe("prs");
 
+    fireEvent.change(dragInput, { target: { value: "issues" } });
     fireEvent.change(formSlotInput, { target: { value: "linked" } });
     expect(formSlotInput.value).toBe("linked");
-    expect(dragInput.value).toBe("prs");
+    expect(dragInput.value).toBe("issues");
 
     fireEvent.change(screen.getByPlaceholderText("instance_id"), { target: { value: "bad_inst" } });
+    fireEvent.change(screen.getByPlaceholderText("definition (pkg.def)"), {
+      target: { value: "engineering.linked_prs" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Add to Draft" }));
 
     await screen.findByText("Active Draft: dft_ui_1");
