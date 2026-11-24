@@ -759,166 +759,8 @@ async fn ac11_visual_ui_embedded_assets_and_api_flows() {
     h.abort();
 }
 
-#[tokio::test]
-async fn ac12_mcp_full_autonomous_draft_preview_rebase_activate_and_action_cycle() {
-    let tmp = TempDir::new().unwrap();
-    let (services, addr, h) = boot_http_app(&tmp, vec![]).await;
-    let base = format!("http://{addr}");
-    let (_agt, token) = services
-        .agent_create(
-            "auto-agent",
-            CapabilityCeiling {
-                allowed_providers: BTreeSet::from(["*".into()]),
-                allowed_actions: BTreeSet::from(["transition_issue".into()]),
-                allowed_connectors: BTreeSet::from(["jira_transitioner".into()]),
-                allowed_capabilities: BTreeSet::from([
-                    "issues.transition".into(),
-                    "issues.read".into(),
-                ]),
-                can_author_drafts: true,
-                can_activate_drafts: true,
-                ..Default::default()
-            },
-            None,
-            &Principal::administrator(),
-        )
-        .unwrap();
-
-    let client = reqwest::Client::new();
-    let mcp = |id: u64, method: &str, params: serde_json::Value| {
-        let c = client.clone();
-        let b = base.clone();
-        let t = token.clone();
-        let m = method.to_string();
-        async move {
-            let v: serde_json::Value = c
-                .post(format!("{b}/mcp"))
-                .header("authorization", format!("Bearer {t}"))
-                .json(&json!({ "jsonrpc": "2.0", "id": id, "method": m, "params": params }))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            v
-        }
-    };
-
-    assert_eq!(
-        mcp(1, "initialize", json!({"protocolVersion": "2026-07-28"})).await["result"]
-            ["serverInfo"]["name"],
-        "dash-mcp"
-    );
-    let cat = mcp(
-        2,
-        "tools/call",
-        json!({"name": "catalog_search", "arguments": {"query": "linked_prs"}}),
-    )
-    .await;
-    assert_eq!(cat["result"]["isError"], false);
-
-    let begin = mcp(
-        3,
-        "tools/call",
-        json!({"name": "draft_begin", "arguments": {}}),
-    )
-    .await;
-    let draft_id = begin["result"]["structuredContent"]["draft_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let def_res = mcp(4, "tools/call", json!({
-        "name": "definition_create",
-        "arguments": {
-            "draft_id": draft_id,
-            "package": "engineering",
-            "name": "mcp_widget_metric",
-            "definition_luau": "local dash = require(\"dash\"); return dash.data_provider { id = \"engineering.mcp_widget_metric\", handler = \"query\" }",
-            "runtime_luau": "local R = {}; function R.query(ctx) return { value = 77 } end; return R"
-        }
-    })).await;
-    assert_eq!(def_res["result"]["isError"], false);
-
-    let inst_res = mcp(
-        5,
-        "tools/call",
-        json!({
-            "name": "instance_create",
-            "arguments": {
-                "draft_id": draft_id,
-                "instance": {
-                    "id": "mcp_metric",
-                    "category": "data_provider",
-                    "definition": "engineering.mcp_widget_metric"
-                }
-            }
-        }),
-    )
-    .await;
-    assert_eq!(inst_res["result"]["isError"], false);
-
-    let prev = mcp(
-        6,
-        "tools/call",
-        json!({"name": "draft_preview", "arguments": {"draft_id": draft_id}}),
-    )
-    .await;
-    assert_eq!(prev["result"]["structuredContent"]["all_passed"], true);
-
-    let act = mcp(
-        7,
-        "tools/call",
-        json!({"name": "draft_activate", "arguments": {"draft_id": draft_id}}),
-    )
-    .await;
-    assert_eq!(act["result"]["isError"], false);
-
-    let q = mcp(
-        8,
-        "tools/call",
-        json!({"name": "provider_query", "arguments": {"instance_id": "mcp_metric"}}),
-    )
-    .await;
-    assert_eq!(q["result"]["structuredContent"]["value"]["value"], 77);
-    h.abort();
-}
-
-#[tokio::test]
-async fn ac13_transactional_hot_reload_carry_over_and_stale_draft_rejection() {
-    let tmp = TempDir::new().unwrap();
-    let ws = tmp.path().join("ws");
-    let data = tmp.path().join("data");
-    copy_ecc_fixture(&ws);
-    let store = SqliteStore::open(&data).unwrap();
-    let mgr = DraftManager::initialize(ws, data, store, ResourceBudget::default())
-        .await
-        .unwrap();
-    let admin = Principal::administrator();
-
-    // Invalid draft preserves active Generation!
-    let gen_before = mgr.engine().graph.load().generation_id;
-    let bad = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_upsert_instance(
-        &bad.draft_id,
-        &InstanceConfig {
-            id: "bad_cycle".into(),
-            category: DefinitionCategory::DataProvider,
-            definition: "nonexistent.def".into(),
-            inputs: BTreeMap::new(),
-            config: json!({}),
-            secrets: BTreeMap::new(),
-            capabilities: vec![],
-            run_as: None,
-            enabled: None,
-        },
-    )
-    .unwrap();
-    assert!(mgr.draft_activate(&bad.draft_id, &admin).await.is_err());
-    assert_eq!(mgr.engine().graph.load().generation_id, gen_before);
-    mgr.draft_abort(&bad.draft_id).await.unwrap();
-}
+// AC-12 and AC-13 are covered end to end in `ac_11_14.rs` (MCP Agent cycle with rebase, action
+// invocation and push; invalid updates, concurrent readers, carry-over, stale-base rejection).
 
 #[tokio::test]
 async fn ac14_git_transaction_single_commit_unsynced_retry_and_crash_recovery() {
@@ -951,7 +793,22 @@ async fn ac14_git_transaction_single_commit_unsynced_retry_and_crash_recovery() 
             .unwrap()
             .is_empty());
         assert_eq!(mgr.engine().graph.load().generation_id, 1);
+        // A journal whose base and target both differ from HEAD is not silently treated as
+        // landed or rolled back: it is resolved as failed and surfaced as a startup warning.
+        assert!(
+            mgr.startup_warnings()
+                .iter()
+                .any(|w| w.contains("jrn_crash") && w.contains("external Git divergence")),
+            "{:?}",
+            mgr.startup_warnings()
+        );
+        assert_eq!(
+            mgr.engine().graph.load().revision_commit,
+            mgr.active_revision().await.unwrap()
+        );
     }
+    // One commit per draft, push failure / sync retry and crash recovery at every activation
+    // journal stage are covered in `ac_11_14.rs`.
 }
 
 #[tokio::test]

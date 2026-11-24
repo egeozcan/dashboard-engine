@@ -106,6 +106,28 @@ pub struct DraftManager {
     /// Drafts with an activation, rebase or abort in progress (draft id -> operation).
     busy: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
     startup_warnings: Arc<Vec<String>>,
+    /// Test-only simulated process crash point inside activation (see [`CRASH_POINTS`]).
+    crash_point: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Named points of the activation protocol at which [`DraftManager::set_crash_point_for_tests`]
+/// can simulate a process crash, in protocol order.
+#[doc(hidden)]
+pub const CRASH_POINTS: &[&str] = &[
+    "after_journal_started",
+    "after_commit_object",
+    "after_target_journalled",
+    "after_head_moved",
+    "after_committed",
+    "after_generation_recorded",
+    "after_swap",
+    "before_push",
+];
+
+const SIMULATED_CRASH_PREFIX: &str = "simulated crash at ";
+
+fn is_simulated_crash(e: &GitError) -> bool {
+    matches!(e, GitError::Workspace(m) if m.starts_with(SIMULATED_CRASH_PREFIX))
 }
 
 impl DraftManager {
@@ -199,6 +221,7 @@ impl DraftManager {
             record_lock: Arc::new(std::sync::Mutex::new(())),
             busy: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             startup_warnings: Arc::new(warnings),
+            crash_point: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -234,6 +257,35 @@ impl DraftManager {
     /// Revision of the Generation that is currently serving.
     pub fn active_generation_revision(&self) -> String {
         self.engine.graph.load().revision_commit.clone()
+    }
+
+    /// Test hook: make the next activation stop dead at `point` (one of [`CRASH_POINTS`]),
+    /// returning an error without running any of the remaining steps or rollbacks, as if the
+    /// process had been killed there. Startup reconciliation is then exercised by reopening
+    /// the Workspace with a new manager (§12.2 activation journal).
+    #[doc(hidden)]
+    pub fn set_crash_point_for_tests(&self, point: Option<&str>) {
+        if let Some(p) = point {
+            assert!(CRASH_POINTS.contains(&p), "unknown crash point '{p}'");
+        }
+        *self
+            .crash_point
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = point.map(str::to_string);
+    }
+
+    fn simulated_crash(&self, point: &str) -> Result<(), GitError> {
+        let mut cp = self
+            .crash_point
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cp.as_deref() == Some(point) {
+            *cp = None;
+            return Err(GitError::Workspace(format!(
+                "{SIMULATED_CRASH_PREFIX}{point}"
+            )));
+        }
+        Ok(())
     }
 
     // ---- Authorization ----
@@ -1075,6 +1127,7 @@ impl DraftManager {
         self.store
             .upsert_activation_journal(&journal("started", None, None, None))
             .map_err(|e| GitError::Workspace(e.to_string()))?;
+        self.simulated_crash("after_journal_started")?;
 
         let (summary, message) = commit_message(&draft, principal);
         let base_tree = git_tree_of(&self.workspace_dir, &active_rev).await?;
@@ -1105,12 +1158,17 @@ impl DraftManager {
                 }
             }
         };
+        self.simulated_crash("after_commit_object")?;
         // Record the target before HEAD moves so crash recovery can decide deterministically
         self.store
             .upsert_activation_journal(&journal("started", Some(&new_commit), None, None))
             .map_err(|e| GitError::Workspace(e.to_string()))?;
+        self.simulated_crash("after_target_journalled")?;
         if new_commit != active_rev {
             if let Err(e) = self.advance_workspace(&active_rev, &new_commit, mode).await {
+                if is_simulated_crash(&e) {
+                    return Err(e);
+                }
                 let _ = self.store.upsert_activation_journal(&journal(
                     "failed",
                     Some(&new_commit),
@@ -1136,6 +1194,7 @@ impl DraftManager {
             ));
             return Err(GitError::Workspace(e.to_string()));
         }
+        self.simulated_crash("after_committed")?;
 
         // Record the Generation only once the new graph is fully built, right before the swap
         live_graph.revision_commit = new_commit.clone();
@@ -1160,6 +1219,7 @@ impl DraftManager {
             }
         };
         live_graph.generation_id = new_gen_id;
+        self.simulated_crash("after_generation_recorded")?;
 
         // Migrate State transactionally and seed defaults before touching the live runtime; a
         // failed migration rolls back and leaves the live Generation and its State untouched (§8).
@@ -1199,6 +1259,15 @@ impl DraftManager {
             .mark_generation_stale(&downstream_affected, new_gen_id);
         // Dashboard State defaults were seeded by apply_generation_state above.
         let _ = self.engine.history.sync_series_configs(&history_cfg);
+        self.simulated_crash("after_swap")?;
+        // Mark the draft activated before the journal leaves `committed`: a crash in between is
+        // then still reconciled at startup, and a draft whose content is live never stays open
+        // (e.g. after a crash before the push).
+        remove_worktree(&self.workspace_dir, &wt).await;
+        self.update_record(&draft_id, |r| {
+            r.status = "activated".into();
+            Ok(())
+        })?;
         if let Err(e) = self.store.upsert_activation_journal(&journal(
             "activated",
             Some(&new_commit),
@@ -1220,6 +1289,7 @@ impl DraftManager {
             });
         }
 
+        self.simulated_crash("before_push")?;
         // Attempt push to configured remote; push failure leaves active/committed/unsynced (§12.2 step 8)
         let (sync_status, sync_error) = self.attempt_push(&new_commit).await;
         if sync_status == "synced" {
@@ -1230,13 +1300,6 @@ impl DraftManager {
                 None,
             ));
         }
-
-        // Cleanup draft worktree & mark activated
-        remove_worktree(&self.workspace_dir, &wt).await;
-        self.update_record(&draft_id, |r| {
-            r.status = "activated".into();
-            Ok(())
-        })?;
 
         let _ = self.store.append_audit(
             &principal.id,
@@ -1311,6 +1374,7 @@ impl DraftManager {
     ) -> Result<(), GitError> {
         let ws = &self.workspace_dir;
         git_update_head(ws, new_commit, base, "dash: activate draft").await?;
+        self.simulated_crash("after_head_moved")?;
         let res = match mode {
             ActivationMode::Draft => git_read_tree_fast_forward(ws, base, new_commit).await,
             ActivationMode::Reload => git_read_tree_index_only(ws, new_commit).await,

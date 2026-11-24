@@ -2282,7 +2282,19 @@ impl QueryEngine {
         dashboard_id: &str,
         principal: &Principal,
     ) -> Result<serde_json::Value, String> {
-        let g = self.graph.load_full();
+        self.render_dashboard_in(self.graph.load_full(), dashboard_id, principal)
+            .await
+    }
+
+    /// Render `dashboard_id` entirely from the Generation snapshot `g`. Callers that combine
+    /// the render with other Generation data (the Dashboard document, widget asset URLs) pass
+    /// the same snapshot so a concurrent activation can never produce a mixed response (§17.13).
+    pub async fn render_dashboard_in(
+        &self,
+        g: Arc<ConfiguredGraph>,
+        dashboard_id: &str,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
         let dash = g
             .dashboards
             .get(dashboard_id)
