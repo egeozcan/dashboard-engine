@@ -425,7 +425,7 @@ impl HostBridge for MockTestBridge {
             q.validate_value(&params)
                 .map_err(|e| format!("invalid query parameters for '{def_id}': {e}"))?;
         }
-        let val = self
+        let mut val = self
             .run_nested(
                 &target,
                 DefinitionCategory::DataProvider,
@@ -436,6 +436,7 @@ impl HostBridge for MockTestBridge {
             )
             .await?;
         if let Some(ref out) = target.manifest.output {
+            out.normalize_empty_lists(&mut val);
             out.validate_value(&val)
                 .map_err(|e| format!("output contract violation on '{def_id}': {e}"))?;
         }

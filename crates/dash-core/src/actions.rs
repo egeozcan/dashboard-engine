@@ -928,7 +928,7 @@ impl ActionManager {
             retry_safe: false,
         };
         match run_res {
-            Ok(val) => {
+            Ok(mut val) => {
                 if val.get("__unknown").and_then(|v| v.as_bool()) == Some(true) {
                     let reason = val
                         .get("reason")
@@ -938,6 +938,7 @@ impl ActionManager {
                     return unknown(reason);
                 }
                 if let Some(ref schema) = def.manifest.result {
+                    schema.normalize_empty_lists(&mut val);
                     if let Err(e) = schema.validate_value(&val) {
                         let reason = format!("invalid_result_contract: {e}");
                         // The side effect may already have happened: never claim `failed` then.

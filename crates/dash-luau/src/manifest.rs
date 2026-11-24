@@ -207,6 +207,46 @@ impl SchemaSpec {
         }
     }
 
+    /// Luau has a single table type, so an empty list returned by a handler (`return {}`)
+    /// crosses the VM boundary as an empty JSON object. Rewrite such values to `[]` wherever this
+    /// schema expects a list, so empty results satisfy their own contract (and stay lists for
+    /// deltas and consumers). Call before [`Self::validate_value`] on handler outputs.
+    pub fn normalize_empty_lists(&self, val: &mut serde_json::Value) {
+        match self {
+            Self::List { item } => {
+                if val.as_object().is_some_and(|o| o.is_empty()) {
+                    *val = serde_json::Value::Array(Vec::new());
+                }
+                if let Some(arr) = val.as_array_mut() {
+                    for elem in arr {
+                        item.normalize_empty_lists(elem);
+                    }
+                }
+            }
+            Self::Optional { inner } => inner.normalize_empty_lists(val),
+            Self::Map { value } => {
+                if let Some(obj) = val.as_object_mut() {
+                    for v in obj.values_mut() {
+                        value.normalize_empty_lists(v);
+                    }
+                }
+            }
+            Self::Object { fields } => {
+                if let Some(obj) = val.as_object_mut() {
+                    for (k, field_schema) in fields {
+                        if let Some(v) = obj.get_mut(k) {
+                            field_schema.normalize_empty_lists(v);
+                        }
+                    }
+                }
+            }
+            Self::Semantic {
+                shape: Some(inner), ..
+            } => inner.normalize_empty_lists(val),
+            _ => {}
+        }
+    }
+
     pub fn validate_value(&self, val: &serde_json::Value) -> Result<(), String> {
         self.validate_at("$", val)
     }
@@ -862,5 +902,40 @@ mod tests {
         assert!(build_semantic_registry([("a.p", &producer), ("a.o", &other)]).is_err());
         let orphan = manifest_with_output("a.x", sem("dev.none@1", None));
         assert!(build_semantic_registry([("a.x", &orphan)]).is_err());
+    }
+
+    #[test]
+    fn empty_luau_tables_become_lists_where_the_schema_expects_one() {
+        let schema = obj(&[
+            (
+                "rows",
+                SchemaSpec::List {
+                    item: Box::new(obj(&[(
+                        "tags",
+                        SchemaSpec::List {
+                            item: Box::new(SchemaSpec::String),
+                        },
+                    )])),
+                },
+            ),
+            (
+                "meta",
+                SchemaSpec::Map {
+                    value: Box::new(SchemaSpec::Any),
+                },
+            ),
+        ]);
+        let mut v = serde_json::json!({ "rows": {}, "meta": {} });
+        assert!(schema.validate_value(&v).is_err());
+        schema.normalize_empty_lists(&mut v);
+        assert_eq!(v, serde_json::json!({ "rows": [], "meta": {} }));
+        let mut nested = serde_json::json!({ "rows": [{ "tags": {} }], "meta": {} });
+        schema.normalize_empty_lists(&mut nested);
+        assert_eq!(nested["rows"][0]["tags"], serde_json::json!([]));
+        schema.validate_value(&nested).unwrap();
+        // A non-empty object where a list is expected is still a contract violation.
+        let mut bad = serde_json::json!({ "rows": { "a": 1 }, "meta": {} });
+        schema.normalize_empty_lists(&mut bad);
+        assert!(schema.validate_value(&bad).is_err());
     }
 }

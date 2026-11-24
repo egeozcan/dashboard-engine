@@ -1463,7 +1463,7 @@ impl QueryEngine {
 
         let deps = recorded_deps.lock().unwrap().clone();
         let upstreams = recorded_upstreams.lock().unwrap().clone();
-        let val = match res {
+        let mut val = match res {
             Ok(v) => v,
             Err(e) => {
                 return Err(ProviderFailure {
@@ -1476,6 +1476,7 @@ impl QueryEngine {
 
         // Validate output contract at boundary
         if let Some(ref out_schema) = def.manifest.output {
+            out_schema.normalize_empty_lists(&mut val);
             if let Err(e) = out_schema.validate_value(&val) {
                 return Err(ProviderFailure {
                     message: format!("output contract violation on '{}': {e}", inst.id),

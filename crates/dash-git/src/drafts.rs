@@ -185,6 +185,8 @@ impl DraftManager {
         let engine = RuntimeEngine::new(graph.clone(), store.clone(), budget)
             .map_err(|e| GitError::Workspace(e.to_string()))?;
         let _ = engine.history.sync_series_configs(&graph.workspace.history);
+        // Durable consumers start at this Generation's activation point (§7.2).
+        engine.automations.register_consumers();
         for dash in graph.dashboards.values() {
             let _ = engine.state.seed_dashboard_defaults(dash, gen_id);
         }
@@ -1199,6 +1201,7 @@ impl DraftManager {
             .mark_generation_stale(&downstream_affected, new_gen_id);
         // Dashboard State defaults were seeded by apply_generation_state above.
         let _ = self.engine.history.sync_series_configs(&history_cfg);
+        self.engine.automations.register_consumers();
         if let Err(e) = self.store.upsert_activation_journal(&journal(
             "activated",
             Some(&new_commit),
