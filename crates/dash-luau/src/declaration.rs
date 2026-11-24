@@ -908,7 +908,7 @@ fn parse_operations(
         let (op_name, op_tbl) = pair?;
         check_known_keys(
             &op_tbl,
-            &["description", "required_capabilities", "args", "result"],
+            &["description", "required_capabilities", "args", "result", "mode"],
             &format!("operation '{op_name}'"),
         )?;
         let description: String = get_opt_string(&op_tbl, "description")?.unwrap_or_default();
