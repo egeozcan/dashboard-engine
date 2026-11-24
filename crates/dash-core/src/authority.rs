@@ -516,6 +516,16 @@ pub fn validate_configured_graph(
         }
     }
 
+    // §4.4: Definitions may only require declared libraries from resolved packages.
+    for (def_id, _lib, message) in graph.unresolved_library_declarations() {
+        issues.push(ValidationIssue {
+            severity: "error".into(),
+            code: "UNRESOLVED_LIBRARY".into(),
+            target: def_id,
+            message,
+        });
+    }
+
     let valid = !issues.iter().any(|i| i.severity == "error");
     ValidationReport { valid, issues }
 }

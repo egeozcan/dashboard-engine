@@ -11,7 +11,7 @@ use dash_git::{
     read_packages_toml, write_packages_toml, ActivationResult, DraftManager, GitCommitInfo,
     GitError, GitStatusReport, PackageDependencySpec, PackagesLock, PreviewTestReport,
 };
-use dash_luau::{run_definition_tests, DefinitionCategory, DefinitionTestReport, NullHostBridge};
+use dash_luau::{DefinitionCategory, DefinitionTestReport};
 use dash_store::{
     ActionExecutionRecord, AgentPrincipalRecord, AuditRecord, DraftRecord, GitSyncRecord,
     SecretMetadata, SqliteStore, TraceSpanRecord,
@@ -358,23 +358,8 @@ impl AppServices {
             is_preview,
         )
         .map_err(|e| e.to_string())?;
-        let def = graph
-            .definitions
-            .get(definition_id)
-            .ok_or_else(|| format!("definition '{definition_id}' not found"))?;
-        let tests_src = def
-            .tests_source
-            .as_deref()
-            .ok_or_else(|| format!("definition '{definition_id}' has no tests.luau"))?;
-        run_definition_tests(
-            &def.manifest,
-            &def.runtime_source,
-            tests_src,
-            &graph.resolved_libraries(),
-            Arc::new(NullHostBridge),
-            serde_json::json!({}),
-        )
-        .await
+        // §4.5: Definition tests run against Mocks, not a null bridge.
+        dash_git::run_definition_tests_against_mocks(Arc::new(graph), definition_id).await
     }
 
     pub fn instance_upsert_in_draft(

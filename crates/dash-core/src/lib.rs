@@ -73,6 +73,26 @@ impl RuntimeEngine {
         let events = EventBus::new(store.clone(), 512);
         let state = StateManager::new(store.clone(), signals.clone());
         let telemetry = Telemetry::new(store.clone());
+        // Per-Instance Luau budgets from the live graph's `[resources]` (§2.1), and VM-level
+        // trace spans for startup, memory, interrupts, queue and execution time (§15.1).
+        {
+            let g = Arc::clone(&graph);
+            pool.set_budget_resolver(Arc::new(move |inst_id: &str| {
+                g.load().workspace.resources.overrides_for(inst_id)
+            }));
+            let tel = telemetry.clone();
+            pool.set_execution_observer(Arc::new(move |s: &dash_luau::ExecutionStats| {
+                tel.record_span(
+                    &s.trace_id,
+                    None,
+                    &format!("luau_vm:{}:{}", s.instance_id, s.handler),
+                    "system",
+                    serde_json::to_value(s).unwrap_or_default(),
+                    if s.outcome == "ok" { "ok" } else { "error" },
+                    (s.queue_ms + s.exec_ms) as i64,
+                );
+            }));
+        }
         let queries = QueryEngine::new(
             Arc::clone(&graph),
             pool.clone(),

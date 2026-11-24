@@ -1213,6 +1213,26 @@ impl HostBridge for EngineHostBridge {
             .map(|_| ())
     }
 
+    async fn emit_event_versioned(
+        &self,
+        event_type: &str,
+        schema_version: &str,
+        payload: serde_json::Value,
+        durable: bool,
+    ) -> Result<(), String> {
+        self.engine
+            .events
+            .emit(
+                &self.caller_inst.id,
+                event_type,
+                schema_version,
+                &self.trace_id,
+                durable,
+                payload,
+            )
+            .map(|_| ())
+    }
+
     async fn state_get(&self, scope: &str, key: &str) -> Result<serde_json::Value, String> {
         let owner = match scope {
             "dashboard" => {
