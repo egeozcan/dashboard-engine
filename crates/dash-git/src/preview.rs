@@ -917,7 +917,8 @@ mod mock_test_bridge_tests {
             assert_eq!(r.failed, 0, "definition test failed: {r:?}");
         }
         // connector input -> github.mock fixtures (and Mock state within one test)
-        assert_eq!(report_for(&reports, "github.merge_pr").passed, 3);
+        // 3 Mock-backed cases + 6 self-contained reconcile/dry_run/execute cases
+        assert_eq!(report_for(&reports, "github.merge_pr").passed, 9);
         assert_eq!(report_for(&reports, "github.pull_requests").passed, 2);
         // data inputs -> providers -> Mocks
         assert_eq!(report_for(&reports, "engineering.linked_prs").passed, 2);
