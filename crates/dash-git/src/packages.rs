@@ -237,18 +237,174 @@ pub fn validate_dependency_spec(
     Ok(())
 }
 
-fn git_command() -> tokio::process::Command {
+/// Who steers the Git I/O of a package resolution (R7:SEC-5, §11.3, §14.2).
+#[derive(Debug, Clone, Default)]
+pub enum PackageFetchPolicy {
+    /// Administrator or Workspace configuration: any validated source, the daemon's Git setup.
+    #[default]
+    Trusted,
+    /// A non-Administrator Principal (an Agent's `dependency_update`) steers the fetch: every
+    /// remote actually fetched must be allowed by the Administrator network ceiling and resolve
+    /// only to public addresses (the HTTP broker's SSRF rules); local repositories are refused;
+    /// Git runs without the daemon's ambient credentials, SSH keys/agent or Git config; and a
+    /// failed fetch is reported without Git's stderr (kept in the daemon log for the
+    /// Administrator), so it cannot be used to probe internal hosts.
+    Restricted {
+        network_ceiling: Option<dash_core::NetworkPolicy>,
+    },
+}
+
+impl PackageFetchPolicy {
+    /// [`Self::Trusted`] for unrestricted (Administrator) Principals, otherwise
+    /// [`Self::Restricted`] under the Administrator network ceiling stored in SQLite.
+    pub fn for_principal(
+        principal: &dash_core::Principal,
+        store: &dash_store::SqliteStore,
+    ) -> Self {
+        if principal.ceiling.unrestricted {
+            Self::Trusted
+        } else {
+            Self::Restricted {
+                network_ceiling: dash_core::load_network_ceiling(store),
+            }
+        }
+    }
+
+    fn is_restricted(&self) -> bool {
+        matches!(self, Self::Restricted { .. })
+    }
+}
+
+/// `(host, port)` of a remote dependency URL (`https://`, `ssh://`, scp-like `user@host:path`).
+fn remote_git_host(url: &str) -> Option<(String, u16)> {
+    let (rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (r, 443)
+    } else if let Some(r) = url.strip_prefix("ssh://") {
+        (r, 22)
+    } else if is_scp_like_url(url) {
+        let (user_host, _) = url.split_once(':')?;
+        let (_, host) = user_host.split_once('@')?;
+        return Some((host.to_ascii_lowercase(), 22));
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = if let Some(v6) = host_port.strip_prefix('[') {
+        let (h, after) = v6.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if after.is_empty() => default_port,
+            None => return None,
+        };
+        (h.to_string(), port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (host_port.to_string(), default_port),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port))
+}
+
+/// Vet a fetch steered by a restricted Principal before any Git I/O. Returns the
+/// `http.curloptResolve` pin for an `https` remote (connect only to the vetted addresses).
+async fn vet_restricted_fetch(
+    url: &str,
+    network_ceiling: Option<&dash_core::NetworkPolicy>,
+) -> Result<Option<String>, GitError> {
+    if is_local_git_url(url) {
+        return Err(GitError::Package(format!(
+            "local repository '{url}' cannot be fetched for this principal"
+        )));
+    }
+    let (host, port) = remote_git_host(url)
+        .ok_or_else(|| GitError::Package(format!("cannot determine the host of '{url}'")))?;
+    let addrs = dash_core::http_broker::vet_outbound_host(&host, port, network_ceiling)
+        .await
+        .map_err(|e| {
+            GitError::Package(format!(
+                "package source '{host}:{port}' is not reachable for this principal: {e}"
+            ))
+        })?;
+    if !url.starts_with("https://") || host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(None);
+    }
+    let list: Vec<String> = addrs
+        .iter()
+        .map(|a| match a.ip() {
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+            v4 => v4.to_string(),
+        })
+        .collect();
+    Ok(Some(format!("{host}:{port}:{}", list.join(","))))
+}
+
+fn git_command(policy: &PackageFetchPolicy) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
+    if policy.is_restricted() {
+        // No ambient authority: no inherited credentials, SSH agent/keys, proxies or Git config.
+        cmd.env_clear();
+        for keep in [
+            "PATH",
+            "SYSTEMROOT",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "LANG",
+            "LC_ALL",
+        ] {
+            if let Some(v) = std::env::var_os(keep) {
+                cmd.env(keep, v);
+            }
+        }
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        cmd.env(
+            "HOME",
+            std::env::temp_dir().join("dash-restricted-git-home"),
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env(
+            "GIT_SSH_COMMAND",
+            format!(
+                "ssh -F none -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=none \
+                     -o IdentityAgent=none -o StrictHostKeyChecking=accept-new \
+                     -o UserKnownHostsFile={null}"
+            ),
+        );
+    }
+    let protocols = if policy.is_restricted() {
+        "https:ssh"
+    } else {
+        "https:ssh:file"
+    };
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         // Only plain transports; never `ext::` or other remote helpers.
-        .env("GIT_ALLOW_PROTOCOL", "https:ssh:file");
+        .env("GIT_ALLOW_PROTOCOL", protocols);
     cmd
 }
 
 async fn run_pkg_git(cwd: Option<&Path>, args: &[&str]) -> Result<String, GitError> {
-    let mut cmd = git_command();
+    run_pkg_git_with(cwd, args, &PackageFetchPolicy::Trusted, &[]).await
+}
+
+/// Run `git <config...> <args>` under `policy` (`config` are `-c key=value` pairs).
+async fn run_pkg_git_with(
+    cwd: Option<&Path>,
+    args: &[&str],
+    policy: &PackageFetchPolicy,
+    config: &[String],
+) -> Result<String, GitError> {
+    let mut cmd = git_command(policy);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+    }
+    for c in config {
+        cmd.arg("-c").arg(c);
     }
     let output = cmd.args(args).output().await?;
     if !output.status.success() {
@@ -262,19 +418,54 @@ async fn run_pkg_git(cwd: Option<&Path>, args: &[&str]) -> Result<String, GitErr
 
 /// Clone `url` into `dest` and check out `rev` (a branch, tag or commit) detached.
 /// Returns the checked-out commit hash.
-async fn clone_checkout(url: &str, rev: &str, dest: &Path) -> Result<String, GitError> {
+async fn clone_checkout(
+    url: &str,
+    rev: &str,
+    dest: &Path,
+    policy: &PackageFetchPolicy,
+) -> Result<String, GitError> {
     if rev.starts_with('-') {
         return Err(GitError::Package(format!("invalid revision '{rev}'")));
+    }
+    // A clone steered by a restricted Principal is subject to the Administrator network ceiling
+    // (§14.2) and runs without the daemon's Git credentials (R7:SEC-5).
+    let mut config: Vec<String> = Vec::new();
+    if let PackageFetchPolicy::Restricted { network_ceiling } = policy {
+        if let Some(pin) = vet_restricted_fetch(url, network_ceiling.as_ref()).await? {
+            config.push(format!("http.curloptResolve={pin}"));
+        }
+        config.extend(
+            [
+                "credential.helper=",
+                "core.askPass=",
+                "http.followRedirects=false",
+                "protocol.file.allow=never",
+                "http.proxy=",
+            ]
+            .map(String::from),
+        );
     }
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
     let dest_s = dest.to_string_lossy().to_string();
-    run_pkg_git(
+    let cloned = run_pkg_git_with(
         None,
         &["clone", "--no-checkout", "--quiet", "--", url, &dest_s],
+        policy,
+        &config,
     )
-    .await?;
+    .await;
+    match cloned {
+        Ok(_) => {}
+        Err(GitError::Command { stderr, .. }) if policy.is_restricted() => {
+            tracing::warn!("restricted package fetch of '{url}' failed: {stderr}");
+            return Err(GitError::Package(format!(
+                "fetching '{url}' failed (details are in the daemon log)"
+            )));
+        }
+        Err(e) => return Err(e),
+    }
     // Resolve the revision to a commit: the name itself (tags, SHAs, the default branch), then the
     // remote-tracking branch of the same name.
     let mut commit = None;
@@ -310,7 +501,7 @@ pub async fn resolve_and_lock_packages(
     workspace_dir: &Path,
     data_dir: &Path,
 ) -> Result<PackagesLock, GitError> {
-    resolve_with_policy(workspace_dir, data_dir, None).await
+    resolve_with_policy(workspace_dir, data_dir, None, &PackageFetchPolicy::Trusted).await
 }
 
 /// Re-resolve only `target` (and any of its subdependencies that are new or whose requirement
@@ -322,7 +513,31 @@ pub async fn update_package_lock(
     target: &str,
 ) -> Result<PackagesLock, GitError> {
     let existing = read_packages_lock(workspace_dir)?;
-    resolve_with_policy(workspace_dir, data_dir, Some((&existing, target))).await
+    resolve_with_policy(
+        workspace_dir,
+        data_dir,
+        Some((&existing, target)),
+        &PackageFetchPolicy::Trusted,
+    )
+    .await
+}
+
+/// [`update_package_lock`] with the Git I/O steered under `fetch_policy` (the requesting
+/// Principal's, see [`PackageFetchPolicy::for_principal`]).
+pub async fn update_package_lock_with_policy(
+    workspace_dir: &Path,
+    data_dir: &Path,
+    target: &str,
+    fetch_policy: &PackageFetchPolicy,
+) -> Result<PackagesLock, GitError> {
+    let existing = read_packages_lock(workspace_dir)?;
+    resolve_with_policy(
+        workspace_dir,
+        data_dir,
+        Some((&existing, target)),
+        fetch_policy,
+    )
+    .await
 }
 
 /// Like [`update_package_lock`], but resolves the in-memory `manifest` (a candidate
@@ -335,17 +550,37 @@ pub async fn resolve_package_update(
     manifest: &PackagesToml,
     target: &str,
 ) -> Result<PackagesLock, GitError> {
+    resolve_package_update_with_policy(
+        workspace_dir,
+        data_dir,
+        manifest,
+        target,
+        &PackageFetchPolicy::Trusted,
+    )
+    .await
+}
+
+/// [`resolve_package_update`] with the Git I/O steered under `fetch_policy` (the requesting
+/// Principal's, see [`PackageFetchPolicy::for_principal`]).
+pub async fn resolve_package_update_with_policy(
+    workspace_dir: &Path,
+    data_dir: &Path,
+    manifest: &PackagesToml,
+    target: &str,
+    fetch_policy: &PackageFetchPolicy,
+) -> Result<PackagesLock, GitError> {
     let existing = read_packages_lock(workspace_dir)?;
-    resolve_manifest(manifest, data_dir, Some((&existing, target))).await
+    resolve_manifest(manifest, data_dir, Some((&existing, target)), fetch_policy).await
 }
 
 async fn resolve_with_policy(
     workspace_dir: &Path,
     data_dir: &Path,
     reuse: Option<(&PackagesLock, &str)>,
+    fetch_policy: &PackageFetchPolicy,
 ) -> Result<PackagesLock, GitError> {
     let manifest = read_packages_toml(workspace_dir)?;
-    let lock = resolve_manifest(&manifest, data_dir, reuse).await?;
+    let lock = resolve_manifest(&manifest, data_dir, reuse, fetch_policy).await?;
     write_packages_lock(workspace_dir, &lock)?;
     Ok(lock)
 }
@@ -356,8 +591,10 @@ async fn resolve_manifest(
     manifest: &PackagesToml,
     data_dir: &Path,
     reuse: Option<(&PackagesLock, &str)>,
+    fetch_policy: &PackageFetchPolicy,
 ) -> Result<PackagesLock, GitError> {
     let mut ctx = ResolveCtx {
+        fetch_policy,
         data_dir,
         existing: reuse
             .map(|(lock, _)| {
@@ -387,6 +624,7 @@ async fn resolve_manifest(
 }
 
 struct ResolveCtx<'a> {
+    fetch_policy: &'a PackageFetchPolicy,
     data_dir: &'a Path,
     existing: BTreeMap<String, LockedPackage>,
     reuse_enabled: bool,
@@ -446,13 +684,15 @@ fn resolve_recursive<'a>(
 
         let (commit, tree_digest, cache_dir) = match reusable {
             Some(locked) => {
-                let dir = ensure_locked_package_cached(ctx.data_dir, &locked).await?;
+                let dir =
+                    ensure_locked_package_cached(ctx.data_dir, &locked, ctx.fetch_policy).await?;
                 (locked.commit.clone(), locked.tree_digest.clone(), dir)
             }
             None => {
                 let tmp_dir = tempfile::tempdir()?;
                 let clone_dir = tmp_dir.path().join("repo");
-                let commit = clone_checkout(&spec.git, &spec.git_ref, &clone_dir).await?;
+                let commit =
+                    clone_checkout(&spec.git, &spec.git_ref, &clone_dir, ctx.fetch_policy).await?;
                 let src_root = package_source_root(name, &clone_dir, spec.subdir.as_deref())?;
                 let tree_digest = compute_tree_digest(&src_root)?;
                 let dir = install_into_cache(ctx.data_dir, &src_root, &tree_digest)?;
@@ -642,6 +882,7 @@ fn validate_locked_entry(pkg: &LockedPackage) -> Result<(), GitError> {
 async fn ensure_locked_package_cached(
     data_dir: &Path,
     pkg: &LockedPackage,
+    fetch_policy: &PackageFetchPolicy,
 ) -> Result<PathBuf, GitError> {
     validate_locked_entry(pkg)?;
     let dir = package_cache_dir(data_dir, &pkg.tree_digest);
@@ -650,7 +891,7 @@ async fn ensure_locked_package_cached(
     }
     let tmp_dir = tempfile::tempdir()?;
     let clone_dir = tmp_dir.path().join("repo");
-    let commit = clone_checkout(&pkg.git, &pkg.commit, &clone_dir).await?;
+    let commit = clone_checkout(&pkg.git, &pkg.commit, &clone_dir, fetch_policy).await?;
     if !commit.starts_with(&pkg.commit) && !pkg.commit.starts_with(&commit) {
         return Err(GitError::Package(format!(
             "locked package '{}': fetched commit {commit} differs from pinned {}",
@@ -694,7 +935,7 @@ pub async fn fetch_locked_packages(
         if dir.exists() && verify_cached_package(&dir, &pkg.tree_digest).is_ok() {
             continue;
         }
-        ensure_locked_package_cached(data_dir, pkg).await?;
+        ensure_locked_package_cached(data_dir, pkg, &PackageFetchPolicy::Trusted).await?;
         fetched.push(pkg.name.clone());
     }
     Ok(fetched)
@@ -1311,5 +1552,132 @@ mod tests {
             "{:?}",
             report.issues
         );
+    }
+
+    #[test]
+    fn remote_hosts_are_parsed_from_every_url_form() {
+        for (url, want) in [
+            ("https://example.com/r.git", Some(("example.com", 443))),
+            (
+                "https://u:p@Example.com:8443/r.git",
+                Some(("example.com", 8443)),
+            ),
+            ("https://10.0.0.12:8443/", Some(("10.0.0.12", 8443))),
+            ("https://[::1]:8443/r", Some(("::1", 8443))),
+            (
+                "ssh://git@internal-scm:2222/secret/repo",
+                Some(("internal-scm", 2222)),
+            ),
+            (
+                "ssh://git@internal-scm/secret/repo",
+                Some(("internal-scm", 22)),
+            ),
+            (
+                "git@scm.example.com:org/repo.git",
+                Some(("scm.example.com", 22)),
+            ),
+            ("/srv/repo", None),
+            ("https:///nohost", None),
+        ] {
+            assert_eq!(
+                remote_git_host(url),
+                want.map(|(h, p)| (h.to_string(), p)),
+                "{url}"
+            );
+        }
+    }
+
+    fn wide_ceiling(loopback: bool) -> dash_core::NetworkPolicy {
+        dash_core::NetworkPolicy {
+            allowed_hosts: vec!["*".into()],
+            allowed_methods: vec!["*".into()],
+            allow_loopback_for_tests: loopback,
+        }
+    }
+
+    // R7:SEC-5: a restricted Principal's dependency fetch is held to the Administrator network
+    // ceiling and the SSRF address rules before any Git I/O, never fetches local repositories,
+    // and a failed fetch reveals nothing of Git's (connection) errors.
+    #[tokio::test]
+    async fn restricted_dependency_fetches_are_subject_to_the_network_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a = tmp.path().join("a");
+        make_pkg_repo(&repo_a, "alpha", "a1").await;
+        let ws = tmp.path().join("ws");
+        let data = tmp.path().join("data");
+        write_ws_deps(&ws, &[("alpha", &repo_a)]);
+        resolve_and_lock_packages(&ws, &data).await.unwrap();
+
+        let restricted = |loopback: Option<bool>| PackageFetchPolicy::Restricted {
+            network_ceiling: loopback.map(wide_ceiling),
+        };
+        let add_dep = |name: &str, url: &str| {
+            let mut cfg = read_packages_toml(&ws).unwrap();
+            cfg.dependencies
+                .insert(name.to_string(), spec(url, "main", None));
+            write_packages_toml(&ws, &cfg).unwrap();
+        };
+
+        // Internal addresses: refused before Git runs, under any ceiling.
+        for (url, ceiling) in [
+            ("https://10.0.0.12:8443/x.git", Some(false)),
+            ("ssh://git@127.0.0.1:22/secret/repo", Some(false)),
+            ("https://169.254.169.254/latest", Some(true)),
+            // No Administrator ceiling: deny by default.
+            ("https://example.com/r.git", None),
+        ] {
+            add_dep("beta", url);
+            let err = update_package_lock_with_policy(&ws, &data, "beta", &restricted(ceiling))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("not reachable for this principal"),
+                "{url}: {err}"
+            );
+        }
+        // A host outside the ceiling.
+        add_dep("beta", "https://internal-scm/x.git");
+        let narrow = PackageFetchPolicy::Restricted {
+            network_ceiling: Some(dash_core::NetworkPolicy {
+                allowed_hosts: vec!["packages.example.com".into()],
+                ..wide_ceiling(false)
+            }),
+        };
+        let err = update_package_lock_with_policy(&ws, &data, "beta", &narrow)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("network ceiling"), "{err}");
+
+        // A vetted destination that fails: Git's stderr (reachability detail) is not returned.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        add_dep("beta", &format!("ssh://git@127.0.0.1:{closed}/x.git"));
+        let err = update_package_lock_with_policy(&ws, &data, "beta", &restricted(Some(true)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("details are in the daemon log"), "{err}");
+        assert!(!err.to_lowercase().contains("refused"), "{err}");
+        assert!(!err.contains(&format!("port {closed}")), "{err}");
+
+        // Re-fetching the (Administrator-configured) local dependency is refused for a restricted
+        // Principal.
+        let mut cfg = read_packages_toml(&ws).unwrap();
+        cfg.dependencies.remove("beta");
+        write_packages_toml(&ws, &cfg).unwrap();
+        let err = update_package_lock_with_policy(&ws, &data, "alpha", &restricted(Some(true)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local repository"), "{err}");
+
+        // The Administrator (trusted) path is unchanged.
+        update_package_lock_with_policy(&ws, &data, "alpha", &PackageFetchPolicy::Trusted)
+            .await
+            .unwrap();
     }
 }

@@ -11,16 +11,24 @@
 //! vetted addresses, so a DNS answer cannot change between check and connect (DNS rebinding).
 //! Redirects are re-validated per hop; credentials are never forwarded to another origin and
 //! `https` → `http` downgrades are refused. Responses are size-limited while streaming. Every
-//! outbound request (and every denial) is audited as `http.request`.
+//! outbound request (and every denial) is audited as `http.request`; a request whose caller is
+//! dropped mid-flight (VM deadline, cancellation, bounded wait) is still audited, as `aborted`.
+//! Each hop is recorded as a `connector_http:<connector>` trace span (§15.1) with destination,
+//! method, status, outcome and retry classification.
+//!
+//! Transport errors never carry the request URL (reqwest prints it, query credentials included):
+//! messages name only the credential-free destination of the hop.
 
 use crate::authority::{check_connector_operation_authority, AuthError, Principal};
 use crate::model::{ConfiguredGraph, InstanceConfig, NetworkPolicy};
+use crate::telemetry::Telemetry;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use dash_luau::{HttpHostRequest, HttpHostResponse};
 use dash_store::SqliteStore;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use url::{Host, Url};
 
@@ -184,16 +192,90 @@ fn audit_destination(url: &Url) -> String {
     )
 }
 
+/// Trace context of one brokered request, shared by its hops.
+struct HopTrace<'a> {
+    trace_id: &'a str,
+    connector_id: &'a str,
+    principal_id: &'a str,
+    /// Set right before a hop is handed to the transport.
+    sent: &'a AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct HttpBroker {
     store: SqliteStore,
+    /// Where per-hop `connector_http:*` spans go (§15.1); `None` records no spans.
+    telemetry: Option<Telemetry>,
+}
+
+/// Writes the `http.request` audit (and trace span) of a request whose future is dropped before it
+/// completed (VM deadline, cancellation, bounded wait): exactly the requests whose upstream outcome
+/// is uncertain must not vanish from the audit log.
+struct AbortedRequestAudit<'a> {
+    broker: &'a HttpBroker,
+    principal: &'a Principal,
+    connector_id: &'a str,
+    trace_id: &'a str,
+    detail: serde_json::Value,
+    sent: &'a AtomicBool,
+    started: Instant,
+    completed: bool,
+}
+
+impl Drop for AbortedRequestAudit<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let reached_send = self.sent.load(Ordering::SeqCst);
+        let mut detail = self.detail.clone();
+        if let Some(obj) = detail.as_object_mut() {
+            obj.insert("reached_send".into(), serde_json::Value::Bool(reached_send));
+            obj.insert(
+                "error".into(),
+                serde_json::Value::String(
+                    "request dropped before completion (deadline, cancellation or caller gone); \
+                     the upstream may have processed it"
+                        .into(),
+                ),
+            );
+        }
+        let _ = self.broker.store.append_audit(
+            &self.principal.id,
+            self.principal.kind.as_str(),
+            "http.request",
+            self.connector_id,
+            "aborted",
+            detail.clone(),
+        );
+        if let Some(t) = &self.broker.telemetry {
+            t.record_span(
+                self.trace_id,
+                None,
+                &format!("connector_http:{}", self.connector_id),
+                &self.principal.id,
+                detail,
+                "aborted",
+                self.started.elapsed().as_millis() as i64,
+            );
+        }
+    }
 }
 
 impl HttpBroker {
     pub fn new(store: SqliteStore) -> Result<Self, HttpBrokerError> {
         // Fail fast if the TLS/HTTP stack cannot be initialized.
         build_client(None)?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            telemetry: None,
+        })
+    }
+
+    /// Record per-hop `connector_http:<connector>` trace spans into `telemetry` (§15.1).
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     pub async fn execute(
@@ -204,14 +286,56 @@ impl HttpBroker {
         graph: &ConfiguredGraph,
         req: HttpHostRequest,
     ) -> Result<HttpHostResponse, HttpBrokerError> {
+        self.execute_traced(principal, connector_inst, operation, graph, req, None)
+            .await
+    }
+
+    /// [`HttpBroker::execute`] inside trace `trace_id` (the calling query/action's trace), so the
+    /// connector's outbound hops show up in that trace (§15.1). Without a trace id a fresh one is
+    /// used; inside a browser/agent request scope the spans still link under the request root.
+    pub async fn execute_traced(
+        &self,
+        principal: &Principal,
+        connector_inst: &InstanceConfig,
+        operation: Option<&str>,
+        graph: &ConfiguredGraph,
+        req: HttpHostRequest,
+        trace_id: Option<&str>,
+    ) -> Result<HttpHostResponse, HttpBrokerError> {
+        let trace_id = trace_id
+            .map(str::to_string)
+            .unwrap_or_else(Telemetry::new_trace_id);
         let method = req.method.to_ascii_uppercase();
         let destination = Url::parse(&req.url)
             .map(|u| audit_destination(&u))
             .unwrap_or_else(|_| "<invalid url>".into());
         let credential_slot = req.credential.clone();
+        let sent = AtomicBool::new(false);
+        let mut abort_audit = AbortedRequestAudit {
+            broker: self,
+            principal,
+            connector_id: &connector_inst.id,
+            trace_id: &trace_id,
+            detail: serde_json::json!({
+                "operation": operation,
+                "method": method,
+                "destination": destination,
+                "credential_slot": credential_slot,
+            }),
+            sent: &sent,
+            started: Instant::now(),
+            completed: false,
+        };
+        let hop_ctx = HopTrace {
+            trace_id: &trace_id,
+            connector_id: &connector_inst.id,
+            principal_id: &principal.id,
+            sent: &sent,
+        };
         let result = self
-            .execute_inner(principal, connector_inst, operation, graph, req)
+            .execute_inner(principal, connector_inst, operation, graph, req, &hop_ctx)
             .await;
+        abort_audit.completed = true;
         let (outcome, detail) = match &result {
             Ok((resp, final_dest, cred_attached)) => (
                 "ok",
@@ -254,6 +378,7 @@ impl HttpBroker {
         operation: Option<&str>,
         graph: &ConfiguredGraph,
         req: HttpHostRequest,
+        hop_ctx: &HopTrace<'_>,
     ) -> Result<(HttpHostResponse, String, bool), HttpBrokerError> {
         if let Some(op) = operation {
             check_connector_operation_authority(principal, connector_inst, op, graph)?;
@@ -282,7 +407,7 @@ impl HttpBroker {
         let first_origin = origin_of(&current_url);
         let mut credential_active = credential.is_some();
 
-        for _redirect_hop in 0..=MAX_REDIRECTS {
+        for redirect_hop in 0..=MAX_REDIRECTS {
             let pinned = vet_destination(&current_url, &policy).await?;
             let host = host_for_policy(&current_url)?;
 
@@ -306,6 +431,8 @@ impl HttpBroker {
                 Pinned::Domain(domain, addrs) => build_client(Some((domain.as_str(), addrs)))?,
                 Pinned::IpLiteral => build_client(None)?,
             };
+            // Kept only to scrub it (query credentials included) out of transport error text.
+            let request_url_for_errors = request_url.to_string();
             let mut builder = client.request(method.clone(), request_url);
             for (k, v) in &req.headers {
                 if is_reserved_request_header(
@@ -326,14 +453,38 @@ impl HttpBroker {
             }
 
             // After a 303 redirect the current method may differ from the original one.
-            let mut resp = builder.send().await.map_err(|e| {
-                let redacted = self.store.redactor().redact_str(&error_chain(&e));
-                if request_provably_not_sent(&e) || is_safe_method(method.as_str()) {
-                    HttpBrokerError::Transport(redacted)
-                } else {
-                    HttpBrokerError::OutcomeUnknown(redacted)
+            hop_ctx.sent.store(true, Ordering::SeqCst);
+            let hop_started = Instant::now();
+            let hop_dest = audit_destination(&current_url);
+            let mut resp = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let not_sent = request_provably_not_sent(&e);
+                    let msg = self.transport_error_message(e, &request_url_for_errors, &hop_dest);
+                    let err = if not_sent || is_safe_method(method.as_str()) {
+                        HttpBrokerError::Transport(msg)
+                    } else {
+                        HttpBrokerError::OutcomeUnknown(msg)
+                    };
+                    self.record_hop(
+                        hop_ctx,
+                        redirect_hop,
+                        method.as_str(),
+                        &hop_dest,
+                        Err(&err),
+                        hop_started,
+                    );
+                    return Err(err);
                 }
-            })?;
+            };
+            self.record_hop(
+                hop_ctx,
+                redirect_hop,
+                method.as_str(),
+                &hop_dest,
+                Ok(resp.status().as_u16()),
+                hop_started,
+            );
 
             if resp.status().is_redirection() {
                 if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
@@ -384,11 +535,11 @@ impl HttpBroker {
             // outcome of a non-safe request.
             let mut bytes: Vec<u8> = Vec::new();
             while let Some(chunk) = resp.chunk().await.map_err(|e| {
-                let redacted = self.store.redactor().redact_str(&error_chain(&e));
+                let msg = self.transport_error_message(e, &request_url_for_errors, &hop_dest);
                 if is_safe_method(method.as_str()) {
-                    HttpBrokerError::Transport(redacted)
+                    HttpBrokerError::Transport(msg)
                 } else {
-                    HttpBrokerError::OutcomeUnknown(redacted)
+                    HttpBrokerError::OutcomeUnknown(msg)
                 }
             })? {
                 if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
@@ -417,6 +568,81 @@ impl HttpBroker {
         }
 
         Err(HttpBrokerError::TooManyRedirects)
+    }
+
+    /// Error text of a failed hop: reqwest's message *without* the request URL (whose query may
+    /// carry a `query:` credential in an encoded form that plaintext redaction could miss),
+    /// labelled with the credential-free [`audit_destination`], then redacted.
+    fn transport_error_message(
+        &self,
+        e: reqwest::Error,
+        request_url: &str,
+        destination: &str,
+    ) -> String {
+        let e = e.without_url();
+        let mut msg = format!("{} [{destination}]", error_chain(&e));
+        // Defence in depth: a source error that still embeds the URL or its query loses it here.
+        if !request_url.is_empty() && msg.contains(request_url) {
+            msg = msg.replace(request_url, destination);
+        }
+        if let Some((_, query)) = request_url.split_once('?') {
+            if !query.is_empty() && msg.contains(query) {
+                msg = msg.replace(query, "[REDACTED_QUERY]");
+            }
+        }
+        self.store.redactor().redact_str(&msg)
+    }
+
+    /// Record one hop as a `connector_http:<connector>` span: the status line received
+    /// (`Ok(status)`) or the transport failure, with a retry classification for diagnostics.
+    fn record_hop(
+        &self,
+        hop_ctx: &HopTrace<'_>,
+        hop: usize,
+        method: &str,
+        destination: &str,
+        result: Result<u16, &HttpBrokerError>,
+        started: Instant,
+    ) {
+        let Some(t) = &self.telemetry else {
+            return;
+        };
+        let safe = is_safe_method(method);
+        let (status, outcome, retry_class, error) = match result {
+            Ok(status) => {
+                let (outcome, retry_class) = match status {
+                    300..=399 => ("redirect", "none"),
+                    429 => ("rate_limited", "retry_after_backoff"),
+                    500..=599 if safe => ("server_error", "retryable"),
+                    500..=599 => ("server_error", "do_not_retry"),
+                    400..=499 => ("client_error", "do_not_retry"),
+                    _ => ("ok", "none"),
+                };
+                (Some(status), outcome, retry_class, None)
+            }
+            Err(e @ HttpBrokerError::OutcomeUnknown(_)) => {
+                (None, "unknown_outcome", "do_not_retry", Some(e.to_string()))
+            }
+            Err(e) => (None, "transport_error", "retryable", Some(e.to_string())),
+        };
+        let ok = status.is_some_and(|s| s < 400);
+        t.record_span(
+            hop_ctx.trace_id,
+            None,
+            &format!("connector_http:{}", hop_ctx.connector_id),
+            hop_ctx.principal_id,
+            serde_json::json!({
+                "hop": hop,
+                "method": method,
+                "destination": destination,
+                "status": status,
+                "outcome": outcome,
+                "retry_class": retry_class,
+                "error": error,
+            }),
+            if ok { "ok" } else { "error" },
+            started.elapsed().as_millis() as i64,
+        );
     }
 
     fn resolve_credential(
@@ -472,6 +698,10 @@ impl HttpBroker {
                 url::form_urlencoded::byte_serialize(plaintext.as_bytes()).collect();
             if encoded != plaintext {
                 redactor.register_secret(&encoded);
+                // Upstreams echoing the request target may re-encode a space as `%20`.
+                if encoded.contains('+') && plaintext.contains(' ') {
+                    redactor.register_secret(&encoded.replace('+', "%20"));
+                }
             }
         }
         Ok(Credential {
@@ -721,6 +951,57 @@ fn check_ip_allowed(ip: IpAddr, allow_loopback: bool) -> Result<(), HttpBrokerEr
         return Err(HttpBrokerError::SsrfBlocked(ip.to_string()));
     }
     Ok(())
+}
+
+/// Vet a non-HTTP outbound destination steered by a non-Administrator (for example the Git remote
+/// of a `dependency_update`, §14.2) with the broker's rules: the host must be allowed by the
+/// Administrator network `ceiling` (deny without one), and every address it resolves to must pass
+/// the SSRF IP-class checks (loopback only when the ceiling opts in for tests). Returns the
+/// vetted addresses.
+pub async fn vet_outbound_host(
+    host: &str,
+    port: u16,
+    ceiling: Option<&NetworkPolicy>,
+) -> Result<Vec<SocketAddr>, HttpBrokerError> {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let dest = format!("{host}:{port}");
+    let Some(ceiling) = ceiling else {
+        return Err(HttpBrokerError::PolicyDenied(
+            dest,
+            "no Administrator network ceiling has been granted (pending grant; `dash network grant`)"
+                .into(),
+        ));
+    };
+    if host.is_empty() {
+        return Err(HttpBrokerError::InvalidUrl(dest, "missing host".into()));
+    }
+    if !ceiling.allows_host(&host) {
+        return Err(HttpBrokerError::PolicyDenied(
+            dest,
+            format!("host '{host}' exceeds the Administrator network ceiling (pending grant)"),
+        ));
+    }
+    let allow_loopback = ceiling.allow_loopback_for_tests;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        check_ip_allowed(ip, allow_loopback)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| HttpBrokerError::Transport(format!("DNS lookup failed for {host}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(HttpBrokerError::Transport(format!(
+            "DNS lookup returned no addresses for {host}"
+        )));
+    }
+    for addr in &addrs {
+        check_ip_allowed(addr.ip(), allow_loopback)?;
+    }
+    Ok(addrs)
 }
 
 #[cfg(test)]
@@ -1308,5 +1589,198 @@ mod tests {
             false
         ));
         assert!(!is_reserved_request_header("accept", None, true, false));
+    }
+
+    // R7:SEC-3: a `query:` credential whose wire form differs from its plaintext never reaches
+    // transport error text (reqwest prints the full URL; the broker strips it).
+    #[tokio::test]
+    async fn query_credentials_never_appear_in_transport_errors() {
+        // A port with nothing listening: the connect error carries the URL in reqwest's Display.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let store = SqliteStore::open_in_memory().unwrap();
+        grant_loopback_ceiling(&store);
+        let secret = "Zk/9+q==~:x y";
+        store
+            .set_secret_with_policy("wx", "", secret, &[], None, Some("query:appid"))
+            .unwrap();
+        let broker = HttpBroker::new(store.clone()).unwrap();
+        let err = broker
+            .execute(
+                &Principal::administrator(),
+                &conn_inst(Some("wx")),
+                None,
+                &loopback_graph(),
+                get_req(format!("http://127.0.0.1:{closed}/v1?city=x"), Some("auth")),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        let form: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+        for leaked in [secret, form.as_str(), "Zk%2F9", "appid=", "city=x"] {
+            assert!(!msg.contains(leaked), "'{leaked}' leaked into: {msg}");
+        }
+        assert!(
+            msg.contains(&format!("http://127.0.0.1:{closed}/v1")),
+            "{msg}"
+        );
+        let audits = serde_json::to_string(&store.list_audits(5).unwrap()).unwrap();
+        assert!(
+            !audits.contains("appid=") && !audits.contains("Zk%2F9"),
+            "{audits}"
+        );
+    }
+
+    // R2:HTTP-AUDIT-1: a request dropped mid-flight (VM deadline, cancel, bounded wait) is still
+    // audited as `http.request` with outcome `aborted`.
+    #[tokio::test]
+    async fn requests_dropped_mid_flight_are_audited_as_aborted() {
+        let addr = serve(Router::new().route(
+            "/merge",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "late"
+            }),
+        ))
+        .await;
+        let store = SqliteStore::open_in_memory().unwrap();
+        grant_loopback_ceiling(&store);
+        let broker = HttpBroker::new(store.clone()).unwrap();
+        let req = HttpHostRequest {
+            method: "POST".into(),
+            url: format!("http://127.0.0.1:{}/merge?sha=abc", addr.port()),
+            headers: BTreeMap::new(),
+            body: Some(json!({ "merge": true })),
+            credential: None,
+        };
+        let admin = Principal::administrator();
+        let inst = conn_inst(None);
+        let g = loopback_graph();
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(400),
+            broker.execute(&admin, &inst, None, &g, req),
+        )
+        .await;
+        assert!(timed_out.is_err(), "the upstream never answers");
+        let rec = store
+            .list_audits(10)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.operation == "http.request")
+            .expect("dropped request must be audited");
+        assert_eq!(rec.outcome, "aborted");
+        assert_eq!(rec.target, "gh_conn");
+        assert_eq!(rec.detail["method"], "POST");
+        assert_eq!(rec.detail["reached_send"], true);
+        assert_eq!(
+            rec.detail["destination"],
+            format!("http://127.0.0.1:{}/merge", addr.port())
+        );
+    }
+
+    // R8:SC-11: every outbound hop is a `connector_http:<connector>` span in the caller's trace.
+    #[tokio::test]
+    async fn outbound_hops_are_recorded_as_trace_spans() {
+        let origin = serve(
+            Router::new()
+                .route(
+                    "/start",
+                    get(|| async {
+                        (StatusCode::TEMPORARY_REDIRECT, [("location", "/end")]).into_response()
+                    }),
+                )
+                .route(
+                    "/end",
+                    get(|| async { (StatusCode::TOO_MANY_REQUESTS, "slow down") }),
+                ),
+        )
+        .await;
+        let store = SqliteStore::open_in_memory().unwrap();
+        grant_loopback_ceiling(&store);
+        let telemetry = Telemetry::new(store.clone());
+        let broker = HttpBroker::new(store.clone())
+            .unwrap()
+            .with_telemetry(telemetry.clone());
+        let resp = broker
+            .execute_traced(
+                &Principal::administrator(),
+                &conn_inst(None),
+                None,
+                &loopback_graph(),
+                get_req(
+                    format!("http://127.0.0.1:{}/start?q=1", origin.port()),
+                    None,
+                ),
+                Some("tr_hops"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 429);
+        let mut hops: Vec<_> = telemetry
+            .recent_spans(50)
+            .into_iter()
+            .filter(|s| s.name == "connector_http:gh_conn")
+            .collect();
+        hops.sort_by_key(|s| s.attributes["hop"].as_u64());
+        assert_eq!(hops.len(), 2, "{hops:?}");
+        assert!(hops.iter().all(|s| s.trace_id == "tr_hops"));
+        assert_eq!(hops[0].attributes["status"], 307);
+        assert_eq!(hops[0].attributes["outcome"], "redirect");
+        assert_eq!(hops[1].attributes["status"], 429);
+        assert_eq!(hops[1].attributes["retry_class"], "retry_after_backoff");
+        assert_eq!(hops[1].status, "error");
+        assert!(!hops[0].attributes["destination"]
+            .as_str()
+            .unwrap()
+            .contains("q=1"));
+    }
+
+    // R7:SEC-5 support: non-HTTP outbound destinations get the same ceiling + SSRF vetting.
+    #[tokio::test]
+    async fn outbound_hosts_are_vetted_against_ceiling_and_ip_classes() {
+        let ceiling = NetworkPolicy {
+            allowed_hosts: vec!["*".into()],
+            allowed_methods: vec!["*".into()],
+            allow_loopback_for_tests: false,
+        };
+        assert!(matches!(
+            vet_outbound_host("example.com", 443, None).await,
+            Err(HttpBrokerError::PolicyDenied(..))
+        ));
+        for internal in [
+            "10.0.0.12",
+            "127.0.0.1",
+            "[::1]",
+            "169.254.169.254",
+            "localhost",
+        ] {
+            assert!(
+                matches!(
+                    vet_outbound_host(internal, 22, Some(&ceiling)).await,
+                    Err(HttpBrokerError::SsrfBlocked(_))
+                ),
+                "{internal}"
+            );
+        }
+        let narrow = NetworkPolicy {
+            allowed_hosts: vec!["packages.example.com".into()],
+            ..ceiling.clone()
+        };
+        assert!(matches!(
+            vet_outbound_host("internal-scm", 22, Some(&narrow)).await,
+            Err(HttpBrokerError::PolicyDenied(..))
+        ));
+        assert!(vet_outbound_host("8.8.8.8", 443, Some(&ceiling))
+            .await
+            .is_ok());
+        let loopback = NetworkPolicy {
+            allow_loopback_for_tests: true,
+            ..ceiling
+        };
+        assert!(vet_outbound_host("127.0.0.1", 22, Some(&loopback))
+            .await
+            .is_ok());
     }
 }

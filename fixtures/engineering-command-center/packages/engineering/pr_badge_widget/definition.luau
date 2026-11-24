@@ -8,4 +8,6 @@ return dash.widget_provider {
         repository = dash.string(),
         open_count = dash.integer(),
     },
+    -- The Requests this widget's frame sends (deny by default, §3 / §10.1).
+    accepts_requests = { "refresh_requested" },
 }

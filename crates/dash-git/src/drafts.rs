@@ -28,8 +28,9 @@ use crate::git_cli::{
     GitStatusReport,
 };
 use crate::packages::{
-    fetch_locked_packages, read_packages_lock, read_packages_toml, resolve_package_update,
-    write_packages_lock, write_packages_toml, PackageDependencySpec, PackagesLock, PackagesToml,
+    fetch_locked_packages, read_packages_lock, read_packages_toml,
+    resolve_package_update_with_policy, write_packages_lock, write_packages_toml,
+    PackageDependencySpec, PackageFetchPolicy, PackagesLock, PackagesToml,
 };
 use crate::preview::{
     run_preview_and_scenarios, run_workspace_definition_tests, validate_graph_with_contracts,
@@ -659,7 +660,17 @@ impl DraftManager {
         // Resolve the candidate requirement set in memory first: a failed resolution (unknown
         // ref, clone failure, conflict, cycle) leaves the draft's packages.toml and packages.lock
         // exactly as they were, so it cannot poison later updates.
-        let lock = resolve_package_update(wt, &self.data_dir, &cfg, pkg_name).await?;
+        // The fetch is steered by `principal`: restricted Principals are held to the
+        // Administrator network ceiling and get no ambient Git credentials (R7:SEC-5).
+        let fetch_policy = PackageFetchPolicy::for_principal(principal, &self.store);
+        let lock = resolve_package_update_with_policy(
+            wt,
+            &self.data_dir,
+            &cfg,
+            pkg_name,
+            &fetch_policy,
+        )
+        .await?;
         // Persist both files, restoring the originals if either write fails.
         let originals: Vec<(PathBuf, Option<Vec<u8>>)> = ["packages.toml", "packages.lock"]
             .iter()

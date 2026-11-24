@@ -10,7 +10,7 @@ A single-executable, self-hosted, reactive dashboard engine written in Rust with
 
 | Crate / App | Responsibility |
 | --- | --- |
-| `crates/dash-store` | SQLite WAL storage engine, transactional migrations, AES-256-GCM secret vault (`DASH_MASTER_KEY` / `<data_dir>/vault.key`), redaction |
+| `crates/dash-store` | SQLite WAL storage engine, transactional migrations, AES-256-GCM secret vault (`DASH_MASTER_KEY`, `DASH_MASTER_KEY_FILE` or passphrase-wrapped `<data_dir>/vault.key`), redaction |
 | `crates/dash-luau` | Sandboxed `mlua` Luau runtime, restricted deterministic declaration evaluator, `.d.luau` typegen, async coroutine bridge (`ctx:await`), quotas & VM pool |
 | `crates/dash-core` | Contracts, Principal capability broker, host-mediated SSRF-checked HTTP broker, singleflight query engine, Signals (`dash.query/1`), Events, History, Actions (`DryRun`, `reconcile`, `resolve`), Automations |
 | `crates/dash-git` | Canonical Workspace serializer, transitive Git Package lockfile (`packages.lock`), offline package cache, isolated Mock Preview & YAML Scenario runner, concurrent Draft worktrees, 3-way rebase, Generation carry-over, activation journal |
@@ -111,6 +111,7 @@ docker build -t dash:0.2.0 .
 docker run --rm -p 127.0.0.1:8080:8080 \
   --user "$(id -u):$(id -g)" \
   -e DASH_ADMIN_PASSWORD="change-me-please" \
+  -e DASH_VAULT_PASSPHRASE="a long vault passphrase" \
   -v "$(pwd)/my-workspace:/workspace" \
   -v "$(pwd)/my-data:/data" \
   dash:0.2.0
@@ -120,6 +121,10 @@ Inside the container the daemon binds `0.0.0.0:8080` (required for `-p` publishi
 side `127.0.0.1:` so exposure stays deliberate. On first start, the entrypoint runs `dash init`
 (without `DASH_ADMIN_PASSWORD` a random password is printed once to the container log; set
 `DASH_INIT_FROM_FIXTURE=/opt/dash/fixtures/engineering-command-center` to seed the Workspace).
+The vault refuses to keep its master key in plaintext next to the encrypted secrets in `/data`
+(§5.2): pass `DASH_VAULT_PASSPHRASE` (the key file is Argon2id-wrapped), `DASH_MASTER_KEY`, or
+`DASH_MASTER_KEY_FILE` on a separately mounted secret volume. `DASH_ALLOW_COLOCATED_VAULT_KEY=1`
+accepts the co-located plaintext key explicitly (`dash doctor` keeps warning about it).
 The image runs as an unprivileged user under `tini`, so `docker stop` triggers the graceful drain.
 If a reverse proxy on the Docker host terminates TLS, pass its bridge address, e.g.
 `serve --bind 0.0.0.0:8080 --trusted-proxy 172.17.0.1 --allowed-host dash.example.internal`.

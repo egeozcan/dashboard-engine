@@ -1,0 +1,6 @@
+# Development and test runs use throwaway data directories: allow the plaintext vault key next to
+# the SQLite ciphertext there. dash refuses that layout by default (spec 5.2); installations set
+# DASH_VAULT_PASSPHRASE, DASH_MASTER_KEY or DASH_MASTER_KEY_FILE instead. An explicit value in
+# the environment wins.
+[env]
+DASH_ALLOW_COLOCATED_VAULT_KEY = { value = "1", force = false }

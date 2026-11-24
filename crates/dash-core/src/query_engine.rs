@@ -3144,12 +3144,13 @@ impl HostBridge for EngineHostBridge {
     }
 
     async fn http_request(&self, req: HttpHostRequest) -> Result<HttpHostResponse, String> {
-        let call = self.engine.http.execute(
+        let call = self.engine.http.execute_traced(
             &self.principal,
             &self.caller_inst,
             self.operation.as_deref(),
             &self.graph,
             req,
+            Some(&self.trace_id),
         );
         wait_bounded(call, &self.wait_ctx())
             .await?
