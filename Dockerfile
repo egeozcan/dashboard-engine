@@ -21,7 +21,8 @@ COPY apps/ ./apps/
 COPY --from=web-builder /app/web/dist ./web/dist
 RUN cargo build --release --bin dash
 
-FROM debian:bookworm-slim AS runtime
+# Must match the glibc of the rust:*-slim builder (Debian trixie).
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     # Mounted Workspace volumes are usually owned by the host user.
