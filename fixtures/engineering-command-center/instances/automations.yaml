@@ -1,0 +1,8 @@
+automations:
+  complete_work:
+    definition: engineering.complete_work
+    run_as: work_completion
+    inputs:
+      merge: merge_pr
+      prs: open_prs
+      transition: transition_issue

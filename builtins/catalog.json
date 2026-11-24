@@ -1,0 +1,22 @@
+{
+  "widget_providers": [
+    { "id": "dash.table", "category": "widget_provider", "description": "Interactive data table with client-side sort, filter, and row action Requests" },
+    { "id": "dash.chart", "category": "widget_provider", "description": "Time-series and categorical SVG chart" },
+    { "id": "dash.map", "category": "widget_provider", "description": "Geographic marker visualization" },
+    { "id": "dash.counter", "category": "widget_provider", "description": "Metric KPI counter and status indicator" },
+    { "id": "dash.text", "category": "widget_provider", "description": "Formatted status and rich text block" },
+    { "id": "dash.form", "category": "widget_provider", "description": "Typed parameter or action input form" },
+    { "id": "dash.button", "category": "widget_provider", "description": "Action trigger button with optional Dry-run preview" },
+    { "id": "dash.container", "category": "widget_provider", "description": "Vertical/horizontal flex layout container" },
+    { "id": "dash.grid", "category": "widget_provider", "description": "Responsive CSS grid container" },
+    { "id": "dash.tabs", "category": "widget_provider", "description": "Tabbed widget view switcher" },
+    { "id": "dash.filter", "category": "widget_provider", "description": "Client/Dashboard filter control" }
+  ],
+  "data_providers": [
+    {
+      "id": "dash.history_series",
+      "category": "data_provider",
+      "description": "Queries sampled compact historical time-series stored by HistoryManager"
+    }
+  ]
+}

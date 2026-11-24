@@ -1,0 +1,3 @@
+name = "github"
+version = "0.2.0"
+description = "GitHub pull request connector, mock, data provider, and merge action"

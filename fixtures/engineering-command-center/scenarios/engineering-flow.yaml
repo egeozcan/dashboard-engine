@@ -1,0 +1,78 @@
+name: Engineering Command Center End-to-End Flow
+scenarios:
+  - name: Linked PRs join Jira issues and handle unlinked PRs
+    steps:
+      - query:
+          instance: linked_prs
+          params: { repository: "acme/platform", state: "open" }
+        assert:
+          length: 3
+          contains:
+            - number: 42
+              jira_key: DEV-123
+              jira_status: In Review
+            - number: 44
+              jira_status: Unlinked
+
+  - name: Dry run, merge PR request, durable Event to Jira transition, and query refresh
+    steps:
+      - dry_run:
+          action: merge_pr
+          args: { repository: "acme/platform", number: 42 }
+        assert:
+          feasible: true
+      - send_request:
+          dashboard: engineering
+          adapter: pr_table_adapter
+          widget_id: pr_table_adapter_pr_table
+          request: merge_requested
+          payload: { repository: "acme/platform", number: 42, issue_key: "DEV-123" }
+        assert:
+          status: succeeded
+      - process_events:
+          source: merge_pr
+        assert:
+          transitions: 1
+      - query:
+          instance: linked_prs
+          params: { repository: "acme/platform", state: "open" }
+        assert:
+          length: 2
+
+  - name: Dashboard state repository switch updates rendered Adapter output
+    steps:
+      - set_dashboard_state:
+          dashboard: engineering
+          key: selected_repository
+          value: acme/payments
+      - render_dashboard:
+          dashboard: engineering
+        assert:
+          contains_text: PAY-9
+
+  - name: Failure retains stale data and unknown outcome reconciles cleanly
+    steps:
+      - query:
+          instance: open_prs
+          params: { repository: "acme/platform", state: "open" }
+      - inject_failure:
+          instance: open_prs
+          mode: error
+          message: simulated_github_503
+          remaining: 1
+      - query:
+          instance: open_prs
+          params: { repository: "acme/platform", state: "open" }
+          force_refresh: true
+        assert:
+          status: stale
+      - inject_failure:
+          instance: merge_pr
+          mode: unknown
+          message: upstream_connection_lost_after_request
+          remaining: 1
+      - invoke_action:
+          action: merge_pr
+          args: { repository: "acme/platform", number: 43 }
+        assert:
+          status: unknown

@@ -1,0 +1,42 @@
+[
+  {
+    "id": "acme/platform#42",
+    "number": 42,
+    "title": "DEV-123 Improve query cache deduplication",
+    "repository": "acme/platform",
+    "author": "alice",
+    "state": "open",
+    "merged": false,
+    "updated_at": "2026-11-23T10:00:00Z"
+  },
+  {
+    "id": "acme/platform#43",
+    "number": 43,
+    "title": "DEV-124 Add delta resync on sequence gap",
+    "repository": "acme/platform",
+    "author": "bob",
+    "state": "open",
+    "merged": false,
+    "updated_at": "2026-11-23T10:15:00Z"
+  },
+  {
+    "id": "acme/platform#44",
+    "number": 44,
+    "title": "Refactor internal README formatting",
+    "repository": "acme/platform",
+    "author": "carol",
+    "state": "open",
+    "merged": false,
+    "updated_at": "2026-11-23T11:00:00Z"
+  },
+  {
+    "id": "acme/payments#7",
+    "number": 7,
+    "title": "PAY-9 Fix idempotency header handling",
+    "repository": "acme/payments",
+    "author": "dave",
+    "state": "open",
+    "merged": false,
+    "updated_at": "2026-11-23T09:00:00Z"
+  }
+]

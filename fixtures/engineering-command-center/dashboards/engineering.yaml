@@ -1,0 +1,21 @@
+id: engineering
+title: Engineering Command Center
+layout: grid
+initial_state:
+  selected_repository: acme/platform
+adapters:
+  - adapter_instance: pr_trend_adapter
+    area: top
+    query_params: {}
+  - adapter_instance: pr_table_adapter
+    area: main
+    query_params: {}
+overrides:
+  pr_table_adapter_pr_table:
+    w: 12
+    h: 6
+    visible: true
+  pr_trend_adapter_trend_chart:
+    w: 8
+    h: 4
+    visible: true

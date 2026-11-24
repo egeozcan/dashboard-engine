@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #131922; color: #e6edf3; display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; font-size: 13px; }
+    .badge { background: #1f6feb; color: #fff; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+    button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <span id="repo">Loading...</span>
+  <div>
+    <span class="badge" id="count">0</span>
+    <button id="refresh" type="button">Refresh</button>
+  </div>
+  <script>
+    let currentGeneration = 1;
+    let currentWidgetId = "";
+    window.addEventListener("message", (ev) => {
+      if (!ev.data || ev.data.protocol !== "dash.widget/1") return;
+      if (ev.data.kind === "props") {
+        currentGeneration = ev.data.generation || 1;
+        currentWidgetId = ev.data.widget_id || "";
+        document.getElementById("repo").textContent = "Repo: " + (ev.data.props?.repository || "");
+        document.getElementById("count").textContent = String(ev.data.props?.open_count ?? 0) + " open";
+      }
+    });
+    document.getElementById("refresh").addEventListener("click", () => {
+      window.parent.postMessage({
+        protocol: "dash.widget/1",
+        widget_id: currentWidgetId,
+        generation: currentGeneration,
+        sequence: Date.now(),
+        kind: "request",
+        request: "refresh_requested",
+        payload: {}
+      }, "*");
+    });
+  </script>
+</body>
+</html>

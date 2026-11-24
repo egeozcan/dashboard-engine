@@ -1,0 +1,66 @@
+--!strict
+local Runtime = {}
+
+function Runtime.render(ctx)
+    local repo = ctx:await(ctx.dashboard_state:get("selected_repository")) or "acme/platform"
+    local rows = ctx:await(ctx.inputs.linked:query({
+        repository = repo,
+        state = "open",
+    }))
+
+    return {
+        key = "root",
+        widget_type = "dash.container",
+        props = { direction = "vertical", gap = 16 },
+        children = {
+            {
+                key = "pr_summary",
+                widget_type = "engineering.pr_badge_widget",
+                props = {
+                    repository = repo,
+                    open_count = #rows,
+                },
+            },
+            {
+                key = "pr_table",
+                widget_type = "dash.table",
+                props = {
+                    title = "Open Pull Requests — " .. repo,
+                    columns = {
+                        { key = "number", label = "#" },
+                        { key = "title", label = "Title" },
+                        { key = "author", label = "Author" },
+                        { key = "jira_key", label = "Jira" },
+                        { key = "jira_status", label = "Issue Status" },
+                        { key = "state", label = "PR State" },
+                    },
+                    rows = rows,
+                    client_sort_state_key = "pr_table_sort",
+                    client_filter_state_key = "pr_table_filter",
+                    row_action = {
+                        label = "Merge PR",
+                        request = "merge_requested",
+                        action_instance = "merge_pr",
+                    },
+                },
+            },
+        },
+    }
+end
+
+function Runtime.on_request(ctx)
+    if ctx.request.request == "merge_requested" then
+        local p = ctx.request.payload or {}
+        return {
+            action = "merge",
+            args = {
+                repository = p.repository or "acme/platform",
+                number = p.number,
+                issue_key = p.issue_key,
+            },
+        }
+    end
+    error("unsupported widget request: " .. tostring(ctx.request.request))
+end
+
+return Runtime

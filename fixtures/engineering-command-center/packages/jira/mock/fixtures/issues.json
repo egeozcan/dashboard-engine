@@ -1,0 +1,23 @@
+[
+  {
+    "key": "DEV-123",
+    "summary": "Optimize reactive query deduplication",
+    "status": "In Review",
+    "priority": "High",
+    "assignee": "alice"
+  },
+  {
+    "key": "DEV-124",
+    "summary": "Handle WebSocket delta sequence gaps",
+    "status": "In Progress",
+    "priority": "Medium",
+    "assignee": "bob"
+  },
+  {
+    "key": "PAY-9",
+    "summary": "Enforce idempotency headers",
+    "status": "In Review",
+    "priority": "Critical",
+    "assignee": "dave"
+  }
+]

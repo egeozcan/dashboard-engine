@@ -1,0 +1,21 @@
+service_principals:
+  work_completion:
+    description: Automatically transitions linked Jira issues when PRs merge
+    ceiling:
+      allowed_actions:
+        - transition_issue
+      allowed_connectors:
+        - jira_transitioner
+      allowed_capabilities:
+        - issues.read
+        - issues.transition
+
+  pr_history_sampler:
+    description: Samples open PR count aggregates for 30-day trend chart
+    ceiling:
+      allowed_providers:
+        - open_prs
+      allowed_connectors:
+        - github_reader
+      allowed_capabilities:
+        - pull_requests.read

@@ -1,0 +1,16 @@
+name = "engineering-command-center"
+git_branch = "main"
+
+[network]
+allowed_hosts = ["api.github.com", "jira.example.com"]
+allowed_methods = ["GET", "POST", "PUT", "PATCH"]
+allow_loopback_for_tests = true
+
+[[history]]
+series_id = "open_prs_30d"
+instance_id = "open_prs"
+params = { repository = "acme/platform", state = "open" }
+aggregator = "count"
+cadence_secs = 3600
+retention_days = 30
+service_principal = "pr_history_sampler"

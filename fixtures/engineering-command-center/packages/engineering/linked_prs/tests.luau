@@ -1,0 +1,10 @@
+local dash = require("dash")
+local Runtime = require("runtime")
+local pr_utils = require("engineering.pr_utils")
+
+dash.test("extracts Jira keys and handles missing Jira key gracefully", function(make_ctx)
+    local _ = make_ctx({ query = { repository = "acme/platform" } })
+    dash.assert_eq(pr_utils.extract_jira_key("DEV-123 Improve caching"), "DEV-123", "extract key")
+    dash.assert(pr_utils.extract_jira_key("Refactor README") == nil, "missing key should be nil")
+    dash.assert(type(Runtime.query) == "function", "query handler exists")
+end)

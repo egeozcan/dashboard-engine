@@ -1,0 +1,21 @@
+data:
+  jira_issues_by_keys:
+    definition: jira.issues_by_keys
+    inputs:
+      jira: jira_reader
+
+  open_prs:
+    definition: github.pull_requests
+    inputs:
+      github: github_reader
+
+  linked_prs:
+    definition: engineering.linked_prs
+    inputs:
+      prs: open_prs
+      issues: jira_issues_by_keys
+
+  pr_count_history:
+    definition: dash.history_series
+    config:
+      series_id: open_prs_30d

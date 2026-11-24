@@ -1,0 +1,10 @@
+actions:
+  merge_pr:
+    definition: github.merge_pr
+    inputs:
+      github: github_maintainer
+
+  transition_issue:
+    definition: jira.transition_issue
+    inputs:
+      jira: jira_transitioner

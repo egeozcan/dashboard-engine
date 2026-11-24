@@ -1,0 +1,3 @@
+# Workspace external and local Package declarations
+[local]
+packages = ["github", "jira", "engineering"]

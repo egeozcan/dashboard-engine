@@ -1,0 +1,12 @@
+adapters:
+  pr_table_adapter:
+    definition: engineering.pr_table_adapter
+    inputs:
+      linked: linked_prs
+      merge: merge_pr
+
+  pr_trend_adapter:
+    definition: engineering.pr_trend_adapter
+    inputs:
+      prs: open_prs
+      history: pr_count_history

@@ -1,0 +1,38 @@
+connectors:
+  github_reader:
+    definition: github.connector
+    secrets:
+      auth: secret://github-work
+    capabilities:
+      - pull_requests.read
+    config:
+      base_url: https://api.github.com
+
+  github_maintainer:
+    definition: github.connector
+    secrets:
+      auth: secret://github-work
+    capabilities:
+      - pull_requests.read
+      - pull_requests.merge
+    config:
+      base_url: https://api.github.com
+
+  jira_reader:
+    definition: jira.connector
+    secrets:
+      auth: secret://jira-work
+    capabilities:
+      - issues.read
+    config:
+      base_url: https://jira.example.com
+
+  jira_transitioner:
+    definition: jira.connector
+    secrets:
+      auth: secret://jira-work
+    capabilities:
+      - issues.read
+      - issues.transition
+    config:
+      base_url: https://jira.example.com
