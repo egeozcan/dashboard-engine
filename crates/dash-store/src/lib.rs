@@ -161,6 +161,38 @@ pub struct ActionExecutionRecord {
     pub duration_ms: Option<i64>,
 }
 
+/// Outcome of atomically claiming an idempotency key while inserting a new execution record (§9.2).
+#[derive(Debug, Clone)]
+pub enum IdempotencyClaim {
+    /// The key was free (or superseded a retry-safe terminal failure); the new record was inserted.
+    New,
+    /// The key already names an execution with the same arguments; nothing was inserted.
+    Existing(ActionExecutionRecord),
+    /// The key already names an execution with *different* arguments; nothing was inserted.
+    ArgsMismatch(ActionExecutionRecord),
+}
+
+/// New field values for a conditional execution status transition (§9.1).
+#[derive(Debug, Clone)]
+pub struct ActionTransition<'a> {
+    pub status: &'a str,
+    pub result: Option<serde_json::Value>,
+    pub reason: Option<&'a str>,
+    pub retry_safe: bool,
+    pub reconcile_attempts: i64,
+    pub finished_at: Option<&'a str>,
+    pub duration_ms: Option<i64>,
+}
+
+/// Records swept by start-up / shutdown crash recovery of in-flight executions (§15.2).
+#[derive(Debug, Clone, Default)]
+pub struct InflightRecovery {
+    /// `running` records whose outcome cannot be proven; now `unknown`.
+    pub marked_unknown: Vec<String>,
+    /// `queued` records whose handler never started; now `failed` with `retry_safe = true`.
+    pub marked_not_started: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub audit_id: String,
@@ -267,6 +299,7 @@ impl SqliteStore {
         let db_path = data_dir.join("dash.db");
         let conn = Connection::open(&db_path)?;
         migrations::run_migrations(&conn)?;
+        Self::ensure_action_ledger_schema(&conn)?;
         let vault = SecretVault::load_or_create(data_dir)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -281,6 +314,7 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         migrations::run_migrations(&conn)?;
+        Self::ensure_action_ledger_schema(&conn)?;
         let vault = SecretVault::generate_ephemeral();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -1016,6 +1050,7 @@ impl SqliteStore {
         })
     }
 
+    #[deprecated(note = "does not claim the idempotency key atomically (a conflicting key is silently ignored); use claim_idempotency_and_insert")]
     pub fn insert_action_execution(
         &self,
         rec: &ActionExecutionRecord,
@@ -1064,6 +1099,8 @@ impl SqliteStore {
         })
     }
 
+    #[deprecated(note = "unconditional update can overwrite a concurrent outcome; use transition_action_execution")]
+    #[allow(clippy::too_many_arguments)]
     pub fn update_action_execution(
         &self,
         execution_id: &str,
@@ -1138,6 +1175,7 @@ impl SqliteStore {
         })
     }
 
+    #[deprecated(note = "marks never-started queued records unknown too; use recover_inflight_actions")]
     pub fn mark_inflight_actions_unknown(&self, reason: &str) -> Result<usize, StoreError> {
         let now = Utc::now().to_rfc3339();
         self.with_conn_sync(|conn| {
@@ -1147,6 +1185,334 @@ impl SqliteStore {
                 params![reason, now],
             )?;
             Ok(n)
+        })
+    }
+
+    /// Idempotent, additive schema for the action ledger (reconcile scheduling). Safe to run on every open.
+    fn ensure_action_ledger_schema(conn: &Connection) -> Result<(), StoreError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS action_reconcile_schedule (
+                execution_id TEXT PRIMARY KEY,
+                next_attempt_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES action_executions(execution_id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_action_reconcile_due
+                ON action_reconcile_schedule(next_attempt_at);",
+        )?;
+        Ok(())
+    }
+
+    /// Atomically claim `rec.idempotency_key` (if any) and insert `rec` in one transaction (§9.2).
+    ///
+    /// * No key, or a free key: the record is inserted and the key now names it (`New`).
+    /// * A key naming an execution with equal (redacted) arguments: nothing is inserted (`Existing`),
+    ///   except when that execution ended `failed`/`cancelled` with `retry_safe = true` (its outcome is
+    ///   proven to have had no external effect): then the key is atomically repointed to the new record.
+    /// * A key naming an execution with different arguments: nothing is inserted (`ArgsMismatch`).
+    pub fn claim_idempotency_and_insert(
+        &self,
+        rec: &ActionExecutionRecord,
+    ) -> Result<IdempotencyClaim, StoreError> {
+        let safe_args = self.redactor().redact_json(&rec.args);
+        let safe_res = rec.result.as_ref().map(|v| self.redactor().redact_json(v));
+        let safe_reason = rec.reason.as_ref().map(|r| self.redactor().redact_str(r));
+        let args_json = serde_json::to_string(&safe_args)?;
+        let res_json = safe_res.as_ref().map(serde_json::to_string).transpose()?;
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let insert_exec = |tx: &rusqlite::Transaction<'_>| -> Result<(), StoreError> {
+                tx.execute(
+                    "INSERT INTO action_executions
+                     (execution_id, action_instance, parent_execution_id, principal_id, principal_kind, status,
+                      idempotency_key, args_json, result_json, reason, retry_safe, reconcile_attempts, trace_id,
+                      started_at, finished_at, duration_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    params![
+                        rec.execution_id,
+                        rec.action_instance,
+                        rec.parent_execution_id,
+                        rec.principal_id,
+                        rec.principal_kind,
+                        rec.status,
+                        rec.idempotency_key,
+                        args_json,
+                        res_json,
+                        safe_reason,
+                        if rec.retry_safe { 1_i64 } else { 0_i64 },
+                        rec.reconcile_attempts,
+                        rec.trace_id,
+                        rec.started_at,
+                        rec.finished_at,
+                        rec.duration_ms
+                    ],
+                )?;
+                Ok(())
+            };
+
+            let Some(ref key) = rec.idempotency_key else {
+                insert_exec(&tx)?;
+                tx.commit()?;
+                return Ok(IdempotencyClaim::New);
+            };
+
+            // Plain INSERT (never OR IGNORE): the PRIMARY KEY is the claim. A constraint violation
+            // means another invocation already owns the key.
+            let claimed = tx.execute(
+                "INSERT INTO action_idempotency (idempotency_key, action_instance, execution_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![key, rec.action_instance, rec.execution_id, rec.started_at],
+            );
+            match claimed {
+                Ok(_) => {
+                    insert_exec(&tx)?;
+                    tx.commit()?;
+                    return Ok(IdempotencyClaim::New);
+                }
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation => {}
+                Err(e) => return Err(e.into()),
+            }
+
+            let owner_id: String = tx.query_row(
+                "SELECT execution_id FROM action_idempotency
+                 WHERE idempotency_key = ?1 AND action_instance = ?2",
+                params![key, rec.action_instance],
+                |r| r.get(0),
+            )?;
+            let existing = Self::get_action_execution_conn(&tx, &owner_id)?;
+            let supersede = match existing {
+                None => true, // dangling claim: repoint it
+                Some(ref ex) => {
+                    if ex.args != safe_args {
+                        return Ok(IdempotencyClaim::ArgsMismatch(ex.clone()));
+                    }
+                    ex.retry_safe && (ex.status == "failed" || ex.status == "cancelled")
+                }
+            };
+            if !supersede {
+                return Ok(IdempotencyClaim::Existing(existing.expect("checked above")));
+            }
+            insert_exec(&tx)?;
+            let n = tx.execute(
+                "UPDATE action_idempotency SET execution_id = ?1, created_at = ?2
+                 WHERE idempotency_key = ?3 AND action_instance = ?4 AND execution_id = ?5",
+                params![rec.execution_id, rec.started_at, key, rec.action_instance, owner_id],
+            )?;
+            if n != 1 {
+                // Lost a race to another superseding attempt; roll back our insert.
+                drop(tx);
+                return match self.lookup_action_idempotency_conn(conn, &rec.action_instance, key)? {
+                    Some(ex) => Ok(IdempotencyClaim::Existing(ex)),
+                    None => Err(StoreError::NotFound(format!("idempotency key '{key}'"))),
+                };
+            }
+            tx.commit()?;
+            Ok(IdempotencyClaim::New)
+        })
+    }
+
+    fn lookup_action_idempotency_conn(
+        &self,
+        conn: &Connection,
+        action_instance: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<ActionExecutionRecord>, StoreError> {
+        let exec_id: Option<String> = conn
+            .query_row(
+                "SELECT execution_id FROM action_idempotency
+                 WHERE idempotency_key = ?1 AND action_instance = ?2",
+                params![idempotency_key, action_instance],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match exec_id {
+            Some(id) => Self::get_action_execution_conn(conn, &id),
+            None => Ok(None),
+        }
+    }
+
+    /// Conditionally transition an execution: the UPDATE applies only while the current status is one of
+    /// `expected_statuses`. Returns `true` when exactly one row changed (§9.1; prevents reconcile, manual
+    /// resolution and cancellation from overwriting each other).
+    pub fn transition_action_execution(
+        &self,
+        execution_id: &str,
+        expected_statuses: &[&str],
+        next: ActionTransition<'_>,
+    ) -> Result<bool, StoreError> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let safe_res = next.result.map(|v| self.redactor().redact_json(&v));
+        let res_json = safe_res.as_ref().map(serde_json::to_string).transpose()?;
+        let safe_reason = next.reason.map(|r| self.redactor().redact_str(r));
+        self.with_conn_sync(|conn| {
+            let placeholders: Vec<String> =
+                (0..expected_statuses.len()).map(|i| format!("?{}", i + 9)).collect();
+            let sql = format!(
+                "UPDATE action_executions
+                 SET status = ?1, result_json = ?2, reason = ?3, retry_safe = ?4,
+                     reconcile_attempts = ?5, finished_at = ?6, duration_ms = ?7
+                 WHERE execution_id = ?8 AND status IN ({})",
+                placeholders.join(", ")
+            );
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                next.status.to_string().into(),
+                res_json.into(),
+                safe_reason.into(),
+                (if next.retry_safe { 1_i64 } else { 0_i64 }).into(),
+                next.reconcile_attempts.into(),
+                next.finished_at.map(|s| s.to_string()).into(),
+                next.duration_ms.into(),
+                execution_id.to_string().into(),
+            ];
+            values.extend(expected_statuses.iter().map(|s| rusqlite::types::Value::from(s.to_string())));
+            let n = conn.execute(&sql, rusqlite::params_from_iter(values))?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Crash/shutdown recovery for in-flight executions (§15.2, §14): `running` records become `unknown`
+    /// (the outcome cannot be proven), `queued` records — whose handler never started — become `failed`
+    /// with `retry_safe = true`. Only call this when no executions are in flight in this process.
+    pub fn recover_inflight_actions(&self, reason: &str) -> Result<InflightRecovery, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let collect = |status: &str| -> Result<Vec<String>, StoreError> {
+                let mut stmt =
+                    tx.prepare("SELECT execution_id FROM action_executions WHERE status = ?1")?;
+                let rows = stmt.query_map(params![status], |r| r.get::<_, String>(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            };
+            let running = collect("running")?;
+            let queued = collect("queued")?;
+            tx.execute(
+                "UPDATE action_executions SET status = 'unknown', retry_safe = 0, reason = ?1, finished_at = ?2
+                 WHERE status = 'running'",
+                params![reason, now],
+            )?;
+            tx.execute(
+                "UPDATE action_executions SET status = 'failed', retry_safe = 1, reason = ?1, finished_at = ?2
+                 WHERE status = 'queued'",
+                params![format!("{reason}: handler never started"), now],
+            )?;
+            tx.commit()?;
+            Ok(InflightRecovery {
+                marked_unknown: running,
+                marked_not_started: queued,
+            })
+        })
+    }
+
+    /// Schedule (or reschedule) the next host-driven `reconcile` attempt for an `unknown` execution.
+    pub fn schedule_action_reconcile(
+        &self,
+        execution_id: &str,
+        next_attempt_at: &str,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO action_reconcile_schedule (execution_id, next_attempt_at, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(execution_id) DO UPDATE SET next_attempt_at = excluded.next_attempt_at,
+                                                         updated_at = excluded.updated_at",
+                params![execution_id, next_attempt_at, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn clear_action_reconcile(&self, execution_id: &str) -> Result<(), StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "DELETE FROM action_reconcile_schedule WHERE execution_id = ?1",
+                params![execution_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_action_reconcile_schedule(&self, execution_id: &str) -> Result<Option<String>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT next_attempt_at FROM action_reconcile_schedule WHERE execution_id = ?1",
+                params![execution_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// `unknown` executions whose scheduled reconcile attempt is due at or before `now_rfc3339`.
+    pub fn list_due_action_reconciles(
+        &self,
+        now_rfc3339: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.execution_id FROM action_reconcile_schedule s
+                 JOIN action_executions e ON e.execution_id = s.execution_id
+                 WHERE e.status = 'unknown' AND s.next_attempt_at <= ?1
+                 ORDER BY s.next_attempt_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![now_rfc3339, limit as i64], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// `unknown` executions that have no reconcile schedule row (e.g. left by an older process).
+    pub fn list_unscheduled_unknown_executions(&self, limit: usize) -> Result<Vec<ActionExecutionRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT execution_id, action_instance, parent_execution_id, principal_id, principal_kind,
+                        status, idempotency_key, args_json, result_json, reason, retry_safe,
+                        reconcile_attempts, trace_id, started_at, finished_at, duration_ms
+                 FROM action_executions e
+                 WHERE e.status = 'unknown'
+                   AND NOT EXISTS (SELECT 1 FROM action_reconcile_schedule s WHERE s.execution_id = e.execution_id)
+                 ORDER BY started_at ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], Self::map_action_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Child executions of a composed action, in step order, with their current status (§9.2).
+    pub fn list_action_step_children(
+        &self,
+        parent_execution_id: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.child_execution_id, e.status FROM action_steps s
+                 JOIN action_executions e ON e.execution_id = s.child_execution_id
+                 WHERE s.execution_id = ?1 ORDER BY s.step_order ASC",
+            )?;
+            let rows = stmt.query_map(params![parent_execution_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
         })
     }
 
@@ -2013,6 +2379,106 @@ mod tests {
         drop(store);
         let reopened = SqliteStore::open(dir.path()).unwrap();
         assert!(reopened.list_secrets().unwrap().is_empty());
+    }
+
+    fn exec(id: &str, status: &str, key: Option<&str>, args: serde_json::Value) -> ActionExecutionRecord {
+        ActionExecutionRecord {
+            execution_id: id.into(),
+            action_instance: "merge_pr".into(),
+            parent_execution_id: None,
+            principal_id: "admin".into(),
+            principal_kind: "administrator".into(),
+            status: status.into(),
+            idempotency_key: key.map(|k| k.to_string()),
+            args,
+            result: None,
+            reason: None,
+            retry_safe: false,
+            reconcile_attempts: 0,
+            trace_id: "tr".into(),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_action_ledger_claims_transitions_recovery_and_schedule() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(dir.path()).unwrap();
+        let t = |status: &'static str, retry_safe: bool| ActionTransition {
+            status,
+            result: None,
+            reason: Some("r"),
+            retry_safe,
+            reconcile_attempts: 0,
+            finished_at: None,
+            duration_ms: None,
+        };
+
+        // Atomic claim: the second insert with the same key inserts nothing.
+        assert!(matches!(
+            store.claim_idempotency_and_insert(&exec("a1", "queued", Some("k"), json!({"n": 1}))).unwrap(),
+            IdempotencyClaim::New
+        ));
+        match store.claim_idempotency_and_insert(&exec("a2", "queued", Some("k"), json!({"n": 1}))).unwrap() {
+            IdempotencyClaim::Existing(r) => assert_eq!(r.execution_id, "a1"),
+            other => panic!("expected Existing, got {other:?}"),
+        }
+        assert!(store.get_action_execution("a2").unwrap().is_none());
+        assert!(matches!(
+            store.claim_idempotency_and_insert(&exec("a3", "queued", Some("k"), json!({"n": 2}))).unwrap(),
+            IdempotencyClaim::ArgsMismatch(_)
+        ));
+
+        // Conditional transitions.
+        assert!(store.transition_action_execution("a1", &["queued"], t("running", false)).unwrap());
+        assert!(!store.transition_action_execution("a1", &["queued"], t("cancelled", true)).unwrap());
+        assert!(store.transition_action_execution("a1", &["running"], t("failed", true)).unwrap());
+        // A retry-safe failure is superseded atomically by the next claim.
+        assert!(matches!(
+            store.claim_idempotency_and_insert(&exec("a4", "queued", Some("k"), json!({"n": 1}))).unwrap(),
+            IdempotencyClaim::New
+        ));
+        assert_eq!(store.lookup_action_idempotency("merge_pr", "k").unwrap().unwrap().execution_id, "a4");
+        assert!(store.transition_action_execution("a4", &["queued"], t("running", false)).unwrap());
+        assert!(store.transition_action_execution("a4", &["running"], t("unknown", false)).unwrap());
+        // An unknown outcome is never superseded.
+        match store.claim_idempotency_and_insert(&exec("a5", "queued", Some("k"), json!({"n": 1}))).unwrap() {
+            IdempotencyClaim::Existing(r) => assert_eq!(r.execution_id, "a4"),
+            other => panic!("expected Existing, got {other:?}"),
+        }
+
+        // Crash recovery + reconcile schedule.
+        store.claim_idempotency_and_insert(&exec("r1", "running", None, json!({}))).unwrap();
+        store.claim_idempotency_and_insert(&exec("q1", "queued", None, json!({}))).unwrap();
+        let rec = store.recover_inflight_actions("restart").unwrap();
+        assert_eq!(rec.marked_unknown, vec!["r1".to_string()]);
+        assert_eq!(rec.marked_not_started, vec!["q1".to_string()]);
+        assert_eq!(store.get_action_execution("r1").unwrap().unwrap().status, "unknown");
+        let q = store.get_action_execution("q1").unwrap().unwrap();
+        assert_eq!(q.status, "failed");
+        assert!(q.retry_safe);
+
+        let unscheduled: Vec<String> = store
+            .list_unscheduled_unknown_executions(10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.execution_id)
+            .collect();
+        assert_eq!(unscheduled, vec!["a4".to_string(), "r1".to_string()]);
+        store.schedule_action_reconcile("r1", "2000-01-01T00:00:00.000Z").unwrap();
+        store.schedule_action_reconcile("a4", "2999-01-01T00:00:00.000Z").unwrap();
+        assert_eq!(
+            store.list_due_action_reconciles("2026-01-01T00:00:00.000Z", 10).unwrap(),
+            vec!["r1".to_string()]
+        );
+        store.clear_action_reconcile("r1").unwrap();
+        assert!(store.list_due_action_reconciles("2026-01-01T00:00:00.000Z", 10).unwrap().is_empty());
+        drop(store);
+        // The additive ledger schema survives reopening.
+        let reopened = SqliteStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get_action_reconcile_schedule("a4").unwrap().as_deref(), Some("2999-01-01T00:00:00.000Z"));
     }
 
     #[test]

@@ -14,6 +14,9 @@ function Runtime.dry_run(ctx)
     return {
         feasible = feasible,
         warnings = warnings,
+        preconditions = {
+            { check = "pr_state", expected = "open", actual = pr.state },
+        },
         effects = {
             repository = ctx.args.repository,
             number = ctx.args.number,
@@ -54,6 +57,11 @@ function Runtime.reconcile(ctx)
     if pr.state == "merged" or pr.merged == true then
         return { status = "succeeded", merged = true, number = pr.number }
     end
+    if pr.state == "closed" then
+        -- Closed without merging: the merge verifiably did not happen.
+        return { status = "failed", merged = false, number = pr.number }
+    end
+    -- Still open: the merge may yet land (or never did); stay unknown and let the host retry.
     return { status = "unknown" }
 end
 

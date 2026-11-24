@@ -104,7 +104,12 @@ export const DashboardView: React.FC = () => {
 
   const executeWidgetRequest = async (ctx: WidgetRequestContext) => {
     try {
-      const exec = await apiFetch<{ execution_id: string; status: string }>("/api/widget-request", {
+      const exec = await apiFetch<{
+        outcome?: "action" | "refreshed";
+        execution_id?: string;
+        status: string;
+        refreshed?: string[];
+      }>("/api/widget-request", {
         method: "POST",
         body: JSON.stringify({
           protocol: "dash.widget/1",
@@ -118,7 +123,11 @@ export const DashboardView: React.FC = () => {
           payload: ctx.payload,
         }),
       });
-      setBanner(`Request '${ctx.request}' -> execution ${exec.execution_id} (${exec.status})`);
+      setBanner(
+        exec.outcome === "refreshed" || !exec.execution_id
+          ? `Request '${ctx.request}' -> refreshed ${(exec.refreshed ?? []).join(", ") || "bound data"} (${exec.status})`
+          : `Request '${ctx.request}' -> execution ${exec.execution_id} (${exec.status})`
+      );
       await loadActiveDashboard(activeId);
     } catch (e) {
       setError(String(e));

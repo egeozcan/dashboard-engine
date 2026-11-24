@@ -1457,6 +1457,14 @@ impl QueryEngine {
             .get(connector_id)
             .ok_or_else(|| format!("connector instance '{connector_id}' not found"))?
             .clone();
+        // Only connector Instances run here; an action bound as an input must go through
+        // ActionManager::invoke (own execution record, authority and audit, §9.2).
+        if conn_inst.category != DefinitionCategory::Connector {
+            return Err(format!(
+                "instance '{connector_id}' is a {}, not a connector; connector operations cannot target it",
+                conn_inst.category.as_str()
+            ));
+        }
 
         audited(
             &self.store,
@@ -1563,7 +1571,16 @@ impl QueryEngine {
             )
             .await;
         self.record_runtime_outcome(&breaker_key, admission, &res, false);
-        res.map_err(|e| self.store.redactor().redact_str(&e.to_string()))
+        res.map_err(|e| match e {
+            // The connector handler was interrupted mid-flight: any request it issued may have
+            // been processed upstream (§9.1 `unknown`).
+            RuntimeError::Timeout(_) | RuntimeError::Cancelled => format!(
+                "{}: connector '{}' operation '{operation}' did not complete: {e}",
+                crate::actions::UNKNOWN_OUTCOME_CODE,
+                conn_inst.id
+            ),
+            other => self.store.redactor().redact_str(&other.to_string()),
+        })
     }
 
     /// Update the breaker of a non-query execution. Timeouts and memory violations always count;

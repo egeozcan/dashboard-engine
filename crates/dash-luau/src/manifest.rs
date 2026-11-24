@@ -438,11 +438,23 @@ pub struct ConnectorOperationSpec {
     /// capability and every required capability ends in `.read`; otherwise `write`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Declared to perform no side effects (equivalent to `mode = "read"`; the declaration
+    /// parser keeps both in sync). Only read operations may run inside an action's Dry run or
+    /// `reconcile` handler (§9.1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ConnectorOperationSpec {
     /// Whether the operation may cause external side effects (deny by default, §20).
     pub fn has_side_effects(&self) -> bool {
+        if self.read_only {
+            return false;
+        }
         match self.mode.as_deref() {
             Some("read") => false,
             Some(_) => true,
@@ -454,6 +466,12 @@ impl ConnectorOperationSpec {
                         .all(|c| c.ends_with(".read"))
             }
         }
+    }
+
+    /// Whether the operation is a read (no side effects): the single classification used by
+    /// data providers, Dry runs and reconcile handlers.
+    pub fn is_read_only(&self) -> bool {
+        !self.has_side_effects()
     }
 }
 
@@ -532,6 +550,10 @@ pub struct DefinitionManifest {
     pub dashboard_state_reads: Vec<String>,
     #[serde(default)]
     pub accepts_requests: Vec<String>,
+    /// Payload schemas for accepted widget Requests (`requests = { name = schema }`), validated by the
+    /// host before dispatch (Appendix A.3).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_schemas: BTreeMap<String, SchemaSpec>,
     #[serde(default)]
     pub widget_props: Option<SchemaSpec>,
     #[serde(default)]
@@ -780,6 +802,7 @@ mod tests {
             invalidates: vec![],
             dashboard_state_reads: vec![],
             accepts_requests: vec![],
+            request_schemas: BTreeMap::new(),
             widget_props: None,
             widget_asset: None,
             updates: UpdateModes::default(),

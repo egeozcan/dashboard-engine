@@ -36,6 +36,11 @@ function Runtime.call(ctx)
             credential = "auth",
             body = { merge_method = "squash" },
         }))
+        if resp.status >= 500 then
+            -- A gateway/server error to a write does not prove the merge did not happen (§9.1):
+            -- report an unknown outcome so the host reconciles instead of inviting a retry.
+            error("UNKNOWN_OUTCOME: GitHub merge_pr returned HTTP " .. tostring(resp.status))
+        end
         if resp.status >= 400 then
             error("GitHub merge_pr failed with HTTP " .. tostring(resp.status))
         end

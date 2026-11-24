@@ -57,6 +57,7 @@ pub fn build_router(services: AppServices) -> Router {
         .route("/api/actions/{instance_id}/invoke", post(action_invoke_handler))
         .route("/api/executions", get(executions_list_handler))
         .route("/api/executions/{id}/resolve", post(execution_resolve_handler))
+        .route("/api/executions/{id}/cancel", post(execution_cancel_handler))
         .route("/api/drafts", get(drafts_list_handler).post(draft_begin_handler))
         .route("/api/drafts/{id}", get(draft_status_handler).delete(draft_abort_handler))
         .route("/api/drafts/{id}/validate", post(draft_validate_handler))
@@ -364,8 +365,8 @@ async fn widget_request_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.dispatch_widget_request(req, &p).await {
-        Ok(rec) => Json(rec).into_response(),
+    match st.services.dispatch_widget_request_outcome(req, &p).await {
+        Ok(outcome) => Json(outcome).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -482,6 +483,30 @@ async fn execution_resolve_handler(
         .execution_resolve(&id, &req.status, &req.reason, &p)
         .await
     {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct CancelReq {
+    #[serde(default)]
+    reason: String,
+}
+
+async fn execution_cancel_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<CancelReq>>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match st.services.execution_cancel(&id, &req.reason, &p).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }

@@ -12,4 +12,12 @@ return dash.adapter {
     },
     dashboard_state_reads = { "selected_repository" },
     accepts_requests = { "merge_requested", "refresh_requested" },
+    requests = {
+        merge_requested = dash.object {
+            number = dash.integer(),
+            repository = dash.optional(dash.string()),
+            issue_key = dash.optional(dash.string()),
+        },
+        refresh_requested = dash.any(),
+    },
 }

@@ -233,7 +233,7 @@ async fn handle_ws_socket(
                 }
             }
             WsClientMsg::WidgetRequest { envelope } => {
-                match services.dispatch_widget_request(envelope, &principal).await {
+                match services.dispatch_widget_request_outcome(envelope, &principal).await {
                     Ok(exec) => {
                         let _ = out_tx
                             .send(json!({ "type": "request_result", "execution": exec }))

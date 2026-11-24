@@ -207,6 +207,16 @@ async fn main() -> Result<()> {
             use_mocks,
         } => {
             let services = open_services(&cli.workspace, &cli.data_dir, trusted_proxies, use_mocks).await?;
+            // Crash recovery before admitting work (§15.2): executions left queued/running by a
+            // crash, SIGKILL or OOM are orphaned on a single-host Installation.
+            let recovered = services.engine().actions.recover_after_restart();
+            if !recovered.marked_unknown.is_empty() || !recovered.marked_not_started.is_empty() {
+                tracing::warn!(
+                    "recovered {} orphaned running action(s) as unknown and {} never-started queued action(s) as failed",
+                    recovered.marked_unknown.len(),
+                    recovered.marked_not_started.len()
+                );
+            }
             let worker_handle = services.spawn_background_workers();
             let app = build_router(services.clone());
 
@@ -442,5 +452,23 @@ pub async fn run_mcp_stdio_proxy(url: &str, token: &str) -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    // SIGINT and SIGTERM (Docker/systemd) both drain gracefully (§15.2).
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
