@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY apps/ ./apps/
+COPY builtins/ ./builtins/
 COPY --from=web-builder /app/web/dist ./web/dist
 RUN cargo build --release --bin dash
 

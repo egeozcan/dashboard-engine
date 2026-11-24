@@ -6,7 +6,7 @@
     { "id": "dash.counter", "category": "widget_provider", "description": "Metric KPI counter and status indicator" },
     { "id": "dash.text", "category": "widget_provider", "description": "Formatted status and rich text block" },
     { "id": "dash.form", "category": "widget_provider", "description": "Typed parameter or action input form" },
-    { "id": "dash.button", "category": "widget_provider", "description": "Action trigger button with optional Dry-run preview" },
+    { "id": "dash.button", "category": "widget_provider", "description": "Action trigger button with optional Dry run" },
     { "id": "dash.container", "category": "widget_provider", "description": "Vertical/horizontal flex layout container" },
     { "id": "dash.grid", "category": "widget_provider", "description": "Responsive CSS grid container" },
     { "id": "dash.tabs", "category": "widget_provider", "description": "Tabbed widget view switcher" },

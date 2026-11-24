@@ -13,6 +13,7 @@ pub mod state;
 pub mod telemetry;
 
 pub use actions::{ActionManager, DryRunReport, WidgetRequestEnvelope};
+pub use actions::WidgetRequestDryRun;
 pub use authority::{
     check_action_authority, check_connector_operation_authority, check_provider_access,
     validate_configured_graph, AuthError, Principal, PrincipalKind, ValidationIssue,

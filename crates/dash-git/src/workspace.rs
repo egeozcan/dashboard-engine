@@ -221,13 +221,43 @@ pub fn load_workspace_graph(
     Ok(graph)
 }
 
+/// Built-in Definition catalog shipped with the engine: the single source of built-in
+/// Definition IDs and descriptions.
+const BUILTIN_CATALOG_JSON: &str = include_str!("../../../builtins/catalog.json");
+
+#[derive(Debug, Deserialize)]
+struct BuiltinCatalogEntry {
+    id: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinCatalog {
+    #[serde(default)]
+    widget_providers: Vec<BuiltinCatalogEntry>,
+    #[serde(default)]
+    data_providers: Vec<BuiltinCatalogEntry>,
+}
+
+fn builtin_catalog() -> BuiltinCatalog {
+    serde_json::from_str(BUILTIN_CATALOG_JSON).expect("builtins/catalog.json must be valid JSON")
+}
+
 fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
     use dash_luau::{DefinitionManifest, SchemaSpec, UpdateModes};
+    let catalog = builtin_catalog();
+    let hist_description = catalog
+        .data_providers
+        .iter()
+        .find(|e| e.id == "dash.history_series")
+        .map(|e| e.description.clone())
+        .unwrap_or_else(|| "Built-in sampled time-series history data provider".into());
     let mut hist_manifest = DefinitionManifest {
         id: "dash.history_series".into(),
         category: DefinitionCategory::DataProvider,
         identity_version: "builtin:dash.history_series@1".into(),
-        description: "Built-in sampled time-series history data provider".into(),
+        description: hist_description,
         runtime: String::new(),
         handler: "query".into(),
         dry_run_handler: None,
@@ -271,19 +301,8 @@ fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
         },
     );
 
-    for (wid, desc) in [
-        ("dash.table", "Interactive data table widget"),
-        ("dash.chart", "Time-series SVG chart widget"),
-        ("dash.map", "Geographic marker map widget"),
-        ("dash.counter", "KPI counter and status badge widget"),
-        ("dash.text", "Formatted text block widget"),
-        ("dash.form", "Typed action/query parameter form widget"),
-        ("dash.button", "Action request trigger button"),
-        ("dash.container", "Flex layout container"),
-        ("dash.grid", "Responsive grid layout container"),
-        ("dash.tabs", "Tabbed container widget"),
-        ("dash.filter", "Filter control widget"),
-    ] {
+    for entry in &catalog.widget_providers {
+        let (wid, desc) = (entry.id.as_str(), entry.description.as_str());
         let mut m = DefinitionManifest {
             id: wid.into(),
             category: DefinitionCategory::WidgetProvider,
@@ -404,11 +423,22 @@ fn load_package_dir(
             }
         }
 
-        // Load custom widget assets (under assets/ or declared asset path)
+        // Load custom widget assets: only widget providers publish browser assets, and only
+        // files under `assets/` (the declared entry point must live there too, §10.1).
+        if let Some(asset) = manifest.widget_asset.as_deref() {
+            if !is_widget_asset_path(asset) {
+                return Err(GitError::Workspace(format!(
+                    "declaration '{}': widget asset '{asset}' must be a relative path under assets/",
+                    decl_path.display()
+                )));
+            }
+        }
         let mut widget_assets = BTreeMap::new();
-        for (rel, bytes) in &resolved_sources {
-            if rel.starts_with("assets/") || manifest.widget_asset.as_deref() == Some(rel.as_str()) {
-                widget_assets.insert(rel.clone(), bytes.clone());
+        if manifest.category == DefinitionCategory::WidgetProvider {
+            for (rel, bytes) in &resolved_sources {
+                if is_widget_asset_path(rel) {
+                    widget_assets.insert(rel.clone(), bytes.clone());
+                }
             }
         }
 
@@ -427,6 +457,16 @@ fn load_package_dir(
         );
     }
     Ok(())
+}
+
+/// A widget asset path is relative, inside `assets/`, and has no `..` or empty components.
+fn is_widget_asset_path(rel: &str) -> bool {
+    let Some(rest) = rel.strip_prefix("assets/") else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rel.contains('\\')
+        && rest.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 fn find_definition_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GitError> {

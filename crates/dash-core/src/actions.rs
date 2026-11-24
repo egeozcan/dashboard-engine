@@ -833,6 +833,217 @@ impl ActionManager {
     }
 }
 
+/// Result of resolving a widget Request through its Adapter binding without side effects,
+/// followed by the resolved action's optional Dry run (§9.1 step 2, Appendix A.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetRequestDryRun {
+    pub protocol: String, // "dash.widget/1"
+    pub dashboard_id: String,
+    pub adapter_instance: String,
+    pub widget_id: String,
+    pub request: String,
+    /// `action`: the Request resolves to an action Instance (see `action_instance`/`args`).
+    /// `refresh`: the Request only invalidates/refreshes queries; nothing to confirm.
+    /// `unresolved`: the Adapter could not be evaluated read-only (for example it invokes the
+    /// action imperatively); `dry_run_error` explains why.
+    pub resolution: String,
+    #[serde(default)]
+    pub action_instance: Option<String>,
+    #[serde(default)]
+    pub args: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dry_run: Option<DryRunReport>,
+    #[serde(default)]
+    pub dry_run_error: Option<String>,
+    /// Whether the UI should ask the Administrator to confirm before dispatching the Request.
+    pub requires_confirmation: bool,
+}
+
+impl ActionManager {
+    /// Validate a widget Request exactly like `dispatch_widget_request` (Generation, placement,
+    /// widget_id ownership and accepted Request names) and return the bound Adapter.
+    fn validate_widget_request_binding(
+        &self,
+        g: &ConfiguredGraph,
+        req: &WidgetRequestEnvelope,
+    ) -> Result<(InstanceConfig, LoadedDefinition), String> {
+        if req.generation != g.generation_id {
+            return Err(format!(
+                "stale widget request generation {} (active generation is {})",
+                req.generation, g.generation_id
+            ));
+        }
+        let dash = g
+            .dashboards
+            .get(&req.dashboard_id)
+            .ok_or_else(|| format!("dashboard '{}' not found", req.dashboard_id))?;
+        if !dash
+            .adapters
+            .iter()
+            .any(|p| p.adapter_instance == req.adapter_instance)
+        {
+            return Err(format!(
+                "adapter '{}' is not placed on dashboard '{}'",
+                req.adapter_instance, req.dashboard_id
+            ));
+        }
+        if !req.widget_id.starts_with(&format!("{}_", req.adapter_instance)) {
+            return Err(format!(
+                "widget_id '{}' is not owned by adapter '{}'",
+                req.widget_id, req.adapter_instance
+            ));
+        }
+        let adapter_inst = g
+            .instances
+            .get(&req.adapter_instance)
+            .ok_or_else(|| format!("adapter instance '{}' missing", req.adapter_instance))?
+            .clone();
+        let adapter_def = g
+            .definitions
+            .get(&adapter_inst.definition)
+            .ok_or_else(|| format!("adapter definition '{}' missing", adapter_inst.definition))?
+            .clone();
+        if !adapter_def.manifest.accepts_requests.is_empty()
+            && !adapter_def
+                .manifest
+                .accepts_requests
+                .iter()
+                .any(|r| r == &req.request)
+        {
+            return Err(format!(
+                "adapter '{}' does not accept request '{}'",
+                adapter_inst.id, req.request
+            ));
+        }
+        Ok((adapter_inst, adapter_def))
+    }
+
+    /// Resolve a widget Request through the Adapter's `on_request` (evaluated read-only: nested
+    /// action invocation and mutating connector operations are refused) or its direct action
+    /// binding, then run the resolved action's Dry run. Performs no side effects and creates no
+    /// execution record.
+    pub async fn dry_run_widget_request(
+        &self,
+        req: WidgetRequestEnvelope,
+        principal: &Principal,
+    ) -> Result<WidgetRequestDryRun, String> {
+        let g = self.graph.load_full();
+        let (adapter_inst, adapter_def) = self.validate_widget_request_binding(&g, &req)?;
+
+        let mut out = WidgetRequestDryRun {
+            protocol: "dash.widget/1".into(),
+            dashboard_id: req.dashboard_id.clone(),
+            adapter_instance: req.adapter_instance.clone(),
+            widget_id: req.widget_id.clone(),
+            request: req.request.clone(),
+            resolution: "unresolved".into(),
+            action_instance: None,
+            args: None,
+            dry_run: None,
+            dry_run_error: None,
+            requires_confirmation: true,
+        };
+
+        let (target_action, args) = if let Some(ref on_req) = adapter_def.manifest.request_handler {
+            let trace_id = format!("reqdry_{}", Uuid::now_v7().simple());
+            let bridge = Arc::new(ActionHostBridge {
+                manager: self.clone(),
+                graph: (*g).clone(),
+                caller_inst: adapter_inst.clone(),
+                caller_def: adapter_def.clone(),
+                principal: principal.clone(),
+                trace_id: trace_id.clone(),
+                parent_execution_id: None,
+                is_read_only: true,
+                step_counter: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            });
+            let bundle = CompiledInstanceBundle {
+                instance_id: format!("dryrun:{}", adapter_inst.id),
+                manifest: adapter_def.manifest.clone(),
+                runtime_source: adapter_def.runtime_source.clone(),
+                config_digest: adapter_inst.config_digest(),
+                resolved_libraries: g.resolved_libraries(),
+            };
+            let evaluated = self
+                .pool
+                .execute_handler(
+                    &bundle,
+                    on_req,
+                    ExecutionContextConfig {
+                        category: DefinitionCategory::Adapter,
+                        instance_id: adapter_inst.id.clone(),
+                        input_names: adapter_inst.inputs.keys().cloned().collect(),
+                        config: adapter_inst.config.clone(),
+                        payload: serde_json::json!({
+                            "widget_id": req.widget_id,
+                            "request": req.request,
+                            "payload": req.payload,
+                        }),
+                        operation: None,
+                        idempotency_key: None,
+                        allowed_emits: vec![],
+                        now_iso: Utc::now().to_rfc3339(),
+                        trace_id,
+                        bridge,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| self.store.redactor().redact_str(&e.to_string()));
+            let val = match evaluated {
+                Ok(v) => v,
+                Err(e) => {
+                    out.dry_run_error = Some(format!(
+                        "adapter on_request could not be evaluated without side effects: {e}"
+                    ));
+                    return Ok(out);
+                }
+            };
+            if let Some(action_slot) = val.get("action").and_then(|v| v.as_str()) {
+                let target = adapter_inst
+                    .inputs
+                    .get(action_slot)
+                    .cloned()
+                    .unwrap_or_else(|| action_slot.to_string());
+                let args = val.get("args").cloned().unwrap_or(req.payload.clone());
+                (target, args)
+            } else if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("invalidate").is_some()
+            {
+                out.resolution = "refresh".into();
+                out.requires_confirmation = false;
+                return Ok(out);
+            } else {
+                out.dry_run_error =
+                    Some("adapter on_request handler did not specify an action".into());
+                return Ok(out);
+            }
+        } else {
+            let target = adapter_inst
+                .inputs
+                .get(&req.request)
+                .or_else(|| adapter_inst.inputs.get("action"))
+                .ok_or_else(|| {
+                    format!(
+                        "adapter '{}' has no action binding for request '{}'",
+                        adapter_inst.id, req.request
+                    )
+                })?
+                .clone();
+            (target, req.payload.clone())
+        };
+
+        out.resolution = "action".into();
+        out.action_instance = Some(target_action.clone());
+        out.args = Some(self.store.redactor().redact_json(&args));
+        match self.dry_run(&target_action, args, principal).await {
+            Ok(rep) => out.dry_run = Some(rep),
+            Err(e) => out.dry_run_error = Some(e),
+        }
+        Ok(out)
+    }
+}
+
 fn resolve_invalidations(
     inst: &InstanceConfig,
     def: &LoadedDefinition,

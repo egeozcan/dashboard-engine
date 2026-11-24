@@ -251,16 +251,21 @@ pub struct SignalHub {
     state_tx: broadcast::Sender<StateSignalPayload>,
     /// Bounded queue capacity for delta streams.
     channel_capacity: usize,
+    /// Fan-in of every published query envelope (any query key). Used by Dashboard
+    /// subscriptions to learn that an upstream Query result of one of their Adapters changed.
+    query_activity_tx: broadcast::Sender<QueryEnvelope>,
 }
 
 impl SignalHub {
     pub fn new(channel_capacity: usize) -> Self {
         let (state_tx, _) = broadcast::channel(channel_capacity.max(64));
+        let (query_activity_tx, _) = broadcast::channel(channel_capacity.max(64));
         Self {
             query_watches: Arc::new(DashMap::new()),
             query_streams: Arc::new(DashMap::new()),
             state_tx,
             channel_capacity: channel_capacity.max(32),
+            query_activity_tx,
         }
     }
 
@@ -278,7 +283,17 @@ impl SignalHub {
             .query_streams
             .entry(key)
             .or_insert_with(|| broadcast::channel(self.channel_capacity).0);
+        if self.query_activity_tx.receiver_count() > 0 {
+            let _ = self.query_activity_tx.send(envelope.clone());
+        }
         let _ = stream.send(envelope);
+    }
+
+    /// Subscribe to every published query envelope regardless of query key (bounded; lagged
+    /// receivers see `Lagged`). Consumers must re-read authoritative data through the query
+    /// engine under their own Principal rather than forwarding these values.
+    pub fn subscribe_query_activity(&self) -> broadcast::Receiver<QueryEnvelope> {
+        self.query_activity_tx.subscribe()
     }
 
     /// Subscribe to coalesced latest-value Signals (never drops the latest value under slow consumers).
@@ -313,5 +328,32 @@ impl SignalHub {
             .map(|e| e.value().receiver_count())
             .sum::<usize>()
             + self.state_tx.receiver_count()
+    }
+}
+
+#[cfg(test)]
+mod query_activity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn query_activity_fans_in_envelopes_from_every_query_key() {
+        let hub = SignalHub::new(8);
+        let mut rx = hub.subscribe_query_activity();
+        for (inst, qk) in [("open_prs", "qk_a"), ("linked_prs", "qk_b")] {
+            hub.publish_query(QueryEnvelope::snapshot(
+                inst,
+                qk,
+                1,
+                1,
+                QueryStatus::Fresh,
+                None,
+                serde_json::json!([]),
+                None,
+            ));
+        }
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!((first.instance.as_str(), first.query_key.as_str()), ("open_prs", "qk_a"));
+        assert_eq!((second.instance.as_str(), second.query_key.as_str()), ("linked_prs", "qk_b"));
     }
 }
