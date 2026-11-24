@@ -16,8 +16,8 @@ use std::path::Path;
 use tempfile::TempDir;
 
 fn copy_ecc_fixture(dst: &Path) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/engineering-command-center");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
     dash_git::packages::copy_tree_excluding_git(&src, dst).unwrap();
 }
 
@@ -40,7 +40,12 @@ fn drafting_agent(services: &AppServices) -> Principal {
         ..Default::default()
     };
     let (rec, _token) = services
-        .agent_create("drafting-bot", ceiling.clone(), None, &Principal::administrator())
+        .agent_create(
+            "drafting-bot",
+            ceiling.clone(),
+            None,
+            &Principal::administrator(),
+        )
         .unwrap();
     Principal {
         id: rec.agent_id,
@@ -68,7 +73,11 @@ async fn agent_cannot_bind_or_redirect_administrator_secrets() {
             "github-work",
             "PAT",
             "ghp_admin_only_secret_1",
-            &["github_reader".into(), "github_maintainer".into(), "exfil".into()],
+            &[
+                "github_reader".into(),
+                "github_maintainer".into(),
+                "exfil".into(),
+            ],
             &admin,
         )
         .unwrap();
@@ -82,7 +91,10 @@ async fn agent_cannot_bind_or_redirect_administrator_secrets() {
     let err = services
         .instance_upsert_in_draft(&draft.draft_id, &exfil, &agent)
         .unwrap_err();
-    assert!(err.contains("does not permit binding secret 'github-work'"), "{err}");
+    assert!(
+        err.contains("does not permit binding secret 'github-work'"),
+        "{err}"
+    );
     assert!(audits(&services, "secret.bind", "denied") >= 1);
 
     // 2. Redirecting the existing credentialed connector (secrets untouched) is a pending grant.
@@ -93,11 +105,20 @@ async fn agent_cannot_bind_or_redirect_administrator_secrets() {
         .unwrap();
     let report = services.draft_validate(&draft.draft_id).await.unwrap();
     assert!(!report.valid);
-    assert!(report.issues.iter().any(|i| i.code == "PENDING_SECRET_GRANT"));
-    let err = services.draft_activate(&draft.draft_id, &agent).await.unwrap_err();
+    assert!(report
+        .issues
+        .iter()
+        .any(|i| i.code == "PENDING_SECRET_GRANT"));
+    let err = services
+        .draft_activate(&draft.draft_id, &agent)
+        .await
+        .unwrap_err();
     assert!(err.contains("PENDING_SECRET_GRANT"), "{err}");
     // Even the Administrator cannot activate a change an ungranted Agent authored.
-    let err = services.draft_activate(&draft.draft_id, &admin).await.unwrap_err();
+    let err = services
+        .draft_activate(&draft.draft_id, &admin)
+        .await
+        .unwrap_err();
     assert!(err.contains("PENDING_SECRET_GRANT"), "{err}");
     assert_eq!(
         services.graph().instances["github_reader"].config["base_url"],
@@ -156,7 +177,10 @@ async fn agent_cannot_borrow_a_granted_service_principal() {
     services
         .instance_upsert_in_draft(&draft.draft_id, &borrowed, &agent)
         .unwrap();
-    let err = services.draft_activate(&draft.draft_id, &agent).await.unwrap_err();
+    let err = services
+        .draft_activate(&draft.draft_id, &agent)
+        .await
+        .unwrap_err();
     assert!(err.contains("PENDING_SERVICE_PRINCIPAL_BINDING"), "{err}");
     assert!(!services.graph().instances.contains_key("borrowed_poll"));
 }
@@ -184,7 +208,12 @@ async fn use_mocks_substitutes_connectors_but_keeps_administrator_grants() {
     let env = mgr
         .engine()
         .queries
-        .query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &Principal::administrator(), true)
+        .query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &Principal::administrator(),
+            true,
+        )
         .await
         .unwrap();
     assert!(!env.value.unwrap().as_array().unwrap().is_empty());
@@ -282,11 +311,20 @@ async fn network_ceiling_is_administrator_only_and_sp_reaches_credentialed_conne
     };
     assert!(services.network_policy_grant(wide.clone(), &agent).is_err());
     assert!(audits(&services, "network_policy.grant", "denied") == 1);
-    assert!(!services.network_policy_status()["pending_hosts"].as_array().unwrap().is_empty());
+    assert!(!services.network_policy_status()["pending_hosts"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     services.network_policy_grant(wide, &admin).unwrap();
 
     services
-        .secret_set("github-work", "PAT", "ghp_live_sampler_secret_7", &["github_reader".into()], &admin)
+        .secret_set(
+            "github-work",
+            "PAT",
+            "ghp_live_sampler_secret_7",
+            &["github_reader".into()],
+            &admin,
+        )
         .unwrap();
     let series = HistorySeriesConfig {
         series_id: "open_prs_30d".into(),
@@ -318,7 +356,12 @@ async fn network_ceiling_is_administrator_only_and_sp_reaches_credentialed_conne
     services
         .service_principal_grant("pr_history_sampler", sampler.clone(), &admin)
         .unwrap();
-    let err = services.engine().history.sample_series(&series, None).await.unwrap_err();
+    let err = services
+        .engine()
+        .history
+        .sample_series(&series, None)
+        .await
+        .unwrap_err();
     assert!(err.contains("does not permit binding this secret"), "{err}");
 
     // ...and with it, history sampling works against the credentialed connector.
@@ -326,7 +369,12 @@ async fn network_ceiling_is_administrator_only_and_sp_reaches_credentialed_conne
     services
         .service_principal_grant("pr_history_sampler", sampler, &admin)
         .unwrap();
-    let count = services.engine().history.sample_series(&series, None).await.unwrap();
+    let count = services
+        .engine()
+        .history
+        .sample_series(&series, None)
+        .await
+        .unwrap();
     assert_eq!(count, 2.0);
     assert!(audits(&services, "http.request", "ok") >= 1);
 }

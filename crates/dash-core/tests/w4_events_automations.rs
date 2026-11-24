@@ -210,9 +210,23 @@ fn test_graph() -> ConfiguredGraph {
     }
     use DefinitionCategory::*;
     for inst in [
-        instance("src", ActionProvider, "test.source_act", &[], json!({}), None),
+        instance(
+            "src",
+            ActionProvider,
+            "test.source_act",
+            &[],
+            json!({}),
+            None,
+        ),
         instance("sink", ActionProvider, "test.sink", &[], json!({}), None),
-        instance("failing", ActionProvider, "test.failing", &[], json!({}), None),
+        instance(
+            "failing",
+            ActionProvider,
+            "test.failing",
+            &[],
+            json!({}),
+            None,
+        ),
         instance("flag", DataProvider, "test.flag", &[], json!({}), None),
         instance(
             "auto",
@@ -222,8 +236,22 @@ fn test_graph() -> ConfiguredGraph {
             json!({}),
             Some("auto_sp"),
         ),
-        instance("cron_skip", Automation, "test.cron_skip", &[], json!({}), Some("auto_sp")),
-        instance("cron_catch", Automation, "test.cron_catch", &[], json!({}), Some("auto_sp")),
+        instance(
+            "cron_skip",
+            Automation,
+            "test.cron_skip",
+            &[],
+            json!({}),
+            Some("auto_sp"),
+        ),
+        instance(
+            "cron_catch",
+            Automation,
+            "test.cron_catch",
+            &[],
+            json!({}),
+            Some("auto_sp"),
+        ),
         instance(
             "sig_auto",
             Automation,
@@ -248,8 +276,22 @@ fn test_graph() -> ConfiguredGraph {
             json!({"dashboard": "main"}),
             Some("auto_sp"),
         ),
-        instance("unbound_writer", Automation, "test.dash_writer", &[], json!({}), Some("auto_sp")),
-        instance("emitter", Automation, "test.emitter_auto", &[], json!({}), Some("auto_sp")),
+        instance(
+            "unbound_writer",
+            Automation,
+            "test.dash_writer",
+            &[],
+            json!({}),
+            Some("auto_sp"),
+        ),
+        instance(
+            "emitter",
+            Automation,
+            "test.emitter_auto",
+            &[],
+            json!({}),
+            Some("auto_sp"),
+        ),
     ] {
         g.instances.insert(inst.id.clone(), inst);
     }
@@ -285,15 +327,22 @@ fn sp_ceiling() -> CapabilityCeiling {
 }
 
 fn engine_on(store: &SqliteStore) -> RuntimeEngine {
-    let engine = RuntimeEngine::new(test_graph(), store.clone(), ResourceBudget::default()).unwrap();
-    engine.automations.set_retry_backoff(Duration::from_millis(1));
+    let engine =
+        RuntimeEngine::new(test_graph(), store.clone(), ResourceBudget::default()).unwrap();
+    engine
+        .automations
+        .set_retry_backoff(Duration::from_millis(1));
     engine
 }
 
 fn granted_store() -> SqliteStore {
     let store = SqliteStore::open_in_memory().unwrap();
     store
-        .set_service_principal_grant("auto_sp", serde_json::to_value(sp_ceiling()).unwrap(), "admin")
+        .set_service_principal_grant(
+            "auto_sp",
+            serde_json::to_value(sp_ceiling()).unwrap(),
+            "admin",
+        )
         .unwrap();
     store
 }
@@ -322,7 +371,14 @@ async fn durable_events_survive_restart_and_are_delivered_once_from_the_log() {
         let engine = engine_on(&store);
         engine
             .events
-            .emit("src", "test.happened", "1", "tr_restart", true, json!({"n": 1}))
+            .emit(
+                "src",
+                "test.happened",
+                "1",
+                "tr_restart",
+                true,
+                json!({"n": 1}),
+            )
             .unwrap();
         // The process stops before any consumer ran.
     }
@@ -351,7 +407,10 @@ async fn live_delivery_out_of_order_never_skips_earlier_events() {
     let live = engine.automations.dispatch_event(&e2).await;
     assert!(live[0].is_ok());
     let report = engine.automations.drain_durable_events().await;
-    assert_eq!(report.succeeded, 2, "e1 delivered, e2 recognised as already done");
+    assert_eq!(
+        report.succeeded, 2,
+        "e1 delivered, e2 recognised as already done"
+    );
     let runs = sink_executions(&store);
     assert_eq!(runs.len(), 2, "one run per event, no duplicate for e2");
     assert_eq!(engine.events.get_checkpoint("auto", "src"), e2.sequence);
@@ -364,7 +423,14 @@ async fn replay_never_repeats_side_effects_without_authorized_reexecution() {
     let engine = engine_on(&store);
     let ev = engine
         .events
-        .emit("src", "test.happened", "1", "tr_replay", true, json!({"n": 7}))
+        .emit(
+            "src",
+            "test.happened",
+            "1",
+            "tr_replay",
+            true,
+            json!({"n": 7}),
+        )
         .unwrap();
     engine.automations.drain_durable_events().await;
     let runs = sink_executions(&store);
@@ -374,9 +440,16 @@ async fn replay_never_repeats_side_effects_without_authorized_reexecution() {
     assert_eq!(key, format!("auto:auto:event:{}:1", ev.event_id));
 
     // Plain replay (and replayed dispatch) returns the recorded result without re-running.
-    let replayed = engine.automations.replay_events("src", 0, None).await.unwrap();
+    let replayed = engine
+        .automations
+        .replay_events("src", 0, None)
+        .await
+        .unwrap();
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].as_ref().unwrap()["execution_id"], json!(runs[0].execution_id));
+    assert_eq!(
+        replayed[0].as_ref().unwrap()["execution_id"],
+        json!(runs[0].execution_id)
+    );
     let replay_env = engine.events.replay_since("src", 0).unwrap();
     engine.automations.dispatch_event(&replay_env[0]).await;
     assert_eq!(sink_executions(&store).len(), 1);
@@ -414,7 +487,10 @@ async fn bounded_retry_then_dead_letter_and_authorized_redrive() {
         .unwrap();
     let r = engine.automations.drain_durable_events().await;
     assert_eq!(r.succeeded, 1);
-    let rec = &engine.automations.list_executions(Some("auto"), 10).unwrap()[0];
+    let rec = &engine
+        .automations
+        .list_executions(Some("auto"), 10)
+        .unwrap()[0];
     assert_eq!(rec.attempts, 3);
     assert_eq!(rec.status, "succeeded");
     assert_eq!(rec.event_id.as_deref(), Some(ev1.event_id.as_str()));
@@ -452,7 +528,11 @@ async fn bounded_retry_then_dead_letter_and_authorized_redrive() {
         .await
         .unwrap();
     assert_eq!(res["action_instance"], "sink");
-    assert!(engine.automations.list_dead_letters(false, 10).unwrap().is_empty());
+    assert!(engine
+        .automations
+        .list_dead_letters(false, 10)
+        .unwrap()
+        .is_empty());
     assert_eq!(sink_executions(&store).len(), 2);
 }
 
@@ -465,7 +545,10 @@ async fn missing_grant_fails_fast_and_is_dead_lettered() {
         .emit("src", "test.happened", "1", "tr", true, json!({"n": 1}))
         .unwrap();
     let res = engine.automations.dispatch_event(&ev).await;
-    assert!(res[0].as_ref().unwrap_err().contains("no Administrator grant"));
+    assert!(res[0]
+        .as_ref()
+        .unwrap_err()
+        .contains("no Administrator grant"));
     let dlq = engine.automations.list_dead_letters(false, 10).unwrap();
     assert_eq!(dlq.len(), 1);
     assert_eq!(dlq[0].attempts, 1);
@@ -477,16 +560,29 @@ async fn execution_records_continue_the_event_trace() {
     let engine = engine_on(&store);
     let ev = engine
         .events
-        .emit("src", "test.happened", "1", "tr_trace_42", true, json!({"n": 3}))
+        .emit(
+            "src",
+            "test.happened",
+            "1",
+            "tr_trace_42",
+            true,
+            json!({"n": 3}),
+        )
         .unwrap();
     engine.automations.drain_durable_events().await;
-    let rec = &engine.automations.list_executions(Some("auto"), 10).unwrap()[0];
+    let rec = &engine
+        .automations
+        .list_executions(Some("auto"), 10)
+        .unwrap()[0];
     assert_eq!(rec.trace_id, "tr_trace_42");
     assert_eq!(rec.trigger_kind, "event");
     assert_eq!(rec.trigger_ref, format!("event:{}", ev.event_id));
     assert_eq!(rec.run_as.as_deref(), Some("auto_sp"));
     assert_eq!(rec.action_executions.len(), 1);
-    assert_eq!(rec.action_executions[0], sink_executions(&store)[0].execution_id);
+    assert_eq!(
+        rec.action_executions[0],
+        sink_executions(&store)[0].execution_id
+    );
     assert!(engine
         .telemetry
         .recent_spans(50)
@@ -510,25 +606,43 @@ async fn cron_triggers_apply_catch_up_policies_across_restarts() {
     };
 
     // First sight registers the trigger without firing.
-    let out = engine.automations.run_due_schedules(at("2026-01-01T07:30:00Z")).await;
+    let out = engine
+        .automations
+        .run_due_schedules(at("2026-01-01T07:30:00Z"))
+        .await;
     assert!(out.is_empty());
 
     // "Restart" three hours later, 30 minutes after the last window: skip vs catch_up.
     let engine = engine_on(&store);
-    let out = engine.automations.run_due_schedules(at("2026-01-01T10:30:00Z")).await;
-    assert!(fired_for(&out, "cron_skip").is_empty(), "skip policy drops missed windows");
+    let out = engine
+        .automations
+        .run_due_schedules(at("2026-01-01T10:30:00Z"))
+        .await;
+    assert!(
+        fired_for(&out, "cron_skip").is_empty(),
+        "skip policy drops missed windows"
+    );
     let catch = fired_for(&out, "cron_catch");
     assert_eq!(catch.len(), 1, "catch_up fires once for all missed windows");
     assert_eq!(catch[0]["missed"], 3);
     assert_eq!(catch[0]["scheduled_for"], "2026-01-01T10:00:00+00:00");
 
     // An on-time window fires under the default policy, exactly once.
-    let out = engine.automations.run_due_schedules(at("2026-01-01T11:00:20Z")).await;
+    let out = engine
+        .automations
+        .run_due_schedules(at("2026-01-01T11:00:20Z"))
+        .await;
     assert_eq!(fired_for(&out, "cron_skip").len(), 1);
     assert_eq!(fired_for(&out, "cron_catch").len(), 1);
-    let out = engine.automations.run_due_schedules(at("2026-01-01T11:00:40Z")).await;
+    let out = engine
+        .automations
+        .run_due_schedules(at("2026-01-01T11:00:40Z"))
+        .await;
     assert!(out.is_empty());
-    let recs = engine.automations.list_executions(Some("cron_skip"), 10).unwrap();
+    let recs = engine
+        .automations
+        .list_executions(Some("cron_skip"), 10)
+        .unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].trigger_ref, "cron:0:2026-01-01T11:00:00+00:00");
 }
@@ -537,28 +651,57 @@ async fn cron_triggers_apply_catch_up_policies_across_restarts() {
 async fn signal_triggers_evaluate_predicates_on_fresh_changes() {
     let store = granted_store();
     let engine = engine_on(&store);
-    let sp = engine.automations.resolve_service_principal("auto_sp").unwrap();
+    let sp = engine
+        .automations
+        .resolve_service_principal("auto_sp")
+        .unwrap();
     let sig_runs = |out: &[(String, Result<serde_json::Value, String>)]| {
         out.iter().filter(|(a, _)| a == "sig_auto").count()
     };
 
     // Baseline observation does not fire (default catch-up: skip).
-    assert_eq!(sig_runs(&engine.automations.run_due_signal_triggers().await), 0);
+    assert_eq!(
+        sig_runs(&engine.automations.run_due_signal_triggers().await),
+        0
+    );
     // Change to 1: predicate (value >= 2) rejects.
-    engine.state.set("instance", "flag", "flag", 1, 1, json!(1), None).unwrap();
-    engine.queries.query("flag", json!({}), &sp, true).await.unwrap();
-    assert_eq!(sig_runs(&engine.automations.run_due_signal_triggers().await), 0);
+    engine
+        .state
+        .set("instance", "flag", "flag", 1, 1, json!(1), None)
+        .unwrap();
+    engine
+        .queries
+        .query("flag", json!({}), &sp, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        sig_runs(&engine.automations.run_due_signal_triggers().await),
+        0
+    );
     // Change to 2: predicate holds, automation runs once.
-    engine.state.set("instance", "flag", "flag", 1, 1, json!(2), None).unwrap();
-    engine.queries.query("flag", json!({}), &sp, true).await.unwrap();
+    engine
+        .state
+        .set("instance", "flag", "flag", 1, 1, json!(2), None)
+        .unwrap();
+    engine
+        .queries
+        .query("flag", json!({}), &sp, true)
+        .await
+        .unwrap();
     let out = engine.automations.run_due_signal_triggers().await;
     let run = out.iter().find(|(a, _)| a == "sig_auto").unwrap();
     assert_eq!(run.1.as_ref().unwrap()["seen"], 2);
     // No change: nothing fires again.
-    assert_eq!(sig_runs(&engine.automations.run_due_signal_triggers().await), 0);
+    assert_eq!(
+        sig_runs(&engine.automations.run_due_signal_triggers().await),
+        0
+    );
 
     // State Signal trigger on the bound dashboard.
-    engine.state.set("dashboard", "main", "mode", 1, 1, json!("calm"), None).unwrap();
+    engine
+        .state
+        .set("dashboard", "main", "mode", 1, 1, json!("calm"), None)
+        .unwrap();
     let out = engine.automations.run_due_signal_triggers().await;
     let st = out.iter().find(|(a, _)| a == "state_sig").unwrap();
     assert_eq!(st.1.as_ref().unwrap()["mode"], "calm");
@@ -575,10 +718,16 @@ async fn automation_state_uses_one_owner_and_publishes_signals_and_cannot_emit()
         .await
         .unwrap();
     assert_eq!(out["note"], "hi");
-    let rec = store.get_state("dashboard", "main", "note").unwrap().unwrap();
+    let rec = store
+        .get_state("dashboard", "main", "note")
+        .unwrap()
+        .unwrap();
     assert_eq!(rec.value, json!("hi"));
     let sig = state_rx.try_recv().unwrap();
-    assert_eq!((sig.scope.as_str(), sig.owner.as_str()), ("dashboard", "main"));
+    assert_eq!(
+        (sig.scope.as_str(), sig.owner.as_str()),
+        ("dashboard", "main")
+    );
 
     let unbound = engine
         .automations
@@ -655,17 +804,34 @@ async fn history_sampling_skips_stale_values() {
         retention_days: 30,
         service_principal: "auto_sp".into(),
     };
-    engine.history.sync_series_configs(std::slice::from_ref(&series)).unwrap();
-    assert_eq!(engine.history.sample_series(&series, None).await.unwrap(), 1.0);
+    engine
+        .history
+        .sync_series_configs(std::slice::from_ref(&series))
+        .unwrap();
+    assert_eq!(
+        engine.history.sample_series(&series, None).await.unwrap(),
+        1.0
+    );
     engine.telemetry.inject_failure(FailureInjectionRule {
         instance_id: "flag".into(),
         mode: "error".into(),
         message: "provider down".into(),
         remaining: Some(1),
     });
-    let err = engine.history.sample_series(&series, None).await.unwrap_err();
+    let err = engine
+        .history
+        .sample_series(&series, None)
+        .await
+        .unwrap_err();
     assert!(err.contains("Stale"), "{err}");
-    assert_eq!(engine.history.query_samples("flag_hist", None, 100).unwrap().len(), 1);
+    assert_eq!(
+        engine
+            .history
+            .query_samples("flag_hist", None, 100)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -676,7 +842,9 @@ local dash = require("dash")
 return dash.automation { id = "test.bad", handler = "run", triggers = { { kind = "webhook" } } }
 "#;
     sources.insert("definition.luau".into(), unknown_kind.as_bytes().to_vec());
-    let err = evaluate_declaration(unknown_kind, &sources).unwrap_err().to_string();
+    let err = evaluate_declaration(unknown_kind, &sources)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("unknown trigger kind"), "{err}");
 
     let bad_policy = r#"
@@ -699,7 +867,14 @@ return dash.automation { id = "test.bad_cron", handler = "run", triggers = { { k
     );
     g.instances.insert(
         "bad_cron".into(),
-        instance("bad_cron", DefinitionCategory::Automation, "test.bad_cron", &[], json!({}), Some("auto_sp")),
+        instance(
+            "bad_cron",
+            DefinitionCategory::Automation,
+            "test.bad_cron",
+            &[],
+            json!({}),
+            Some("auto_sp"),
+        ),
     );
     g.workspace.history.push(HistorySeriesConfig {
         series_id: "ghost".into(),
@@ -714,10 +889,9 @@ return dash.automation { id = "test.bad_cron", handler = "run", triggers = { { k
     let store = SqliteStore::open_in_memory().unwrap();
     let report = validate_configured_graph(&g, &store, false);
     assert!(!report.valid);
-    assert!(report
-        .issues
-        .iter()
-        .any(|i| i.code == "INVALID_TRIGGER" && i.target == "bad_cron" && i.message.contains("invalid cron")));
+    assert!(report.issues.iter().any(|i| i.code == "INVALID_TRIGGER"
+        && i.target == "bad_cron"
+        && i.message.contains("invalid cron")));
     assert!(report
         .issues
         .iter()

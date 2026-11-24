@@ -177,7 +177,11 @@ pub async fn mcp_post_handler(
             if items.is_empty() {
                 (
                     StatusCode::BAD_REQUEST,
-                    Some(rpc_error_body(Value::Null, -32600, "Invalid Request: empty batch")),
+                    Some(rpc_error_body(
+                        Value::Null,
+                        -32600,
+                        "Invalid Request: empty batch",
+                    )),
                 )
             } else {
                 let mut responses = Vec::new();
@@ -202,9 +206,19 @@ pub async fn mcp_post_handler(
             negotiated = h.negotiated_version;
             match h.response {
                 Some(r) => {
-                    let bad = r.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_i64())
+                    let bad = r
+                        .get("error")
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_i64())
                         == Some(-32600);
-                    (if bad { StatusCode::BAD_REQUEST } else { StatusCode::OK }, Some(r))
+                    (
+                        if bad {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::OK
+                        },
+                        Some(r),
+                    )
                 }
                 None => (StatusCode::ACCEPTED, None),
             }
@@ -241,7 +255,11 @@ async fn handle_message(services: &AppServices, principal: &Principal, msg: Valu
     };
     let Some(obj) = msg.as_object() else {
         return Handled {
-            response: Some(rpc_error_body(Value::Null, -32600, "Invalid Request: expected object")),
+            response: Some(rpc_error_body(
+                Value::Null,
+                -32600,
+                "Invalid Request: expected object",
+            )),
             negotiated_version: None,
         };
     };
@@ -348,11 +366,7 @@ async fn handle_message(services: &AppServices, principal: &Principal, msg: Valu
         }
         "resources/list" => Ok(json!({ "resources": mcp_resources_list(services, principal) })),
         "resources/read" => {
-            let uri = req
-                .params
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let uri = req.params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
             match read_mcp_resource(services, principal, uri) {
                 Ok(McpResourceContent::Json(val)) => Ok(json!({
                     "contents": [{
@@ -464,21 +478,47 @@ pub async fn call_mcp_tool(
         }
         "contract_get" => services.contract_get(req_str(&args, "definition_id")?),
         "graph_inspect" => Ok(services.graph_inspect_for(principal)),
-        "capability_explain" => Ok(services.capability_explain(req_str(&args, "target")?, principal)),
+        "capability_explain" => {
+            Ok(services.capability_explain(req_str(&args, "target")?, principal))
+        }
 
         // Drafts
         "draft_begin" => {
             let base = args.get("base_revision").and_then(|v| v.as_str());
             Ok(json!(services.draft_begin_at(principal, base).await?))
         }
-        "draft_status" => Ok(json!(services.draft_status_as(req_str(&args, "draft_id")?, principal)?)),
-        "draft_validate" => Ok(json!(services.draft_validate_as(req_str(&args, "draft_id")?, principal).await?)),
-        "draft_preview" => Ok(json!(services.draft_preview_as(req_str(&args, "draft_id")?, principal).await?)),
-        "draft_test" => Ok(json!(services.draft_test_as(req_str(&args, "draft_id")?, principal).await?)),
-        "draft_rebase" => Ok(json!(services.draft_rebase_as(req_str(&args, "draft_id")?, principal).await?)),
-        "draft_activate" => Ok(json!(services.draft_activate_as(req_str(&args, "draft_id")?, principal).await?)),
+        "draft_status" => Ok(json!(
+            services.draft_status_as(req_str(&args, "draft_id")?, principal)?
+        )),
+        "draft_validate" => Ok(json!(
+            services
+                .draft_validate_as(req_str(&args, "draft_id")?, principal)
+                .await?
+        )),
+        "draft_preview" => Ok(json!(
+            services
+                .draft_preview_as(req_str(&args, "draft_id")?, principal)
+                .await?
+        )),
+        "draft_test" => Ok(json!(
+            services
+                .draft_test_as(req_str(&args, "draft_id")?, principal)
+                .await?
+        )),
+        "draft_rebase" => Ok(json!(
+            services
+                .draft_rebase_as(req_str(&args, "draft_id")?, principal)
+                .await?
+        )),
+        "draft_activate" => Ok(json!(
+            services
+                .draft_activate_as(req_str(&args, "draft_id")?, principal)
+                .await?
+        )),
         "draft_abort" => {
-            services.draft_abort_as(req_str(&args, "draft_id")?, principal).await?;
+            services
+                .draft_abort_as(req_str(&args, "draft_id")?, principal)
+                .await?;
             Ok(json!({ "aborted": true }))
         }
 
@@ -526,11 +566,9 @@ pub async fn call_mcp_tool(
         "instance_delete" => {
             let draft_id = req_str(&args, "draft_id")?;
             let inst_id = req_str(&args, "instance_id")?;
-            Ok(json!(services.instance_delete_in_draft(
-                draft_id,
-                inst_id,
-                principal
-            )?))
+            Ok(json!(
+                services.instance_delete_in_draft(draft_id, inst_id, principal)?
+            ))
         }
 
         // Dashboards
@@ -547,9 +585,9 @@ pub async fn call_mcp_tool(
                     .ok_or_else(|| "missing 'dashboard' object".to_string())?,
             )
             .map_err(|e| format!("invalid dashboard document: {e}"))?;
-            Ok(json!(services.dashboard_update_in_draft(
-                draft_id, &doc, principal
-            )?))
+            Ok(json!(
+                services.dashboard_update_in_draft(draft_id, &doc, principal)?
+            ))
         }
         "dashboard_preview" => {
             services
@@ -569,14 +607,18 @@ pub async fn call_mcp_tool(
                 .get("force_refresh")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            Ok(json!(services
-                .provider_query(inst_id, params, principal, force)
-                .await?))
+            Ok(json!(
+                services
+                    .provider_query(inst_id, params, principal, force)
+                    .await?
+            ))
         }
         "action_dry_run" => {
             let act_id = req_str(&args, "action_instance")?;
             let act_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
-            Ok(json!(services.action_dry_run(act_id, act_args, principal).await?))
+            Ok(json!(
+                services.action_dry_run(act_id, act_args, principal).await?
+            ))
         }
         "action_invoke" => {
             let act_id = req_str(&args, "action_instance")?;
@@ -585,9 +627,11 @@ pub async fn call_mcp_tool(
                 .get("idempotency_key")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            Ok(json!(services
-                .action_invoke(act_id, act_args, ikey, principal)
-                .await?))
+            Ok(json!(
+                services
+                    .action_invoke(act_id, act_args, ikey, principal)
+                    .await?
+            ))
         }
         "execution_inspect" => {
             let exec_id = args.get("execution_id").and_then(|v| v.as_str());
@@ -600,9 +644,11 @@ pub async fn call_mcp_tool(
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("resolved via MCP");
-            Ok(json!(services
-                .execution_resolve(exec_id, status, reason, principal)
-                .await?))
+            Ok(json!(
+                services
+                    .execution_resolve(exec_id, status, reason, principal)
+                    .await?
+            ))
         }
 
         "execution_cancel" => {
@@ -611,9 +657,11 @@ pub async fn call_mcp_tool(
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("cancelled via MCP");
-            Ok(json!(services
-                .execution_cancel(exec_id, reason, principal)
-                .await?))
+            Ok(json!(
+                services
+                    .execution_cancel(exec_id, reason, principal)
+                    .await?
+            ))
         }
 
         // Diagnostics
@@ -667,10 +715,7 @@ pub async fn call_mcp_tool(
         "secret_bind" => {
             let draft_id = req_str(&args, "draft_id")?;
             let inst_id = req_str(&args, "instance_id")?;
-            let slot = args
-                .get("slot")
-                .and_then(|v| v.as_str())
-                .unwrap_or("auth");
+            let slot = args.get("slot").and_then(|v| v.as_str()).unwrap_or("auth");
             let secret_name = req_str(&args, "secret_name")?;
             Ok(json!(services.secret_bind(
                 draft_id,
@@ -689,7 +734,11 @@ pub async fn call_mcp_tool(
 
 /// Embedded documentation exposed as `dash://docs/{topic}` (§11.2 "documentation").
 const DOC_TOPICS: &[(&str, &str, &str)] = &[
-    ("glossary", "Domain glossary (authoritative vocabulary)", include_str!("../../../GLOSSARY.md")),
+    (
+        "glossary",
+        "Domain glossary (authoritative vocabulary)",
+        include_str!("../../../GLOSSARY.md"),
+    ),
     (
         "adr-0001-adapters-evaluated-per-dashboard",
         "ADR 0001: Adapters evaluated per Dashboard",
@@ -789,7 +838,11 @@ pub fn dependency_graph(services: &AppServices) -> Value {
         .instances
         .values()
         .map(|i| json!({ "id": i.id, "category": i.category.as_str(), "definition": i.definition }))
-        .chain(g.dashboards.keys().map(|d| json!({ "id": format!("dashboard:{d}"), "category": "dashboard" })))
+        .chain(
+            g.dashboards
+                .keys()
+                .map(|d| json!({ "id": format!("dashboard:{d}"), "category": "dashboard" })),
+        )
         .collect();
     json!({
         "generation_id": g.generation_id,
@@ -889,7 +942,10 @@ fn obj(props: Vec<(&str, Value)>, required: &[&str]) -> Value {
 }
 
 fn draft_only() -> Value {
-    obj(vec![("draft_id", s("Draft id returned by draft_begin"))], &["draft_id"])
+    obj(
+        vec![("draft_id", s("Draft id returned by draft_begin"))],
+        &["draft_id"],
+    )
 }
 
 fn instance_schema() -> Value {
@@ -964,19 +1020,37 @@ pub fn tool_input_schema(name: &str) -> Value {
         ]
     };
     match name {
-        "catalog_search" => obj(vec![("query", s("Substring matched against id, description and category"))], &[]),
-        "contract_get" => obj(vec![("definition_id", s("Definition id"))], &["definition_id"]),
-        "graph_inspect" | "metrics_query" | "git_status" | "git_sync" | "secret_list" => obj(vec![], &[]),
-        "draft_begin" => obj(
-            vec![("base_revision", s("Optional base Revision; defaults to the active Revision"))],
+        "catalog_search" => obj(
+            vec![(
+                "query",
+                s("Substring matched against id, description and category"),
+            )],
             &[],
         ),
-        "capability_explain" => obj(vec![("target", s("Instance id to explain authority for"))], &["target"]),
+        "contract_get" => obj(
+            vec![("definition_id", s("Definition id"))],
+            &["definition_id"],
+        ),
+        "graph_inspect" | "metrics_query" | "git_status" | "git_sync" | "secret_list" => {
+            obj(vec![], &[])
+        }
+        "draft_begin" => obj(
+            vec![(
+                "base_revision",
+                s("Optional base Revision; defaults to the active Revision"),
+            )],
+            &[],
+        ),
+        "capability_explain" => obj(
+            vec![("target", s("Instance id to explain authority for"))],
+            &["target"],
+        ),
         "draft_status" | "draft_validate" | "draft_preview" | "draft_test" | "draft_rebase"
         | "draft_activate" | "draft_abort" => draft_only(),
-        "definition_create" | "definition_edit" => {
-            obj(def_props(), &["draft_id", "package", "name", "definition_luau"])
-        }
+        "definition_create" | "definition_edit" => obj(
+            def_props(),
+            &["draft_id", "package", "name", "definition_luau"],
+        ),
         "definition_test" => obj(
             vec![
                 ("definition_id", s("Definition id")),
@@ -989,53 +1063,89 @@ pub fn tool_input_schema(name: &str) -> Value {
             &["draft_id", "instance"],
         ),
         "instance_delete" => obj(
-            vec![("draft_id", s("Draft id")), ("instance_id", s("Instance id"))],
+            vec![
+                ("draft_id", s("Draft id")),
+                ("instance_id", s("Instance id")),
+            ],
             &["draft_id", "instance_id"],
         ),
         "dashboard_get" => obj(vec![("dashboard_id", s("Dashboard id"))], &["dashboard_id"]),
         "dashboard_update" => obj(
-            vec![("draft_id", s("Draft id")), ("dashboard", dashboard_schema())],
+            vec![
+                ("draft_id", s("Draft id")),
+                ("dashboard", dashboard_schema()),
+            ],
             &["draft_id", "dashboard"],
         ),
         "dashboard_preview" => obj(
-            vec![("draft_id", s("Draft id")), ("dashboard_id", s("Dashboard id"))],
+            vec![
+                ("draft_id", s("Draft id")),
+                ("dashboard_id", s("Dashboard id")),
+            ],
             &["draft_id", "dashboard_id"],
         ),
         "provider_query" => obj(
             vec![
                 ("instance_id", s("Data provider Instance id")),
-                ("params", json!({ "type": "object", "description": "Query parameters" })),
-                ("force_refresh", json!({ "type": "boolean", "default": false })),
+                (
+                    "params",
+                    json!({ "type": "object", "description": "Query parameters" }),
+                ),
+                (
+                    "force_refresh",
+                    json!({ "type": "boolean", "default": false }),
+                ),
             ],
             &["instance_id"],
         ),
         "action_dry_run" => obj(
             vec![
                 ("action_instance", s("Action provider Instance id")),
-                ("args", json!({ "type": "object", "description": "Action arguments" })),
+                (
+                    "args",
+                    json!({ "type": "object", "description": "Action arguments" }),
+                ),
             ],
             &["action_instance"],
         ),
         "action_invoke" => obj(
             vec![
                 ("action_instance", s("Action provider Instance id")),
-                ("args", json!({ "type": "object", "description": "Action arguments" })),
-                ("idempotency_key", s("Optional key; repeats return the original execution")),
+                (
+                    "args",
+                    json!({ "type": "object", "description": "Action arguments" }),
+                ),
+                (
+                    "idempotency_key",
+                    s("Optional key; repeats return the original execution"),
+                ),
             ],
             &["action_instance"],
         ),
-        "execution_inspect" => obj(vec![("execution_id", s("Execution id; omit to list recent executions"))], &[]),
+        "execution_inspect" => obj(
+            vec![(
+                "execution_id",
+                s("Execution id; omit to list recent executions"),
+            )],
+            &[],
+        ),
         "execution_resolve" => obj(
             vec![
                 ("execution_id", s("Execution id in status 'unknown'")),
-                ("status", json!({ "type": "string", "enum": ["succeeded", "failed", "cancelled"] })),
+                (
+                    "status",
+                    json!({ "type": "string", "enum": ["succeeded", "failed", "cancelled"] }),
+                ),
                 ("reason", s("Audit reason")),
             ],
             &["execution_id", "status"],
         ),
         "execution_cancel" => obj(
             vec![
-                ("execution_id", s("Execution id in status 'queued' or 'running'")),
+                (
+                    "execution_id",
+                    s("Execution id in status 'queued' or 'running'"),
+                ),
                 ("reason", s("Optional audit reason")),
             ],
             &["execution_id"],
@@ -1127,7 +1237,11 @@ mod tests {
         for t in &tools {
             let schema = &t["inputSchema"];
             assert_eq!(schema["type"], "object");
-            assert!(schema["properties"].is_object(), "{} lacks properties", t["name"]);
+            assert!(
+                schema["properties"].is_object(),
+                "{} lacks properties",
+                t["name"]
+            );
             for req in schema["required"].as_array().unwrap() {
                 assert!(
                     schema["properties"].get(req.as_str().unwrap()).is_some(),
@@ -1138,13 +1252,22 @@ mod tests {
             }
         }
         let find = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["inputSchema"].clone();
-        assert_eq!(find("action_invoke")["required"], json!(["action_instance"]));
+        assert_eq!(
+            find("action_invoke")["required"],
+            json!(["action_instance"])
+        );
         assert_eq!(
             find("definition_create")["required"],
             json!(["draft_id", "package", "name", "definition_luau"])
         );
-        assert_eq!(find("secret_bind")["required"], json!(["draft_id", "instance_id", "secret_name"]));
-        assert!(find("instance_create")["properties"]["instance"]["properties"]["category"]["enum"].is_array());
+        assert_eq!(
+            find("secret_bind")["required"],
+            json!(["draft_id", "instance_id", "secret_name"])
+        );
+        assert!(
+            find("instance_create")["properties"]["instance"]["properties"]["category"]["enum"]
+                .is_array()
+        );
     }
 
     #[test]
@@ -1157,7 +1280,9 @@ mod tests {
 
     #[test]
     fn docs_are_embedded() {
-        assert!(DOC_TOPICS.iter().any(|(t, _, body)| *t == "glossary" && body.contains("Generation")));
+        assert!(DOC_TOPICS
+            .iter()
+            .any(|(t, _, body)| *t == "glossary" && body.contains("Generation")));
         let md = tool_reference_markdown();
         assert!(md.contains("## `action_invoke`"));
     }

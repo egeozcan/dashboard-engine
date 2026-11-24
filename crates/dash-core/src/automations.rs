@@ -36,9 +36,7 @@ use dash_luau::{
     CompiledInstanceBundle, DefinitionCategory, ExecutionContextConfig, HostBridge,
     HttpHostRequest, HttpHostResponse, TriggerDeclSpec, VmPool,
 };
-use dash_store::{
-    AutomationExecutionRecord, DeadLetterRecord, SqliteStore, EVENT_READ_BUDGET,
-};
+use dash_store::{AutomationExecutionRecord, DeadLetterRecord, SqliteStore, EVENT_READ_BUDGET};
 use dashmap::DashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -221,8 +219,7 @@ impl AutomationEngine {
                 "service principal '{principal_id}' has no Administrator grant"
             ));
         };
-        let ceiling: CapabilityCeiling =
-            serde_json::from_value(val).map_err(|e| e.to_string())?;
+        let ceiling: CapabilityCeiling = serde_json::from_value(val).map_err(|e| e.to_string())?;
         Ok(Principal {
             id: principal_id.to_string(),
             kind: PrincipalKind::ServicePrincipal,
@@ -240,7 +237,11 @@ impl AutomationEngine {
             .collect()
     }
 
-    fn event_trigger_matches(t: &TriggerDeclSpec, inst: &InstanceConfig, ev: &EventEnvelope) -> bool {
+    fn event_trigger_matches(
+        t: &TriggerDeclSpec,
+        inst: &InstanceConfig,
+        ev: &EventEnvelope,
+    ) -> bool {
         t.kind == "event"
             && t.event_type.as_deref() == Some(ev.semantic_type.as_str())
             && match t.source_input.as_deref() {
@@ -252,7 +253,11 @@ impl AutomationEngine {
     }
 
     /// Bounded attempts for an Event: the largest `max_attempts` among matching triggers.
-    fn max_attempts_for_event(def: &LoadedDefinition, inst: &InstanceConfig, ev: &EventEnvelope) -> Option<u32> {
+    fn max_attempts_for_event(
+        def: &LoadedDefinition,
+        inst: &InstanceConfig,
+        ev: &EventEnvelope,
+    ) -> Option<u32> {
         let matching: Vec<&TriggerDeclSpec> = def
             .manifest
             .triggers
@@ -277,7 +282,10 @@ impl AutomationEngine {
     /// [`Self::drain_durable_events`] and are skipped. Replayed Events whose run already succeeded
     /// return the recorded result without re-running (§7.2). Checkpoints are only advanced by the
     /// ordered log consumer, so delivering one Event here never causes earlier ones to be skipped.
-    pub async fn dispatch_event(&self, event: &EventEnvelope) -> Vec<Result<serde_json::Value, String>> {
+    pub async fn dispatch_event(
+        &self,
+        event: &EventEnvelope,
+    ) -> Vec<Result<serde_json::Value, String>> {
         let g = self.graph.load_full();
         let mut results = Vec::new();
         for (auto_id, inst, def) in Self::automations(&g) {
@@ -285,15 +293,24 @@ impl AutomationEngine {
                 continue;
             };
             if event.durable && !event.is_replay {
-                if let Ok(Some(ckpt)) = self.events.find_checkpoint(auto_id, &event.source_instance) {
+                if let Ok(Some(ckpt)) = self.events.find_checkpoint(auto_id, &event.source_instance)
+                {
                     if event.sequence <= ckpt {
                         continue;
                     }
                 }
             }
             results.push(
-                self.deliver(auto_id, inst, def, &g, RunTrigger::Event(event), false, max_attempts)
-                    .await,
+                self.deliver(
+                    auto_id,
+                    inst,
+                    def,
+                    &g,
+                    RunTrigger::Event(event),
+                    false,
+                    max_attempts,
+                )
+                .await,
             );
         }
         results
@@ -309,8 +326,12 @@ impl AutomationEngine {
         let mut report = DrainReport::default();
         let mut all_sources: Option<Vec<String>> = None;
         for (auto_id, inst, def) in Self::automations(&g) {
-            let event_triggers: Vec<&TriggerDeclSpec> =
-                def.manifest.triggers.iter().filter(|t| t.kind == "event").collect();
+            let event_triggers: Vec<&TriggerDeclSpec> = def
+                .manifest
+                .triggers
+                .iter()
+                .filter(|t| t.kind == "event")
+                .collect();
             if event_triggers.is_empty() {
                 continue;
             }
@@ -336,13 +357,19 @@ impl AutomationEngine {
                     Ok(None) => {
                         let start = self.consumer_start_sequence(&g, &src);
                         if let Err(e) = self.events.ack_checkpoint(auto_id, &src, start) {
-                            self.log_error(auto_id, &format!("cannot register consumer for '{src}': {e}"));
+                            self.log_error(
+                                auto_id,
+                                &format!("cannot register consumer for '{src}': {e}"),
+                            );
                             continue;
                         }
                         start
                     }
                     Err(e) => {
-                        self.log_error(auto_id, &format!("cannot read checkpoint for '{src}': {e}"));
+                        self.log_error(
+                            auto_id,
+                            &format!("cannot read checkpoint for '{src}': {e}"),
+                        );
                         continue;
                     }
                 };
@@ -359,7 +386,15 @@ impl AutomationEngine {
                         match Self::max_attempts_for_event(def, inst, ev) {
                             Some(max_attempts) => {
                                 match self
-                                    .deliver(auto_id, inst, def, &g, RunTrigger::Event(ev), false, max_attempts)
+                                    .deliver(
+                                        auto_id,
+                                        inst,
+                                        def,
+                                        &g,
+                                        RunTrigger::Event(ev),
+                                        false,
+                                        max_attempts,
+                                    )
                                     .await
                                 {
                                     Ok(_) => report.succeeded += 1,
@@ -502,9 +537,18 @@ impl AutomationEngine {
             .definitions
             .get(&inst.definition)
             .ok_or_else(|| format!("definition '{}' missing", inst.definition))?;
-        let max_attempts = Self::max_attempts_for_event(def, inst, &event).unwrap_or(DEFAULT_MAX_ATTEMPTS);
+        let max_attempts =
+            Self::max_attempts_for_event(def, inst, &event).unwrap_or(DEFAULT_MAX_ATTEMPTS);
         let res = self
-            .deliver(&dlq.consumer_id, inst, def, &g, RunTrigger::Event(&event), false, max_attempts)
+            .deliver(
+                &dlq.consumer_id,
+                inst,
+                def,
+                &g,
+                RunTrigger::Event(&event),
+                false,
+                max_attempts,
+            )
             .await;
         let outcome = if res.is_ok() { "succeeded" } else { "failed" };
         if res.is_ok() {
@@ -551,8 +595,16 @@ impl AutomationEngine {
             .get(&inst.definition)
             .ok_or_else(|| format!("definition '{}' missing", inst.definition))?
             .clone();
-        self.deliver(automation_id, &inst, &def, &g, RunTrigger::Manual(payload), false, 1)
-            .await
+        self.deliver(
+            automation_id,
+            &inst,
+            &def,
+            &g,
+            RunTrigger::Manual(payload),
+            false,
+            1,
+        )
+        .await
     }
 
     /// Validate a cron schedule expression (standard 5/6/7 field via `cron` crate).
@@ -563,7 +615,10 @@ impl AutomationEngine {
     /// Fire due cron triggers (§7.3). Last fire times are persisted, so restarts apply the
     /// trigger's catch-up policy: `skip` (default) runs only an on-time window, `catch_up` runs
     /// once for all missed windows. A trigger seen for the first time starts from `now`.
-    pub async fn run_due_schedules(&self, now: DateTime<Utc>) -> Vec<(String, Result<serde_json::Value, String>)> {
+    pub async fn run_due_schedules(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, Result<serde_json::Value, String>)> {
         let g = self.graph.load_full();
         let mut out = Vec::new();
         for (auto_id, inst, def) in Self::automations(&g) {
@@ -571,7 +626,9 @@ impl AutomationEngine {
                 if t.kind != "cron" {
                     continue;
                 }
-                let Some(expr) = t.schedule.as_deref() else { continue };
+                let Some(expr) = t.schedule.as_deref() else {
+                    continue;
+                };
                 let schedule = match parse_cron(expr) {
                     Ok(s) => s,
                     Err(e) => {
@@ -580,14 +637,23 @@ impl AutomationEngine {
                     }
                 };
                 let key = format!("cron:{index}");
-                let state = self.store.get_automation_trigger_state(auto_id, &key).ok().flatten();
+                let state = self
+                    .store
+                    .get_automation_trigger_state(auto_id, &key)
+                    .ok()
+                    .flatten();
                 let last = state
                     .as_ref()
                     .and_then(|s| s.last_fired_at.as_deref())
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&Utc));
                 let Some(last) = last else {
-                    let _ = self.store.set_automation_trigger_state(auto_id, &key, Some(&now.to_rfc3339()), None);
+                    let _ = self.store.set_automation_trigger_state(
+                        auto_id,
+                        &key,
+                        Some(&now.to_rfc3339()),
+                        None,
+                    );
                     continue;
                 };
                 let due: Vec<DateTime<Utc>> = schedule
@@ -595,12 +661,22 @@ impl AutomationEngine {
                     .take_while(|t| *t <= now)
                     .take(MAX_CRON_WINDOWS)
                     .collect();
-                let Some(latest) = due.last().copied() else { continue };
-                let policy = t.catch_up.as_deref().unwrap_or(DEFAULT_CATCH_UP).to_string();
+                let Some(latest) = due.last().copied() else {
+                    continue;
+                };
+                let policy = t
+                    .catch_up
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CATCH_UP)
+                    .to_string();
                 let on_time = (now - latest).num_seconds() <= CRON_ON_TIME_GRACE_SECS;
                 let fire = policy == "catch_up" || on_time;
                 if fire {
-                    let missed = if policy == "catch_up" { due.len() } else { due.len() - 1 };
+                    let missed = if policy == "catch_up" {
+                        due.len()
+                    } else {
+                        due.len() - 1
+                    };
                     let res = self
                         .deliver(
                             auto_id,
@@ -631,9 +707,12 @@ impl AutomationEngine {
                         ),
                     );
                 }
-                let _ = self
-                    .store
-                    .set_automation_trigger_state(auto_id, &key, Some(&latest.to_rfc3339()), None);
+                let _ = self.store.set_automation_trigger_state(
+                    auto_id,
+                    &key,
+                    Some(&latest.to_rfc3339()),
+                    None,
+                );
             }
         }
         out
@@ -641,7 +720,9 @@ impl AutomationEngine {
 
     /// Evaluate Signal triggers (§7.3): when the watched Query result (fresh only) or State value
     /// changes, evaluate the optional read-only Luau predicate and run the automation if it holds.
-    pub async fn run_due_signal_triggers(&self) -> Vec<(String, Result<serde_json::Value, String>)> {
+    pub async fn run_due_signal_triggers(
+        &self,
+    ) -> Vec<(String, Result<serde_json::Value, String>)> {
         let g = self.graph.load_full();
         let mut out = Vec::new();
         for (auto_id, inst, def) in Self::automations(&g) {
@@ -690,11 +771,17 @@ impl AutomationEngine {
                     value,
                 };
                 if let Some(pred) = t.predicate.as_deref() {
-                    match self.evaluate_predicate(auto_id, inst, def, &g, pred, &trigger).await {
+                    match self
+                        .evaluate_predicate(auto_id, inst, def, &g, pred, &trigger)
+                        .await
+                    {
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(e) => {
-                            self.log_error(auto_id, &format!("signal predicate '{pred}' failed: {e}"));
+                            self.log_error(
+                                auto_id,
+                                &format!("signal predicate '{pred}' failed: {e}"),
+                            );
                             continue;
                         }
                     }
@@ -759,7 +846,10 @@ impl AutomationEngine {
             .ok_or_else(|| format!("automation '{auto_id}' missing 'run_as' Service principal"))?;
         let principal = self.resolve_service_principal(sp_id)?;
         let params = t.params.clone().unwrap_or_else(|| serde_json::json!({}));
-        let env = self.queries.query(target, params, &principal, false).await?;
+        let env = self
+            .queries
+            .query(target, params, &principal, false)
+            .await?;
         if env.status != QueryStatus::Fresh {
             return Ok(None);
         }
@@ -784,7 +874,15 @@ impl AutomationEngine {
         let trace_id = format!("auto_{}", Uuid::now_v7().simple());
         let bridge = self.bridge(inst, g, &principal, String::new(), None, true);
         let out = self
-            .execute(inst, def, g, predicate, trigger.payload(), &trace_id, bridge)
+            .execute(
+                inst,
+                def,
+                g,
+                predicate,
+                trigger.payload(),
+                &trace_id,
+                bridge,
+            )
             .await?;
         Ok(match out {
             serde_json::Value::Bool(b) => b,
@@ -801,8 +899,13 @@ impl AutomationEngine {
     }
 
     fn log_error(&self, auto_id: &str, msg: &str) {
-        self.telemetry
-            .log("error", "automation", auto_id, "", &format!("automation '{auto_id}': {msg}"));
+        self.telemetry.log(
+            "error",
+            "automation",
+            auto_id,
+            "",
+            &format!("automation '{auto_id}': {msg}"),
+        );
     }
 
     /// Run one automation for one trigger occurrence: replay guard, execution record, bounded
@@ -824,7 +927,10 @@ impl AutomationEngine {
         let execution_id = format!("aex_{}", Uuid::now_v7().simple());
         let trigger_ref = trigger.trigger_ref(&execution_id);
         if !reexecute {
-            match self.store.find_succeeded_automation_execution(auto_id, &trigger_ref) {
+            match self
+                .store
+                .find_succeeded_automation_execution(auto_id, &trigger_ref)
+            {
                 Ok(Some(prev)) => return Ok(prev.result.unwrap_or(serde_json::Value::Null)),
                 Ok(None) => {}
                 Err(e) => return Err(format!("cannot read automation execution records: {e}")),
@@ -895,7 +1001,10 @@ impl AutomationEngine {
                     last = self
                         .execute(inst, def, g, handler, payload.clone(), &trace_id, bridge)
                         .await;
-                    action_ids.lock().unwrap().extend(ids.lock().unwrap().drain(..));
+                    action_ids
+                        .lock()
+                        .unwrap()
+                        .extend(ids.lock().unwrap().drain(..));
                     match &last {
                         Ok(_) => break,
                         Err(e) if attempts < max_attempts => {
@@ -927,7 +1036,12 @@ impl AutomationEngine {
             .collect();
         record.attempts = attempts as i64;
         record.action_executions = ids;
-        record.status = if outcome.is_ok() { "succeeded" } else { "failed" }.into();
+        record.status = if outcome.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        }
+        .into();
         record.error = outcome.as_ref().err().cloned();
         let finished_at = Utc::now().to_rfc3339();
         if let Err(e) = self.store.finish_automation_execution(
@@ -974,11 +1088,16 @@ impl AutomationEngine {
 
         if let (Err(err), Some(ev)) = (&outcome, event) {
             if ev.durable {
-                if let Err(e) =
-                    self.events
-                        .send_to_dead_letter(auto_id, &ev.event_id, record.attempts.max(1), err)
-                {
-                    self.log_error(auto_id, &format!("cannot dead-letter '{}': {e}", ev.event_id));
+                if let Err(e) = self.events.send_to_dead_letter(
+                    auto_id,
+                    &ev.event_id,
+                    record.attempts.max(1),
+                    err,
+                ) {
+                    self.log_error(
+                        auto_id,
+                        &format!("cannot dead-letter '{}': {e}", ev.event_id),
+                    );
                 }
             }
         }
@@ -1056,7 +1175,8 @@ fn parse_cron(expr: &str) -> Result<cron::Schedule, String> {
     } else {
         expr.to_string()
     };
-    cron::Schedule::from_str(&normalized).map_err(|e| format!("invalid cron expression '{expr}': {e}"))
+    cron::Schedule::from_str(&normalized)
+        .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
 }
 
 /// The Dashboard an automation's Dashboard State refers to: its Instance config must bind one
@@ -1082,13 +1202,20 @@ fn canonical_json(v: &serde_json::Value) -> String {
             let parts: Vec<String> = sorted
                 .into_iter()
                 .map(|(k, v)| {
-                    format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canonical_json(v))
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonical_json(v)
+                    )
                 })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
         serde_json::Value::Array(arr) => {
-            format!("[{}]", arr.iter().map(canonical_json).collect::<Vec<_>>().join(","))
+            format!(
+                "[{}]",
+                arr.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+            )
         }
         other => other.to_string(),
     }
@@ -1104,7 +1231,10 @@ fn fingerprint_json(v: &serde_json::Value) -> String {
 /// `validate_configured_graph`: automation triggers (kinds, cron syntax, bound sources, catch-up
 /// policy, Dashboard binding), history series Service principals, and polling providers that
 /// have no background (keep-warm) query.
-pub fn validate_background_work(graph: &ConfiguredGraph, store: &SqliteStore) -> Vec<ValidationIssue> {
+pub fn validate_background_work(
+    graph: &ConfiguredGraph,
+    store: &SqliteStore,
+) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     let mut push = |severity: &str, code: &str, target: &str, message: String| {
         issues.push(ValidationIssue {
@@ -1115,7 +1245,9 @@ pub fn validate_background_work(graph: &ConfiguredGraph, store: &SqliteStore) ->
         })
     };
     for (inst_id, inst) in &graph.instances {
-        let Some(def) = graph.definitions.get(&inst.definition) else { continue };
+        let Some(def) = graph.definitions.get(&inst.definition) else {
+            continue;
+        };
         match inst.category {
             DefinitionCategory::Automation => {
                 if let Some(d) = inst.config.get("dashboard") {
@@ -1130,7 +1262,14 @@ pub fn validate_background_work(graph: &ConfiguredGraph, store: &SqliteStore) ->
                     }
                 }
                 for (idx, t) in def.manifest.triggers.iter().enumerate() {
-                    let mut bad = |msg: String| push("error", "INVALID_TRIGGER", inst_id, format!("trigger #{idx}: {msg}"));
+                    let mut bad = |msg: String| {
+                        push(
+                            "error",
+                            "INVALID_TRIGGER",
+                            inst_id,
+                            format!("trigger #{idx}: {msg}"),
+                        )
+                    };
                     match t.kind.as_str() {
                         "event" => {
                             if t.event_type.as_deref().unwrap_or("").is_empty() {
@@ -1170,16 +1309,22 @@ pub fn validate_background_work(graph: &ConfiguredGraph, store: &SqliteStore) ->
                                 }
                             }
                         }
-                        other => bad(format!("unknown trigger kind '{other}' (expected event | cron | signal)")),
+                        other => bad(format!(
+                            "unknown trigger kind '{other}' (expected event | cron | signal)"
+                        )),
                     }
                     if let Some(cu) = t.catch_up.as_deref() {
                         if cu != "skip" && cu != "catch_up" {
-                            bad(format!("unknown catch_up policy '{cu}' (expected skip | catch_up)"));
+                            bad(format!(
+                                "unknown catch_up policy '{cu}' (expected skip | catch_up)"
+                            ));
                         }
                     }
                     if let Some(slot) = t.source_input.as_deref() {
                         if !inst.inputs.contains_key(slot) {
-                            bad(format!("source_input '{slot}' is not bound on this instance"));
+                            bad(format!(
+                                "source_input '{slot}' is not bound on this instance"
+                            ));
                         }
                     }
                 }
@@ -1188,7 +1333,11 @@ pub fn validate_background_work(graph: &ConfiguredGraph, store: &SqliteStore) ->
                 if def.manifest.updates.poll_interval_secs.is_none() {
                     continue;
                 }
-                let has_history = graph.workspace.history.iter().any(|h| &h.instance_id == inst_id);
+                let has_history = graph
+                    .workspace
+                    .history
+                    .iter()
+                    .any(|h| &h.instance_id == inst_id);
                 let keep_warm = inst.config.get("keep_warm");
                 match inst.run_as.as_deref() {
                     Some(sp) if !graph.service_principals.contains_key(sp) => push(
@@ -1305,7 +1454,10 @@ impl HostBridge for AutomationHostBridge {
             .actions
             .invoke(target_action, args, &self.principal, Some(key), None)
             .await?;
-        self.action_ids.lock().unwrap().push(rec.execution_id.clone());
+        self.action_ids
+            .lock()
+            .unwrap()
+            .push(rec.execution_id.clone());
         serde_json::to_value(rec).map_err(|e| e.to_string())
     }
 
@@ -1345,7 +1497,15 @@ impl HostBridge for AutomationHostBridge {
         // Write through the StateManager so a State Signal is published (§8).
         self.queries
             .state_manager()
-            .set(&scope, &owner, key, 1, self.graph.generation_id, value, None)
+            .set(
+                &scope,
+                &owner,
+                key,
+                1,
+                self.graph.generation_id,
+                value,
+                None,
+            )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -1373,7 +1533,10 @@ mod tests {
             fingerprint_json(&json!({"a": 1, "b": [1, 2]})),
             fingerprint_json(&json!({"b": [1, 2], "a": 1}))
         );
-        assert_ne!(fingerprint_json(&json!([1, 2])), fingerprint_json(&json!([2, 1])));
+        assert_ne!(
+            fingerprint_json(&json!([1, 2])),
+            fingerprint_json(&json!([2, 1]))
+        );
     }
 
     #[test]
@@ -1394,7 +1557,9 @@ mod tests {
         assert_eq!(RunTrigger::Event(&ev).trigger_ref("aex_b"), "event:evt_1");
         let manual = RunTrigger::Manual(json!({}));
         assert_ne!(manual.trigger_ref("aex_a"), manual.trigger_ref("aex_b"));
-        let at = DateTime::parse_from_rfc3339("2026-01-01T09:00:00+00:00").unwrap().with_timezone(&Utc);
+        let at = DateTime::parse_from_rfc3339("2026-01-01T09:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
         let cron = RunTrigger::Cron {
             index: 0,
             schedule: "0 9 * * *".into(),

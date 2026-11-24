@@ -84,9 +84,14 @@ pub fn client_ip(headers: &HeaderMap, peer_ip: IpAddr, trusted_proxies: &[IpAddr
 
 /// True when the request carries any proxy-forwarding header.
 fn has_forwarding_headers(headers: &HeaderMap) -> bool {
-    ["x-forwarded-for", "forwarded", "x-forwarded-host", "x-real-ip"]
-        .iter()
-        .any(|h| headers.contains_key(*h))
+    [
+        "x-forwarded-for",
+        "forwarded",
+        "x-forwarded-host",
+        "x-real-ip",
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
 }
 
 /// Decide whether the session cookie gets the `Secure` attribute (§14.3).
@@ -152,11 +157,7 @@ pub fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str>
 }
 
 /// Resolve whether the connection came over HTTPS (directly or via a trusted proxy `X-Forwarded-Proto`).
-pub fn is_request_https(
-    headers: &HeaderMap,
-    peer_ip: IpAddr,
-    trusted_proxies: &[IpAddr],
-) -> bool {
+pub fn is_request_https(headers: &HeaderMap, peer_ip: IpAddr, trusted_proxies: &[IpAddr]) -> bool {
     if trusted_proxies.contains(&peer_ip) {
         if let Some(proto) = headers
             .get("x-forwarded-proto")
@@ -181,7 +182,10 @@ pub fn validate_origin(
     peer_ip: IpAddr,
     trusted_proxies: &[IpAddr],
 ) -> Result<(), (StatusCode, &'static str)> {
-    let Some(origin_raw) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+    let Some(origin_raw) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
         return Ok(());
     };
     let Ok(origin_url) = url::Url::parse(origin_raw) else {
@@ -205,9 +209,15 @@ pub fn validate_origin(
         headers
             .get("x-forwarded-host")
             .and_then(|v| v.to_str().ok())
-            .or_else(|| headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()))
+            .or_else(|| {
+                headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+            })
     } else {
-        headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok())
+        headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
     };
     let Some(expected) = expected else {
         return Err((StatusCode::FORBIDDEN, "cross-origin request rejected"));
@@ -257,14 +267,19 @@ pub async fn host_guard(
         if !services.server.host_allowed(h) {
             return (
                 StatusCode::MISDIRECTED_REQUEST,
-                axum::Json(serde_json::json!({ "error": "Host not allowed (configure --allowed-host)" })),
+                axum::Json(
+                    serde_json::json!({ "error": "Host not allowed (configure --allowed-host)" }),
+                ),
             )
                 .into_response();
         }
     }
     let trusted_peer = peer_ip.is_some_and(|ip| services.trusted_proxies.contains(&ip));
     if trusted_peer {
-        if let Some(fh) = headers.get("x-forwarded-host").and_then(|v| v.to_str().ok()) {
+        if let Some(fh) = headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+        {
             if !services.server.host_allowed(fh) {
                 return (
                     StatusCode::MISDIRECTED_REQUEST,
@@ -295,7 +310,12 @@ pub async fn host_guard(
     if traced {
         let telemetry = services.engine().telemetry.clone();
         let trace_id = Telemetry::new_trace_id();
-        let root = telemetry.start_span(&trace_id, None, &format!("http:{method} {path}"), "anonymous");
+        let root = telemetry.start_span(
+            &trace_id,
+            None,
+            &format!("http:{method} {path}"),
+            "anonymous",
+        );
         let ctx = RequestTraceContext::new(trace_id, root.span_id.clone());
         let resp = REQUEST_TRACE.scope(ctx.clone(), next.run(req)).await;
         let (pid, pkind) = ctx
@@ -312,7 +332,14 @@ pub async fn host_guard(
         if let Some(ip) = client {
             attrs["client_ip"] = serde_json::json!(ip.to_string());
         }
-        root.finish(if status.is_success() || status.is_informational() { "ok" } else { "error" }, attrs);
+        root.finish(
+            if status.is_success() || status.is_informational() {
+                "ok"
+            } else {
+                "error"
+            },
+            attrs,
+        );
         resp
     } else {
         next.run(req).await
@@ -378,7 +405,10 @@ pub fn authenticate_request(
                     principal: Principal::administrator(),
                 });
             }
-            return Err((StatusCode::UNAUTHORIZED, "invalid or revoked bearer token".into()));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "invalid or revoked bearer token".into(),
+            ));
         }
     }
 
@@ -455,9 +485,7 @@ pub fn create_browser_session(
 
 pub fn build_session_cookie(token: &str, secure: bool) -> String {
     if secure {
-        format!(
-            "dash_session={token}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=86400"
-        )
+        format!("dash_session={token}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=86400")
     } else {
         format!("dash_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
     }

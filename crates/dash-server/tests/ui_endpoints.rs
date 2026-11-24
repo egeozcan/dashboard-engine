@@ -176,7 +176,10 @@ async fn definition_sources_are_served_for_workspace_packages_only() {
     assert_eq!(src["package_dir"], "engineering");
     assert_eq!(src["definition_dir"], "pr_table_adapter");
     assert_eq!(src["runtime_file"], "runtime.luau");
-    assert!(src["definition_luau"].as_str().unwrap().contains("dash.adapter"));
+    assert!(src["definition_luau"]
+        .as_str()
+        .unwrap()
+        .contains("dash.adapter"));
     assert!(src["runtime_luau"].as_str().unwrap().contains("on_request"));
     assert!(src["tests_luau"].is_string());
 
@@ -216,7 +219,10 @@ async fn draft_graph_accumulates_edits_and_draft_diff_reports_them() {
     let (status, g1) = srv.get(&format!("/api/drafts/{did}/graph")).await;
     assert_eq!(status, 200, "{g1}");
     assert_eq!(g1["draft_id"], did.as_str());
-    assert_eq!(g1["instances"]["pr_table_adapter"]["inputs"]["extra_prs"], "open_prs");
+    assert_eq!(
+        g1["instances"]["pr_table_adapter"]["inputs"]["extra_prs"],
+        "open_prs"
+    );
     let mut adapter = g1["instances"]["pr_table_adapter"].clone();
     adapter["inputs"]["more_prs"] = json!("open_prs");
     srv.post(&format!("/api/drafts/{did}/instances"), adapter)
@@ -252,11 +258,17 @@ async fn draft_graph_accumulates_edits_and_draft_diff_reports_them() {
     let find = |p: &str| files.iter().find(|f| f["path"] == p).cloned();
     let adapters_yaml = find("instances/adapters.yaml").expect("adapters.yaml in diff");
     assert_eq!(adapters_yaml["status"], "modified");
-    assert!(adapters_yaml["patch"].as_str().unwrap().contains("+      more_prs: open_prs"));
-    let new_def = find("packages/engineering/custom_metric/definition.luau")
-        .expect("new definition in diff");
+    assert!(adapters_yaml["patch"]
+        .as_str()
+        .unwrap()
+        .contains("+      more_prs: open_prs"));
+    let new_def =
+        find("packages/engineering/custom_metric/definition.luau").expect("new definition in diff");
     assert_eq!(new_def["status"], "added");
-    assert!(new_def["patch"].as_str().unwrap().contains("+return dash.data_provider"));
+    assert!(new_def["patch"]
+        .as_str()
+        .unwrap()
+        .contains("+return dash.data_provider"));
 
     // Sources can be read from the Draft worktree.
     let (status, src) = srv
@@ -296,7 +308,10 @@ async fn rendered_custom_widgets_carry_declared_asset_url() {
     // Principal: /widgets/* requires authentication, so an anonymous request gets 401 first).
     let r = srv
         .client
-        .get(format!("{}/widgets/engineering.linked_prs/runtime.luau", srv.base))
+        .get(format!(
+            "{}/widgets/engineering.linked_prs/runtime.luau",
+            srv.base
+        ))
         .bearer_auth(TOKEN)
         .send()
         .await
@@ -308,7 +323,9 @@ async fn rendered_custom_widgets_carry_declared_asset_url() {
 async fn ws_dashboard_subscription_pushes_state_changes_from_other_clients() {
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
     let srv = TestServer::boot().await;
-    let mut req = format!("ws://{}/ws", srv.addr).into_client_request().unwrap();
+    let mut req = format!("ws://{}/ws", srv.addr)
+        .into_client_request()
+        .unwrap();
     req.headers_mut()
         .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(req).await.unwrap();

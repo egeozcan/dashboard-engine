@@ -178,7 +178,8 @@ impl CallTracking {
     }
 
     pub fn mutating_calls_issued(&self) -> usize {
-        self.mutating_issued.load(std::sync::atomic::Ordering::Acquire)
+        self.mutating_issued
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -252,12 +253,15 @@ impl HostBridge for CallTrackingBridge {
         args: serde_json::Value,
         idempotency_key: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        self.tracked(true, self.inner.invoke_action(input_name, args, idempotency_key))
-            .await
+        self.tracked(
+            true,
+            self.inner.invoke_action(input_name, args, idempotency_key),
+        )
+        .await
     }
     async fn http_request(&self, req: HttpHostRequest) -> Result<HttpHostResponse, String> {
-        let mutating = !req.method.eq_ignore_ascii_case("GET")
-            && !req.method.eq_ignore_ascii_case("HEAD");
+        let mutating =
+            !req.method.eq_ignore_ascii_case("GET") && !req.method.eq_ignore_ascii_case("HEAD");
         if !mutating {
             return self.inner.http_request(req).await;
         }
@@ -622,20 +626,23 @@ impl UserData for LuaContext {
             }
         });
 
-        methods.add_async_method("mock_set", |lua, this, (key, val): (String, Value)| async move {
-            if this.cfg.category != DefinitionCategory::Mock {
-                return Err(mlua::Error::runtime(
-                    "ctx:mock_set(...) is only available inside Mock definitions",
-                ));
-            }
-            let j: serde_json::Value = lua.from_value(val)?;
-            this.cfg
-                .bridge
-                .mock_state_set(&key, j)
-                .await
-                .map_err(mlua::Error::runtime)?;
-            Ok(())
-        });
+        methods.add_async_method(
+            "mock_set",
+            |lua, this, (key, val): (String, Value)| async move {
+                if this.cfg.category != DefinitionCategory::Mock {
+                    return Err(mlua::Error::runtime(
+                        "ctx:mock_set(...) is only available inside Mock definitions",
+                    ));
+                }
+                let j: serde_json::Value = lua.from_value(val)?;
+                this.cfg
+                    .bridge
+                    .mock_state_set(&key, j)
+                    .await
+                    .map_err(mlua::Error::runtime)?;
+                Ok(())
+            },
+        );
     }
 }
 
@@ -761,22 +768,19 @@ impl UserData for StateFacade {
             }
         });
 
-        methods.add_async_method(
-            "set",
-            |lua, this, (key, val): (String, Value)| async move {
-                if this.read_only {
-                    return Err(mlua::Error::runtime(
-                        "dashboard_state is read-only inside Adapters",
-                    ));
-                }
-                let j: serde_json::Value = lua.from_value(val)?;
-                this.bridge
-                    .state_set(&this.scope, &key, j)
-                    .await
-                    .map_err(mlua::Error::runtime)?;
-                Ok(())
-            },
-        );
+        methods.add_async_method("set", |lua, this, (key, val): (String, Value)| async move {
+            if this.read_only {
+                return Err(mlua::Error::runtime(
+                    "dashboard_state is read-only inside Adapters",
+                ));
+            }
+            let j: serde_json::Value = lua.from_value(val)?;
+            this.bridge
+                .state_set(&this.scope, &key, j)
+                .await
+                .map_err(mlua::Error::runtime)?;
+            Ok(())
+        });
     }
 }
 
@@ -846,7 +850,10 @@ return R
         category: DefinitionCategory,
         allowed: Vec<String>,
         event_type: &str,
-    ) -> (Result<serde_json::Value, crate::pool::RuntimeError>, Arc<ProbeBridge>) {
+    ) -> (
+        Result<serde_json::Value, crate::pool::RuntimeError>,
+        Arc<ProbeBridge>,
+    ) {
         let pool = VmPool::new(ResourceBudget::default());
         let bridge = Arc::new(ProbeBridge::default());
         let b = bundle("emitter", decl, EMIT_RT);
@@ -864,15 +871,28 @@ return R
 
     #[tokio::test]
     async fn emit_is_fail_closed_without_declared_events() {
-        let decl = r#"local dash = require("dash"); return dash.data_provider { id = "t.noemits" }"#;
-        let (res, bridge) = run_emit(decl, DefinitionCategory::DataProvider, vec![], "dev.pr_merged").await;
+        let decl =
+            r#"local dash = require("dash"); return dash.data_provider { id = "t.noemits" }"#;
+        let (res, bridge) = run_emit(
+            decl,
+            DefinitionCategory::DataProvider,
+            vec![],
+            "dev.pr_merged",
+        )
+        .await;
         let err = res.unwrap_err().to_string();
         assert!(err.contains("not declared in definition contract"), "{err}");
         assert!(bridge.emitted.lock().unwrap().is_empty());
 
         // A connector that declares no emits cannot spoof Events either.
         let decl = r#"local dash = require("dash"); return dash.connector { id = "t.conn" }"#;
-        let (res, _) = run_emit(decl, DefinitionCategory::Connector, vec![], "github.pr_merged").await;
+        let (res, _) = run_emit(
+            decl,
+            DefinitionCategory::Connector,
+            vec![],
+            "github.pr_merged",
+        )
+        .await;
         assert!(res.unwrap_err().to_string().contains("not declared"));
     }
 
@@ -890,16 +910,29 @@ return dash.data_provider {
     },
 }
 "#;
-        let (res, bridge) = run_emit(decl, DefinitionCategory::DataProvider, vec![], "dev.pr_merged").await;
+        let (res, bridge) = run_emit(
+            decl,
+            DefinitionCategory::DataProvider,
+            vec![],
+            "dev.pr_merged",
+        )
+        .await;
         assert!(res.is_ok(), "{res:?}");
         let emitted = bridge.emitted.lock().unwrap().clone();
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, "dev.pr_merged");
-        assert_eq!(emitted[0].1, "3", "declared schema version is passed through");
-        assert!(emitted[0].2, "declared durability applies when no flag is given");
+        assert_eq!(
+            emitted[0].1, "3",
+            "declared schema version is passed through"
+        );
+        assert!(
+            emitted[0].2,
+            "declared durability applies when no flag is given"
+        );
 
         // Payload { number = 42 } violates dev.strict's declared payload schema.
-        let (res, bridge) = run_emit(decl, DefinitionCategory::DataProvider, vec![], "dev.strict").await;
+        let (res, bridge) =
+            run_emit(decl, DefinitionCategory::DataProvider, vec![], "dev.strict").await;
         let err = res.unwrap_err().to_string();
         assert!(err.contains("violates its declared schema"), "{err}");
         assert!(bridge.emitted.lock().unwrap().is_empty());
@@ -925,7 +958,13 @@ return dash.data_provider {
 local dash = require("dash")
 return dash.automation { id = "t.auto", emits = { "dev.pr_merged" } }
 "#;
-        let (res, _) = run_emit(decl, DefinitionCategory::Automation, vec![], "dev.pr_merged").await;
+        let (res, _) = run_emit(
+            decl,
+            DefinitionCategory::Automation,
+            vec![],
+            "dev.pr_merged",
+        )
+        .await;
         let err = res.unwrap_err().to_string();
         assert!(err.contains("cannot emit Events"), "{err}");
 
@@ -933,7 +972,13 @@ return dash.automation { id = "t.auto", emits = { "dev.pr_merged" } }
 local dash = require("dash")
 return dash.action_provider { id = "t.act", emits = { "dev.pr_merged" } }
 "#;
-        let (res, bridge) = run_emit(decl, DefinitionCategory::ActionProvider, vec![], "dev.pr_merged").await;
+        let (res, bridge) = run_emit(
+            decl,
+            DefinitionCategory::ActionProvider,
+            vec![],
+            "dev.pr_merged",
+        )
+        .await;
         assert!(res.is_ok(), "{res:?}");
         assert_eq!(bridge.emitted.lock().unwrap().len(), 1);
     }
@@ -950,22 +995,50 @@ return R
 "#;
         let pool = VmPool::new(ResourceBudget::default());
         for (category, decl, allowed) in [
-            (DefinitionCategory::DataProvider, r#"local dash = require("dash"); return dash.data_provider { id = "t.s1" }"#, true),
-            (DefinitionCategory::Connector, r#"local dash = require("dash"); return dash.connector { id = "t.s2" }"#, true),
-            (DefinitionCategory::Automation, r#"local dash = require("dash"); return dash.automation { id = "t.s3" }"#, true),
-            (DefinitionCategory::ActionProvider, r#"local dash = require("dash"); return dash.action_provider { id = "t.s4" }"#, false),
-            (DefinitionCategory::Adapter, r#"local dash = require("dash"); return dash.adapter { id = "t.s5" }"#, false),
+            (
+                DefinitionCategory::DataProvider,
+                r#"local dash = require("dash"); return dash.data_provider { id = "t.s1" }"#,
+                true,
+            ),
+            (
+                DefinitionCategory::Connector,
+                r#"local dash = require("dash"); return dash.connector { id = "t.s2" }"#,
+                true,
+            ),
+            (
+                DefinitionCategory::Automation,
+                r#"local dash = require("dash"); return dash.automation { id = "t.s3" }"#,
+                true,
+            ),
+            (
+                DefinitionCategory::ActionProvider,
+                r#"local dash = require("dash"); return dash.action_provider { id = "t.s4" }"#,
+                false,
+            ),
+            (
+                DefinitionCategory::Adapter,
+                r#"local dash = require("dash"); return dash.adapter { id = "t.s5" }"#,
+                false,
+            ),
         ] {
             let id = format!("state_{}", category.as_str());
             let b = bundle(&id, decl, rt);
             let res = pool
-                .execute_handler(&b, "go", cfg(category, &id, &[], Arc::new(ProbeBridge::default())), None)
+                .execute_handler(
+                    &b,
+                    "go",
+                    cfg(category, &id, &[], Arc::new(ProbeBridge::default())),
+                    None,
+                )
                 .await;
             if allowed {
                 assert_eq!(res.unwrap(), json!(1), "{category:?}");
             } else {
                 let err = res.unwrap_err().to_string();
-                assert!(err.contains("State") || err.contains("state"), "{category:?}: {err}");
+                assert!(
+                    err.contains("State") || err.contains("state"),
+                    "{category:?}: {err}"
+                );
             }
         }
     }
@@ -980,8 +1053,14 @@ return R
             Arc::new(|_input: &str, op: &str| op != "get_pr"),
         );
         bridge.call_input("gh", "get_pr", json!({})).await.unwrap();
-        assert!(!tracking.side_effect_possible(), "read-only call is not a side effect");
-        bridge.call_input("gh", "merge_pr", json!({})).await.unwrap();
+        assert!(
+            !tracking.side_effect_possible(),
+            "read-only call is not a side effect"
+        );
+        bridge
+            .call_input("gh", "merge_pr", json!({}))
+            .await
+            .unwrap();
         assert!(tracking.side_effect_possible());
         assert_eq!(tracking.mutating_calls_issued(), 1);
 
@@ -991,7 +1070,11 @@ return R
             sleep: std::time::Duration::from_secs(5),
             ..Default::default()
         });
-        let bridge = CallTrackingBridge::new(slow, Arc::clone(&tracking), Arc::new(|_: &str, _: &str| true));
+        let bridge = CallTrackingBridge::new(
+            slow,
+            Arc::clone(&tracking),
+            Arc::new(|_: &str, _: &str| true),
+        );
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(20),
             bridge.call_input("gh", "merge_pr", json!({})),

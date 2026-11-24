@@ -78,7 +78,10 @@ async fn resolved_query_key_matches_query_and_allows_subscribe_first() {
     let first = rx.recv().await.unwrap();
     assert_eq!(first.status, QueryStatus::Loading);
     let second = rx.recv().await.unwrap();
-    assert_eq!((second.status, second.version), (QueryStatus::Fresh, env.version));
+    assert_eq!(
+        (second.status, second.version),
+        (QueryStatus::Fresh, env.version)
+    );
 
     assert!(engine
         .queries
@@ -181,7 +184,11 @@ async fn provider_deltas_are_sequence_checked_and_gaps_resync() {
     }
     assert_eq!(rows[0]["state"], "closed");
     assert_eq!(
-        engine.signals.latest_snapshot(&init.query_key).unwrap().version,
+        engine
+            .signals
+            .latest_snapshot(&init.query_key)
+            .unwrap()
+            .version,
         local_ver
     );
 
@@ -223,11 +230,22 @@ async fn provider_deltas_are_sequence_checked_and_gaps_resync() {
 async fn provider_deltas_require_declared_push_updates() {
     let engine = engine();
     let mut g = (*engine.graph.load_full()).clone();
-    g.definitions.get_mut("test.list").unwrap().manifest.updates.push = false;
+    g.definitions
+        .get_mut("test.list")
+        .unwrap()
+        .manifest
+        .updates
+        .push = false;
     engine.graph.store(Arc::new(g));
     let err = engine
         .queries
-        .apply_provider_delta("inst_list", &json!({}), &Principal::administrator(), 1, vec![])
+        .apply_provider_delta(
+            "inst_list",
+            &json!({}),
+            &Principal::administrator(),
+            1,
+            vec![],
+        )
         .await
         .unwrap_err();
     assert!(err.contains("push"));

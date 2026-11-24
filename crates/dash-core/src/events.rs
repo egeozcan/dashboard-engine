@@ -77,8 +77,12 @@ pub trait EventLog: Send + Sync {
     fn sources(&self) -> Result<Vec<String>, String>;
     fn checkpoint(&self, consumer_id: &str, source_instance: &str) -> Result<Option<i64>, String>;
     /// Monotonic: never moves a checkpoint backwards.
-    fn set_checkpoint(&self, consumer_id: &str, source_instance: &str, sequence: i64)
-        -> Result<(), String>;
+    fn set_checkpoint(
+        &self,
+        consumer_id: &str,
+        source_instance: &str,
+        sequence: i64,
+    ) -> Result<(), String>;
     fn record_dead_letter(
         &self,
         consumer_id: &str,
@@ -86,8 +90,11 @@ pub trait EventLog: Send + Sync {
         attempts: i64,
         error: &str,
     ) -> Result<String, String>;
-    fn list_dead_letters(&self, include_resolved: bool, limit: usize)
-        -> Result<Vec<DeadLetterRecord>, String>;
+    fn list_dead_letters(
+        &self,
+        include_resolved: bool,
+        limit: usize,
+    ) -> Result<Vec<DeadLetterRecord>, String>;
     fn get_dead_letter(&self, dlq_id: &str) -> Result<Option<DeadLetterRecord>, String>;
     fn resolve_dead_letter(&self, dlq_id: &str) -> Result<bool, String>;
     /// Delete acknowledged Events older than `cutoff`; returns how many were deleted.
@@ -116,7 +123,8 @@ impl EventLog for SqliteStore {
         .map_err(|e| e.to_string())
     }
     fn max_sequence(&self, source_instance: &str) -> Result<i64, String> {
-        self.max_event_sequence(source_instance).map_err(|e| e.to_string())
+        self.max_event_sequence(source_instance)
+            .map_err(|e| e.to_string())
     }
     fn max_sequence_before(&self, source_instance: &str, cutoff: &str) -> Result<i64, String> {
         self.max_event_sequence_before(source_instance, cutoff)
@@ -301,7 +309,9 @@ impl EventBus {
         source_instance: &str,
         after_sequence: i64,
     ) -> Result<Vec<EventEnvelope>, String> {
-        let records = self.log.list_since(source_instance, after_sequence, usize::MAX)?;
+        let records = self
+            .log
+            .list_since(source_instance, after_sequence, usize::MAX)?;
         Ok(records
             .into_iter()
             .map(|r| {
@@ -337,7 +347,8 @@ impl EventBus {
         source_instance: &str,
         sequence: i64,
     ) -> Result<(), String> {
-        self.log.set_checkpoint(consumer_id, source_instance, sequence)
+        self.log
+            .set_checkpoint(consumer_id, source_instance, sequence)
     }
 
     pub fn get_checkpoint(&self, consumer_id: &str, source_instance: &str) -> i64 {
@@ -364,7 +375,8 @@ impl EventBus {
         attempts: i64,
         error: &str,
     ) -> Result<String, String> {
-        self.log.record_dead_letter(consumer_id, event_id, attempts, error)
+        self.log
+            .record_dead_letter(consumer_id, event_id, attempts, error)
     }
 
     pub fn list_dead_letters(
@@ -418,7 +430,12 @@ mod tests {
 
         // A fresh bus (restart) seeds ephemeral sequences from the durable log.
         let bus2 = EventBus::new(store, 16);
-        assert_eq!(bus2.emit("src", "a", "1", "tr", false, json!({})).unwrap().sequence, 5);
+        assert_eq!(
+            bus2.emit("src", "a", "1", "tr", false, json!({}))
+                .unwrap()
+                .sequence,
+            5
+        );
     }
 
     #[test]
@@ -442,7 +459,11 @@ mod tests {
         let mut last = 0;
         for _ in 0..200 {
             let ev = rx.try_recv().unwrap();
-            assert!(ev.sequence > last, "broadcast out of order: {} after {last}", ev.sequence);
+            assert!(
+                ev.sequence > last,
+                "broadcast out of order: {} after {last}",
+                ev.sequence
+            );
             last = ev.sequence;
         }
     }

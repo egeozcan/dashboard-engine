@@ -2,9 +2,8 @@
 //! embedded React UI assets (`rust-embed`), and CSP headers (§10.1, §14).
 
 use crate::auth::{
-    authenticate_request, build_session_cookie, client_ip, create_browser_session,
-    extract_cookie, host_guard, session_cookie_secure, validate_origin, verify_password,
-    LoginRateLimiter,
+    authenticate_request, build_session_cookie, client_ip, create_browser_session, extract_cookie,
+    host_guard, session_cookie_secure, validate_origin, verify_password, LoginRateLimiter,
 };
 use crate::mcp::{mcp_delete_handler, mcp_get_handler, mcp_post_handler};
 use crate::services::AppServices;
@@ -54,25 +53,52 @@ pub fn build_router(services: AppServices) -> Router {
         )
         .route("/api/widget-request", post(widget_request_handler))
         .route("/api/queries/{instance_id}", post(query_handler))
-        .route("/api/actions/{instance_id}/dry-run", post(action_dry_run_handler))
-        .route("/api/actions/{instance_id}/invoke", post(action_invoke_handler))
+        .route(
+            "/api/actions/{instance_id}/dry-run",
+            post(action_dry_run_handler),
+        )
+        .route(
+            "/api/actions/{instance_id}/invoke",
+            post(action_invoke_handler),
+        )
         .route("/api/executions", get(executions_list_handler))
-        .route("/api/executions/{id}/resolve", post(execution_resolve_handler))
-        .route("/api/executions/{id}/cancel", post(execution_cancel_handler))
-        .route("/api/drafts", get(drafts_list_handler).post(draft_begin_handler))
-        .route("/api/drafts/{id}", get(draft_status_handler).delete(draft_abort_handler))
+        .route(
+            "/api/executions/{id}/resolve",
+            post(execution_resolve_handler),
+        )
+        .route(
+            "/api/executions/{id}/cancel",
+            post(execution_cancel_handler),
+        )
+        .route(
+            "/api/drafts",
+            get(drafts_list_handler).post(draft_begin_handler),
+        )
+        .route(
+            "/api/drafts/{id}",
+            get(draft_status_handler).delete(draft_abort_handler),
+        )
         .route("/api/drafts/{id}/validate", post(draft_validate_handler))
         .route("/api/drafts/{id}/preview", post(draft_preview_handler))
         .route("/api/drafts/{id}/rebase", post(draft_rebase_handler))
         .route("/api/drafts/{id}/activate", post(draft_activate_handler))
-        .route("/api/drafts/{id}/definitions", post(draft_definition_handler))
-        .route("/api/drafts/{id}/instances", post(draft_instance_upsert_handler))
+        .route(
+            "/api/drafts/{id}/definitions",
+            post(draft_definition_handler),
+        )
+        .route(
+            "/api/drafts/{id}/instances",
+            post(draft_instance_upsert_handler),
+        )
         .route(
             "/api/drafts/{id}/instances/{instance_id}",
             axum::routing::delete(draft_instance_delete_handler),
         )
         .route("/api/drafts/{id}/dashboards", post(draft_dashboard_handler))
-        .route("/api/drafts/{id}/dependencies", post(draft_dependency_handler))
+        .route(
+            "/api/drafts/{id}/dependencies",
+            post(draft_dependency_handler),
+        )
         .route("/api/definitions/{id}/test", post(definition_test_handler))
         .route("/api/diagnostics/logs", get(logs_handler))
         .route("/api/diagnostics/traces", get(traces_handler))
@@ -81,16 +107,25 @@ pub fn build_router(services: AppServices) -> Router {
         .route("/api/git/status", get(git_status_handler))
         .route("/api/git/history", get(git_history_handler))
         .route("/api/git/sync", post(git_sync_handler))
-        .route("/api/secrets", get(secrets_list_handler).post(secrets_set_handler))
+        .route(
+            "/api/secrets",
+            get(secrets_list_handler).post(secrets_set_handler),
+        )
         .route("/api/drafts/{id}/secrets/bind", post(secret_bind_handler))
-        .route("/api/agents", get(agents_list_handler).post(agents_create_handler))
+        .route(
+            "/api/agents",
+            get(agents_list_handler).post(agents_create_handler),
+        )
         .route("/api/agents/{id}/revoke", post(agents_revoke_handler))
         .route("/api/service-principals", get(sp_list_handler))
         .route("/api/service-principals/{id}/grant", post(sp_grant_handler))
         .route("/api/workspace/reload", post(workspace_reload_handler))
         .route("/api/doctor", get(doctor_handler))
         .route("/api/network-policy", get(network_policy_status_handler))
-        .route("/api/network-policy/grant", post(network_policy_grant_handler))
+        .route(
+            "/api/network-policy/grant",
+            post(network_policy_grant_handler),
+        )
         .merge(ui_api_routes())
         .with_state(state.clone());
 
@@ -164,7 +199,13 @@ async fn login_handler(
     st.rate_limiter.clear(client);
     let (tok, csrf) = match create_browser_session(&st.services, &creds.0) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
     };
     let secure = session_cookie_secure(&st.services, &headers, peer.ip());
     let cookie = build_session_cookie(&tok, secure);
@@ -366,9 +407,12 @@ async fn dashboard_state_get_handler(
 }
 
 fn state_error_response(e: &dash_core::state::StateError) -> Response {
-    let status =
-        StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(json!({ "error": e.to_string(), "code": e.code() }))).into_response()
+    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        Json(json!({ "error": e.to_string(), "code": e.code() })),
+    )
+        .into_response()
 }
 
 async fn widget_request_handler(
@@ -473,7 +517,11 @@ async fn executions_list_handler(
     };
     match st.services.execution_inspect_for(None, &p) {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -540,7 +588,11 @@ async fn drafts_list_handler(
     };
     match st.services.draft_list_for(&p) {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -560,7 +612,11 @@ async fn draft_begin_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.draft_begin_at(&p, q.base_revision.as_deref()).await {
+    match st
+        .services
+        .draft_begin_at(&p, q.base_revision.as_deref())
+        .await
+    {
         Ok(d) => Json(d).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -880,9 +936,16 @@ async fn audits_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.audit_query_for(p.limit.unwrap_or(100), &principal) {
+    match st
+        .services
+        .audit_query_for(p.limit.unwrap_or(100), &principal)
+    {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -896,7 +959,11 @@ async fn git_status_handler(
     }
     match st.services.git_status().await {
         Ok(s) => Json(s).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -911,7 +978,11 @@ async fn git_history_handler(
     }
     match st.services.git_history(p.limit.unwrap_or(20)).await {
         Ok(h) => Json(h).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -1030,7 +1101,11 @@ async fn agents_list_handler(
     }
     match st.services.agent_list() {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -1090,7 +1165,10 @@ async fn agents_create_handler(
         Ok(e) => e,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     };
-    match st.services.agent_create(&req.name, req.ceiling, Some(expires_at), &p) {
+    match st
+        .services
+        .agent_create(&req.name, req.ceiling, Some(expires_at), &p)
+    {
         Ok((rec, token)) => Json(json!({ "agent": rec, "token": token })).into_response(),
         Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
     }
@@ -1230,7 +1308,11 @@ async fn doctor_handler(
     }
     match st.services.workspace_doctor() {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -1276,12 +1358,18 @@ async fn widget_asset_handler(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(WIDGET_ASSET_CSP),
     );
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert(
         "cross-origin-resource-policy",
         HeaderValue::from_static("same-origin"),
     );
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     resp
 }
 
@@ -1310,9 +1398,15 @@ async fn embedded_ui_handler(uri: axum::http::Uri) -> Response {
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap());
     let h = resp.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(SHELL_UI_CSP));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(SHELL_UI_CSP),
+    );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -1325,7 +1419,10 @@ fn ui_api_routes() -> Router<ServerState> {
             post(widget_request_dry_run_handler),
         )
         .route("/api/definitions", get(definitions_summary_handler))
-        .route("/api/definitions/{id}/sources", get(definition_sources_handler))
+        .route(
+            "/api/definitions/{id}/sources",
+            get(definition_sources_handler),
+        )
         .route("/api/drafts/{id}/graph", get(draft_graph_handler))
         .route("/api/drafts/{id}/diff", get(draft_diff_handler))
 }

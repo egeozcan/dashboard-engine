@@ -676,7 +676,10 @@ impl DefinitionManifest {
             out.push_str(&format!("export type OutputData = {}\n", o.to_luau_type()));
         }
         if let Some(ref r) = self.result {
-            out.push_str(&format!("export type ActionResult = {}\n", r.to_luau_type()));
+            out.push_str(&format!(
+                "export type ActionResult = {}\n",
+                r.to_luau_type()
+            ));
         }
         self.generated_luau_types = out;
     }
@@ -749,7 +752,10 @@ mod tests {
 
     fn obj(fields: &[(&str, SchemaSpec)]) -> SchemaSpec {
         SchemaSpec::Object {
-            fields: fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
         }
     }
 
@@ -849,7 +855,10 @@ mod tests {
             .validate_value(&serde_json::json!([{ "id": 5 }]))
             .is_err());
 
-        let other = manifest_with_output("a.o", sem("dev.pr@1", Some(obj(&[("id", SchemaSpec::Integer)]))));
+        let other = manifest_with_output(
+            "a.o",
+            sem("dev.pr@1", Some(obj(&[("id", SchemaSpec::Integer)]))),
+        );
         assert!(build_semantic_registry([("a.p", &producer), ("a.o", &other)]).is_err());
         let orphan = manifest_with_output("a.x", sem("dev.none@1", None));
         assert!(build_semantic_registry([("a.x", &orphan)]).is_err());

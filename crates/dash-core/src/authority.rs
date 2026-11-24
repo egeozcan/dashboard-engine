@@ -146,18 +146,25 @@ pub fn check_action_authority(
                 ..
             } = input_spec
             {
-                let bound_id = action_inst.inputs.get(input_slot).ok_or_else(|| AuthError::Denied {
-                    principal_id: principal.id.clone(),
-                    principal_kind: principal.kind.as_str().into(),
-                    target: action_inst.id.clone(),
-                    reason: format!("missing connector input binding '{input_slot}'"),
-                })?;
-                let conn_inst = graph.instances.get(bound_id).ok_or_else(|| AuthError::Denied {
-                    principal_id: principal.id.clone(),
-                    principal_kind: principal.kind.as_str().into(),
-                    target: bound_id.clone(),
-                    reason: "bound connector instance does not exist".into(),
-                })?;
+                let bound_id =
+                    action_inst
+                        .inputs
+                        .get(input_slot)
+                        .ok_or_else(|| AuthError::Denied {
+                            principal_id: principal.id.clone(),
+                            principal_kind: principal.kind.as_str().into(),
+                            target: action_inst.id.clone(),
+                            reason: format!("missing connector input binding '{input_slot}'"),
+                        })?;
+                let conn_inst = graph
+                    .instances
+                    .get(bound_id)
+                    .ok_or_else(|| AuthError::Denied {
+                        principal_id: principal.id.clone(),
+                        principal_kind: principal.kind.as_str().into(),
+                        target: bound_id.clone(),
+                        reason: "bound connector instance does not exist".into(),
+                    })?;
                 if !principal.ceiling.allows_connector(&conn_inst.id) {
                     return Err(AuthError::Denied {
                         principal_id: principal.id.clone(),
@@ -515,7 +522,11 @@ pub fn check_draft_activation_authority(
     let mut consumers: Vec<(String, String, bool)> = Vec::new(); // (sp_id, root, binding_changed)
     for (id, inst) in &candidate.instances {
         if let Some(sp) = inst.run_as.as_deref().filter(|s| !s.is_empty()) {
-            consumers.push((sp.to_string(), id.clone(), instance_changed(active, candidate, id)));
+            consumers.push((
+                sp.to_string(),
+                id.clone(),
+                instance_changed(active, candidate, id),
+            ));
         }
     }
     for series in &candidate.workspace.history {
@@ -544,7 +555,12 @@ pub fn check_draft_activation_authority(
             .ok()
             .flatten()
             .and_then(|v| serde_json::from_value::<CapabilityCeiling>(v).ok())
-            .or_else(|| candidate.service_principals.get(&sp_id).map(|s| s.ceiling.clone()))
+            .or_else(|| {
+                candidate
+                    .service_principals
+                    .get(&sp_id)
+                    .map(|s| s.ceiling.clone())
+            })
             .unwrap_or_default();
         for p in &restricted {
             if !sp_ceiling.is_subset_of(&p.ceiling) {
@@ -676,7 +692,10 @@ pub fn validate_configured_graph(
                                 severity: "error".into(),
                                 code: "INPUT_CATEGORY_MISMATCH".into(),
                                 target: inst_id.clone(),
-                                message: format!("input '{slot}' expects connector, got '{}'", target.category.as_str()),
+                                message: format!(
+                                    "input '{slot}' expects connector, got '{}'",
+                                    target.category.as_str()
+                                ),
                             });
                         }
                         if let Some(expected_def) = definition {
@@ -711,7 +730,10 @@ pub fn validate_configured_graph(
                                 severity: "error".into(),
                                 code: "INPUT_CATEGORY_MISMATCH".into(),
                                 target: inst_id.clone(),
-                                message: format!("input '{slot}' expects data_provider, got '{}'", target.category.as_str()),
+                                message: format!(
+                                    "input '{slot}' expects data_provider, got '{}'",
+                                    target.category.as_str()
+                                ),
                             });
                         }
                         if let Some(expected_def) = definition {
@@ -728,7 +750,8 @@ pub fn validate_configured_graph(
                             (expected_output, graph.definitions.get(&target.definition))
                         {
                             if let Some(prod_schema) = &target_def.manifest.output {
-                                if let Err(msg) = SchemaSpec::is_compatible(prod_schema, exp_schema) {
+                                if let Err(msg) = SchemaSpec::is_compatible(prod_schema, exp_schema)
+                                {
                                     issues.push(ValidationIssue {
                                         severity: "error".into(),
                                         code: "SCHEMA_INCOMPATIBLE".into(),
@@ -755,7 +778,10 @@ pub fn validate_configured_graph(
                                 severity: "error".into(),
                                 code: "INPUT_CATEGORY_MISMATCH".into(),
                                 target: inst_id.clone(),
-                                message: format!("input '{slot}' expects action_provider, got '{}'", target.category.as_str()),
+                                message: format!(
+                                    "input '{slot}' expects action_provider, got '{}'",
+                                    target.category.as_str()
+                                ),
                             });
                         }
                         if let Some(expected_def) = definition {
@@ -911,14 +937,22 @@ pub fn validate_configured_graph(
                     severity: "error".into(),
                     code: "MISSING_ADAPTER".into(),
                     target: dash_id.clone(),
-                    message: format!("dashboard references missing adapter '{}'", placement.adapter_instance),
+                    message: format!(
+                        "dashboard references missing adapter '{}'",
+                        placement.adapter_instance
+                    ),
                 }),
-                Some(inst) if inst.category != DefinitionCategory::Adapter => issues.push(ValidationIssue {
-                    severity: "error".into(),
-                    code: "INVALID_DASHBOARD_INSTANCE".into(),
-                    target: dash_id.clone(),
-                    message: format!("dashboard placement '{}' must be an adapter", placement.adapter_instance),
-                }),
+                Some(inst) if inst.category != DefinitionCategory::Adapter => {
+                    issues.push(ValidationIssue {
+                        severity: "error".into(),
+                        code: "INVALID_DASHBOARD_INSTANCE".into(),
+                        target: dash_id.clone(),
+                        message: format!(
+                            "dashboard placement '{}' must be an adapter",
+                            placement.adapter_instance
+                        ),
+                    })
+                }
                 _ => {}
             }
         }
@@ -1054,7 +1088,8 @@ return dash.connector {
 
     fn base_graph() -> ConfiguredGraph {
         let mut g = ConfiguredGraph::default();
-        g.definitions.insert("gh.connector".into(), def(CONNECTOR, "return {}"));
+        g.definitions
+            .insert("gh.connector".into(), def(CONNECTOR, "return {}"));
         g.definitions.insert(
             "gh.prs".into(),
             def(
@@ -1066,10 +1101,15 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         );
         g.definitions.insert(
             "gh.utils".into(),
-            def(r#"local dash = require("dash"); return dash.library { id = "gh.utils" }"#, "return {}"),
+            def(
+                r#"local dash = require("dash"); return dash.library { id = "gh.utils" }"#,
+                "return {}",
+            ),
         );
         let mut reader = inst("gh_reader", DefinitionCategory::Connector, "gh.connector");
-        reader.secrets.insert("auth".into(), "secret://gh-work".into());
+        reader
+            .secrets
+            .insert("auth".into(), "secret://gh-work".into());
         reader.capabilities = vec!["pr.read".into()];
         reader.config = json!({ "base_url": "https://api.github.com" });
         g.instances.insert(reader.id.clone(), reader);
@@ -1116,8 +1156,9 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         let admin = Principal::administrator();
         let reader = &g.instances["gh_reader"];
         assert!(check_connector_operation_authority(&admin, reader, "list", &g).is_ok());
-        let err = check_connector_operation_authority(&admin, reader, "simulate_external_merge", &g)
-            .unwrap_err();
+        let err =
+            check_connector_operation_authority(&admin, reader, "simulate_external_merge", &g)
+                .unwrap_err();
         assert!(err.to_string().contains("undeclared operation"));
         // Capability still enforced for declared ops.
         assert!(check_connector_operation_authority(&admin, reader, "merge", &g).is_err());
@@ -1143,7 +1184,12 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         let store = SqliteStore::open_in_memory().unwrap();
         let p = agent(CapabilityCeiling::default());
         let g = base_graph();
-        let r = audited(&store, &p, "provider.query", check_provider_access(&p, &g.instances["open_prs"]));
+        let r = audited(
+            &store,
+            &p,
+            "provider.query",
+            check_provider_access(&p, &g.instances["open_prs"]),
+        );
         assert!(r.is_err());
         let a = store.list_audits(5).unwrap();
         assert_eq!(a[0].operation, "provider.query");
@@ -1157,39 +1203,73 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         let active = base_graph();
         let unchanged = base_graph();
         let ag = drafting_agent();
-        assert!(check_draft_activation_authority(&store, &active, &unchanged, std::slice::from_ref(&ag)).is_empty());
+        assert!(check_draft_activation_authority(
+            &store,
+            &active,
+            &unchanged,
+            std::slice::from_ref(&ag)
+        )
+        .is_empty());
 
         // 1. Point the secret-holding connector at an attacker host.
         let mut cand = base_graph();
-        cand.instances.get_mut("gh_reader").unwrap().config = json!({ "base_url": "https://evil.example" });
-        let issues = check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag));
-        assert!(issues.iter().any(|i| i.code == "PENDING_SECRET_GRANT" && i.target == "gh_reader"));
+        cand.instances.get_mut("gh_reader").unwrap().config =
+            json!({ "base_url": "https://evil.example" });
+        let issues =
+            check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag));
+        assert!(issues
+            .iter()
+            .any(|i| i.code == "PENDING_SECRET_GRANT" && i.target == "gh_reader"));
         // The Administrator may make the same change; so may an Agent granted the secret.
-        assert!(check_draft_activation_authority(&store, &active, &cand, &[Principal::administrator()]).is_empty());
+        assert!(check_draft_activation_authority(
+            &store,
+            &active,
+            &cand,
+            &[Principal::administrator()]
+        )
+        .is_empty());
         let mut granted = drafting_agent();
         granted.ceiling.allowed_secrets.insert("gh-work".into());
         assert!(check_draft_activation_authority(&store, &active, &cand, &[granted]).is_empty());
 
         // 2. Edit the connector's runtime code.
         let mut cand = base_graph();
-        cand.definitions.insert("gh.connector".into(), def(CONNECTOR, "return { exfil = true }"));
-        assert!(check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag))
-            .iter()
-            .any(|i| i.code == "PENDING_SECRET_GRANT"));
+        cand.definitions.insert(
+            "gh.connector".into(),
+            def(CONNECTOR, "return { exfil = true }"),
+        );
+        assert!(check_draft_activation_authority(
+            &store,
+            &active,
+            &cand,
+            std::slice::from_ref(&ag)
+        )
+        .iter()
+        .any(|i| i.code == "PENDING_SECRET_GRANT"));
 
         // 3. Edit a Library any connector can `require`.
         let mut cand = base_graph();
         cand.definitions.insert(
             "gh.utils".into(),
-            def(r#"local dash = require("dash"); return dash.library { id = "gh.utils" }"#, "return { x = 1 }"),
+            def(
+                r#"local dash = require("dash"); return dash.library { id = "gh.utils" }"#,
+                "return { x = 1 }",
+            ),
         );
-        assert!(!check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag)).is_empty());
+        assert!(!check_draft_activation_authority(
+            &store,
+            &active,
+            &cand,
+            std::slice::from_ref(&ag)
+        )
+        .is_empty());
 
         // 4. Rebind a different secret onto a new connector Instance.
         let mut cand = base_graph();
         let mut evil = cand.instances["gh_reader"].clone();
         evil.id = "evil_conn".into();
-        evil.secrets.insert("auth".into(), "secret://admin-root".into());
+        evil.secrets
+            .insert("auth".into(), "secret://admin-root".into());
         cand.instances.insert("evil_conn".into(), evil);
         let issues = check_draft_activation_authority(&store, &active, &cand, &[ag]);
         assert!(issues.iter().any(|i| i.target == "evil_conn"));
@@ -1207,8 +1287,11 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         polled.inputs.insert("gh".into(), "gh_reader".into());
         polled.run_as = Some("sampler".into());
         cand.instances.insert("borrowed".into(), polled);
-        let issues = check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag));
-        assert!(issues.iter().any(|i| i.code == "PENDING_SERVICE_PRINCIPAL_BINDING" && i.target == "borrowed"));
+        let issues =
+            check_draft_activation_authority(&store, &active, &cand, std::slice::from_ref(&ag));
+        assert!(issues
+            .iter()
+            .any(|i| i.code == "PENDING_SERVICE_PRINCIPAL_BINDING" && i.target == "borrowed"));
 
         // New history series under the Service principal.
         let mut cand2 = base_graph();
@@ -1222,9 +1305,14 @@ return dash.data_provider { id = "gh.prs", handler = "query",
             retention_days: 1,
             service_principal: "sampler".into(),
         });
-        assert!(check_draft_activation_authority(&store, &active, &cand2, std::slice::from_ref(&ag))
-            .iter()
-            .any(|i| i.code == "PENDING_SERVICE_PRINCIPAL_BINDING"));
+        assert!(check_draft_activation_authority(
+            &store,
+            &active,
+            &cand2,
+            std::slice::from_ref(&ag)
+        )
+        .iter()
+        .any(|i| i.code == "PENDING_SERVICE_PRINCIPAL_BINDING"));
 
         // The Administrator grant (not the YAML request) is the ceiling compared once it exists.
         store
@@ -1264,18 +1352,33 @@ return dash.data_provider { id = "gh.prs", handler = "query",
             )
             .unwrap();
         let p = resolve_recorded_principal(&store, &rec.agent_id, Some("agent")).unwrap();
-        assert!(!p.ceiling.unrestricted, "an Agent record can never resolve as unrestricted");
+        assert!(
+            !p.ceiling.unrestricted,
+            "an Agent record can never resolve as unrestricted"
+        );
         assert!(p.ceiling.allows_secret("gh-work"));
         store.revoke_agent_principal(&rec.agent_id).unwrap();
         let p = resolve_recorded_principal(&store, &rec.agent_id, Some("agent")).unwrap();
-        assert!(!p.ceiling.allows_secret("gh-work"), "revoked Agents lose their authority");
+        assert!(
+            !p.ceiling.allows_secret("gh-work"),
+            "revoked Agents lose their authority"
+        );
         assert!(resolve_recorded_principal(&store, "admin", Some("administrator")).is_none());
         assert!(resolve_recorded_principal(&store, "admin", None).is_none());
-        assert!(resolve_recorded_principal(&store, "agt_ghost", Some("agent"))
-            .is_some_and(|p| p.ceiling == CapabilityCeiling::default()));
+        assert!(
+            resolve_recorded_principal(&store, "agt_ghost", Some("agent"))
+                .is_some_and(|p| p.ceiling == CapabilityCeiling::default())
+        );
 
         store
-            .append_audit(&rec.agent_id, "agent", "draft.edit", "dft_x", "ok", json!({}))
+            .append_audit(
+                &rec.agent_id,
+                "agent",
+                "draft.edit",
+                "dft_x",
+                "ok",
+                json!({}),
+            )
             .unwrap();
         let editors = draft_editor_principals(&store, "dft_x", "admin");
         assert_eq!(editors.len(), 1);

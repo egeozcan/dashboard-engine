@@ -35,8 +35,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn copy_fixture_ws(dst: &Path) {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center");
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
         packages::copy_tree_excluding_git(&src, dst).unwrap();
     }
 
@@ -88,10 +88,9 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
         )
         .unwrap();
         git_cli::ensure_git_repo(&ext_repo, "main").await.unwrap();
-        let pinned_commit =
-            git_cli::git_commit_all(&ext_repo, "v1 release", "author", None)
-                .await
-                .unwrap();
+        let pinned_commit = git_cli::git_commit_all(&ext_repo, "v1 release", "author", None)
+            .await
+            .unwrap();
 
         // Create workspace depending on ext_pkg with ref = "main"
         let ws = tmp.path().join("ws");
@@ -224,7 +223,9 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
 
         let act1 = mgr.draft_activate(&d1.draft_id, &admin).await.unwrap();
         assert_eq!(act1.sync_status, "unsynced");
-        assert!(act1.carried_over_instances.contains(&"pr_trend_adapter".into()));
+        assert!(act1
+            .carried_over_instances
+            .contains(&"pr_trend_adapter".into()));
         // Unchanged instance keeps its exact live VM across hot reload!
         assert_eq!(mgr.engine().pool.vm_uid("pr_trend_adapter"), vm_uid_before);
 
@@ -235,7 +236,12 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
             .unwrap();
         git_cli::run_git(
             &ws,
-            &["remote", "set-url", "origin", &bare_remote.to_string_lossy()],
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &bare_remote.to_string_lossy(),
+            ],
         )
         .await
         .unwrap();
@@ -267,7 +273,9 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
 
         // Draft 2 touched the same EOF hunk in instances/data.yaml -> rebase MUST fail with explicit MergeConflict!
         let conflict_err = mgr.draft_rebase(&d2.draft_id).await.unwrap_err();
-        assert!(matches!(conflict_err, GitError::MergeConflict(ref f) if f.contains(&"instances/data.yaml".into())));
+        assert!(
+            matches!(conflict_err, GitError::MergeConflict(ref f) if f.contains(&"instances/data.yaml".into()))
+        );
         mgr.draft_abort(&d2.draft_id).await.unwrap();
 
         // Draft 3 (also started on old base rev 1) edits a non-conflicting dashboard file -> rebases cleanly!
@@ -296,7 +304,12 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
         assert!(rebased.validation_report.is_none());
         let act2 = mgr.draft_activate(&d3.draft_id, &admin).await.unwrap();
         assert_eq!(act2.sync_status, "synced");
-        assert!(mgr.engine().graph.load().instances.contains_key("hello_metric"));
+        assert!(mgr
+            .engine()
+            .graph
+            .load()
+            .instances
+            .contains_key("hello_metric"));
         assert!(mgr.engine().graph.load().dashboards.contains_key("ops"));
     }
 
@@ -326,7 +339,11 @@ return dash.data_provider { id = "ext.hello", handler = "query" }
         let admin = Principal::administrator();
 
         let status0 = mgr.git_status().await.unwrap();
-        assert!(!status0.dirty, "initial status dirty: {:?}", status0.changed_files);
+        assert!(
+            !status0.dirty,
+            "initial status dirty: {:?}",
+            status0.changed_files
+        );
         assert!(status0.changed_files.is_empty());
 
         // 1. Package Studio draft flow: adding custom_metric must keep existing packages & dashboards intact

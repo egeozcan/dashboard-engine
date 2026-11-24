@@ -17,18 +17,18 @@ pub use actions::{
     WidgetRequestOutcome, UNKNOWN_OUTCOME_CODE,
 };
 pub use authority::{
+    audit_denial, audited, check_connector_operation_read_only, check_draft_activation_authority,
+    draft_editor_principals, resolve_recorded_principal, DRAFT_EDITOR_AUDIT_OPS,
+};
+pub use authority::{
     check_action_authority, check_connector_operation_authority, check_provider_access,
     validate_configured_graph, AuthError, Principal, PrincipalKind, ValidationIssue,
     ValidationReport,
 };
-pub use authority::{
-    audit_denial, audited, check_connector_operation_read_only, check_draft_activation_authority,
-    draft_editor_principals, resolve_recorded_principal, DRAFT_EDITOR_AUDIT_OPS,
-};
-pub use http_broker::{load_network_ceiling, EffectiveNetworkPolicy};
 pub use automations::AutomationEngine;
 pub use events::{EventBus, EventEnvelope};
 pub use history::HistoryManager;
+pub use http_broker::{load_network_ceiling, EffectiveNetworkPolicy};
 pub use http_broker::{HttpBroker, HttpBrokerError};
 pub use model::{
     CapabilityCeiling, ConfiguredGraph, DashboardAdapterPlacement, DashboardDoc,
@@ -151,8 +151,14 @@ impl RuntimeEngine {
             active_vms: self.pool.active_vm_count(),
             reclaimed_vms: self.pool.total_reclaimed(),
             cache_entries: self.queries.cache_len(),
-            query_cache_hits: self.telemetry.query_hits.load(std::sync::atomic::Ordering::Relaxed),
-            query_cache_misses: self.telemetry.query_misses.load(std::sync::atomic::Ordering::Relaxed),
+            query_cache_hits: self
+                .telemetry
+                .query_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            query_cache_misses: self
+                .telemetry
+                .query_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
             active_subscribers: self.signals.total_subscribers(),
             pending_events: self.store.event_consumer_lag().unwrap_or(0) as usize,
             action_executions_total: self
@@ -266,10 +272,18 @@ return R
 "#,
         );
 
-        graph.definitions.insert("test.upstream_a".into(), upstream_a);
-        graph.definitions.insert("test.upstream_b".into(), upstream_b);
-        graph.definitions.insert("test.router".into(), dynamic_router);
-        graph.definitions.insert("test.slow_once".into(), slow_counter);
+        graph
+            .definitions
+            .insert("test.upstream_a".into(), upstream_a);
+        graph
+            .definitions
+            .insert("test.upstream_b".into(), upstream_b);
+        graph
+            .definitions
+            .insert("test.router".into(), dynamic_router);
+        graph
+            .definitions
+            .insert("test.slow_once".into(), slow_counter);
 
         graph.instances.insert(
             "inst_a".into(),
@@ -366,12 +380,18 @@ return R
             kind: PrincipalKind::Agent,
             ceiling: CapabilityCeiling::read_only_agent(),
         };
-        let k_admin = engine
-            .queries
-            .compute_query_key("inst_dedup", "d1", &json!({"repo": "acme/a"}), &admin);
-        let k_agent = engine
-            .queries
-            .compute_query_key("inst_dedup", "d1", &json!({"repo": "acme/a"}), &agent);
+        let k_admin = engine.queries.compute_query_key(
+            "inst_dedup",
+            "d1",
+            &json!({"repo": "acme/a"}),
+            &admin,
+        );
+        let k_agent = engine.queries.compute_query_key(
+            "inst_dedup",
+            "d1",
+            &json!({"repo": "acme/a"}),
+            &agent,
+        );
         assert_ne!(k_admin, k_agent);
 
         // 4. Dynamic dependency cleanup: route a -> route b removes edge to inst_a!
@@ -457,7 +477,8 @@ return R
 
         // Simulate sequence gap -> triggers resync error
         let mut bad_ver = 0;
-        let gap_err = apply_delta_envelope(&mut bad_ver, &mut local_rows, &delta_env, "id").unwrap_err();
+        let gap_err =
+            apply_delta_envelope(&mut bad_ver, &mut local_rows, &delta_env, "id").unwrap_err();
         assert!(gap_err.contains("snapshot resync required"));
 
         // 6. Failure retains stale data!
@@ -571,8 +592,14 @@ return R
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body["ok"], true);
         // Secret echoed back by upstream must be redacted before reaching Luau!
-        assert!(!resp.body["auth_seen"].as_str().unwrap().contains(secret_pat));
-        assert!(resp.body["auth_seen"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(!resp.body["auth_seen"]
+            .as_str()
+            .unwrap()
+            .contains(secret_pat));
+        assert!(resp.body["auth_seen"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED]"));
     }
 
     #[tokio::test]
@@ -689,9 +716,15 @@ return R
         let mut graph = ConfiguredGraph::default();
         graph.generation_id = 1;
         graph.definitions.insert("github.connector".into(), gh_conn);
-        graph.definitions.insert("github.merge_pr".into(), merge_act);
-        graph.definitions.insert("jira.transition_issue".into(), transition_act);
-        graph.definitions.insert("engineering.complete_work".into(), complete_auto);
+        graph
+            .definitions
+            .insert("github.merge_pr".into(), merge_act);
+        graph
+            .definitions
+            .insert("jira.transition_issue".into(), transition_act);
+        graph
+            .definitions
+            .insert("engineering.complete_work".into(), complete_auto);
 
         graph.instances.insert(
             "github_reader".into(),
@@ -799,7 +832,13 @@ return R
         // 1. Reader-bound merge action MUST fail capability check
         let reader_err = engine
             .actions
-            .invoke("merge_with_reader", json!({"number": 42}), &admin, None, None)
+            .invoke(
+                "merge_with_reader",
+                json!({"number": 42}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(reader_err.contains("lacks required capability"));
@@ -831,7 +870,12 @@ return R
 
         let resolved = engine
             .actions
-            .resolve_execution(&unk.execution_id, "failed", "verified PR not merged", &admin)
+            .resolve_execution(
+                &unk.execution_id,
+                "failed",
+                "verified PR not merged",
+                &admin,
+            )
             .await
             .unwrap();
         assert_eq!(resolved.status, "failed");
@@ -855,7 +899,10 @@ return R
             .iter()
             .any(|e| e.semantic_type == "dash.action_completed"));
         let pre_grant = engine.automations.dispatch_event(&merged_evt).await;
-        assert!(pre_grant[0].as_ref().unwrap_err().contains("no Administrator grant"));
+        assert!(pre_grant[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("no Administrator grant"));
 
         // 6. Grant Service principal ceiling in SQLite -> dispatch succeeds, and replay does NOT duplicate!
         store
@@ -954,7 +1001,9 @@ return R
         graph.definitions.insert("test.switch".into(), switch_def);
         graph.definitions.insert("test.a".into(), a_def);
         graph.definitions.insert("test.b".into(), b_def);
-        graph.definitions.insert("test.dyn_router".into(), router_def);
+        graph
+            .definitions
+            .insert("test.dyn_router".into(), router_def);
 
         for (id, def_id, inputs) in [
             ("inst_sw", "test.switch", BTreeMap::new()),
@@ -1017,9 +1066,10 @@ return R
             .identity_version
             .clone();
 
-        let router_qk = engine
-            .queries
-            .compute_query_key("inst_router", &router_dig, &json!({}), &admin);
+        let router_qk =
+            engine
+                .queries
+                .compute_query_key("inst_router", &router_dig, &json!({}), &admin);
         let qk_a = engine
             .queries
             .compute_query_key("inst_a", &a_dig, &json!({}), &admin);
@@ -1033,8 +1083,14 @@ return R
             .await
             .unwrap();
         assert_eq!(res1.value.unwrap().as_array().unwrap().len(), 2);
-        assert!(engine.queries.reverse_subscribers(&qk_a).contains(&router_qk));
-        assert!(!engine.queries.reverse_subscribers(&qk_b).contains(&router_qk));
+        assert!(engine
+            .queries
+            .reverse_subscribers(&qk_a)
+            .contains(&router_qk));
+        assert!(!engine
+            .queries
+            .reverse_subscribers(&qk_b)
+            .contains(&router_qk));
 
         // Flip instance state of inst_sw -> "b" and re-run SAME router query_key
         store
@@ -1052,8 +1108,14 @@ return R
             .unwrap();
         assert_eq!(res2.value.unwrap().as_array().unwrap().len(), 3);
         // Old edge to inst_a MUST be unsubscribed (no leaked subscription!)
-        assert!(!engine.queries.reverse_subscribers(&qk_a).contains(&router_qk));
-        assert!(engine.queries.reverse_subscribers(&qk_b).contains(&router_qk));
+        assert!(!engine
+            .queries
+            .reverse_subscribers(&qk_a)
+            .contains(&router_qk));
+        assert!(engine
+            .queries
+            .reverse_subscribers(&qk_b)
+            .contains(&router_qk));
 
         // History sampling under Service principal
         let series_cfg = HistorySeriesConfig {
@@ -1066,7 +1128,10 @@ return R
             retention_days: 30,
             service_principal: "pr_history_sampler".into(),
         };
-        engine.history.sync_series_configs(&[series_cfg.clone()]).unwrap();
+        engine
+            .history
+            .sync_series_configs(&[series_cfg.clone()])
+            .unwrap();
         // Without Admin grant -> denied
         assert!(engine
             .history
@@ -1086,7 +1151,11 @@ return R
                 "admin",
             )
             .unwrap();
-        let sampled = engine.history.sample_series(&series_cfg, None).await.unwrap();
+        let sampled = engine
+            .history
+            .sample_series(&series_cfg, None)
+            .await
+            .unwrap();
         assert_eq!(sampled, 3.0);
 
         let hist_env = engine

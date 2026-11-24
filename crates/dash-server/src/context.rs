@@ -29,7 +29,9 @@ impl std::str::FromStr for SecureCookieMode {
             "auto" => Ok(Self::Auto),
             "always" => Ok(Self::Always),
             "never" => Ok(Self::Never),
-            other => Err(format!("invalid secure-cookies mode '{other}' (auto|always|never)")),
+            other => Err(format!(
+                "invalid secure-cookies mode '{other}' (auto|always|never)"
+            )),
         }
     }
 }
@@ -220,9 +222,7 @@ impl ServerContext {
     /// Returns the negotiated protocol version on success.
     pub fn mcp_session_touch(&self, session_id: &str, principal_id: &str) -> Option<String> {
         let mut entry = self.mcp_sessions.get_mut(session_id)?;
-        if entry.principal_id != principal_id
-            || entry.last_seen.elapsed() >= MCP_SESSION_IDLE
-        {
+        if entry.principal_id != principal_id || entry.last_seen.elapsed() >= MCP_SESSION_IDLE {
             return None;
         }
         entry.last_seen = Instant::now();
@@ -253,7 +253,10 @@ mod tests {
 
         let ts = ServerContext::default().with_allowed_hosts(
             Some("127.0.0.1".parse().unwrap()),
-            &["dash-box.tailnet-abc.ts.net".into(), "other.lan:9000".into()],
+            &[
+                "dash-box.tailnet-abc.ts.net".into(),
+                "other.lan:9000".into(),
+            ],
         );
         assert!(ts.host_allowed("dash-box.tailnet-abc.ts.net"));
         assert!(!ts.host_allowed("evil-box.tailnet-abc.ts.net"));
@@ -270,7 +273,10 @@ mod tests {
     fn mcp_sessions_are_principal_bound_and_bounded() {
         let ctx = ServerContext::default();
         let sid = ctx.mcp_session_create("agt_a", "2025-06-18");
-        assert_eq!(ctx.mcp_session_touch(&sid, "agt_a").as_deref(), Some("2025-06-18"));
+        assert_eq!(
+            ctx.mcp_session_touch(&sid, "agt_a").as_deref(),
+            Some("2025-06-18")
+        );
         assert!(ctx.mcp_session_touch(&sid, "agt_b").is_none());
         assert!(!ctx.mcp_session_terminate(&sid, "agt_b"));
         assert!(ctx.mcp_session_terminate(&sid, "agt_a"));

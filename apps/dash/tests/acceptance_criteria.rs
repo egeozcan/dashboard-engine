@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn copy_ecc_fixture(dst: &Path) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/engineering-command-center");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
     dash_git::packages::copy_tree_excluding_git(&src, dst).unwrap();
 }
 
@@ -76,7 +76,11 @@ async fn ac01_single_executable_and_health() {
         .output()
         .await
         .unwrap();
-    assert!(init.status.success(), "dash init failed: {}", String::from_utf8_lossy(&init.stderr));
+    assert!(
+        init.status.success(),
+        "dash init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
     assert!(data.join("dash.db").exists());
     assert!(data.join("vault.key").exists());
 
@@ -104,7 +108,11 @@ async fn ac01_single_executable_and_health() {
     let client = reqwest::Client::new();
     let mut ready = false;
     for _ in 0..40 {
-        if let Ok(r) = client.get(format!("http://{bind_addr}/healthz")).send().await {
+        if let Ok(r) = client
+            .get(format!("http://{bind_addr}/healthz"))
+            .send()
+            .await
+        {
             if r.status() == 200 {
                 ready = true;
                 break;
@@ -127,15 +135,13 @@ async fn ac01_single_executable_and_health() {
 
 #[test]
 fn ac02_declarative_luau_manifest_and_rejection() {
-    let decl = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center/packages/engineering/linked_prs/definition.luau"),
-    )
+    let decl = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../fixtures/engineering-command-center/packages/engineering/linked_prs/definition.luau",
+    ))
     .unwrap();
-    let rt = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center/packages/engineering/linked_prs/runtime.luau"),
-    )
+    let rt = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../fixtures/engineering-command-center/packages/engineering/linked_prs/runtime.luau",
+    ))
     .unwrap();
     let mut src = BTreeMap::new();
     src.insert("definition.luau".into(), decl.as_bytes().to_vec());
@@ -154,7 +160,11 @@ async fn ac03_git_packages_lockfile_and_offline_restart() {
     let tmp = TempDir::new().unwrap();
     let ext = tmp.path().join("ext_pkg");
     std::fs::create_dir_all(ext.join("ping")).unwrap();
-    std::fs::write(ext.join("package.toml"), "name = \"ext\"\nversion = \"0.1.0\"\n").unwrap();
+    std::fs::write(
+        ext.join("package.toml"),
+        "name = \"ext\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     std::fs::write(
         ext.join("ping/definition.luau"),
         "local dash = require(\"dash\"); return dash.data_provider { id = \"ext.ping\", handler = \"query\" }",
@@ -165,7 +175,9 @@ async fn ac03_git_packages_lockfile_and_offline_restart() {
         "local R = {}; function R.query(ctx) return { pinned = true } end; return R",
     )
     .unwrap();
-    dash_git::git_cli::ensure_git_repo(&ext, "main").await.unwrap();
+    dash_git::git_cli::ensure_git_repo(&ext, "main")
+        .await
+        .unwrap();
     let commit = dash_git::git_cli::git_commit_all(&ext, "init", "dev", None)
         .await
         .unwrap();
@@ -176,7 +188,10 @@ async fn ac03_git_packages_lockfile_and_offline_restart() {
     std::fs::write(ws.join("dashboard.toml"), "name = \"locktest\"\n").unwrap();
     std::fs::write(
         ws.join("packages.toml"),
-        format!("[dependencies.ext]\ngit = \"{}\"\nref = \"main\"\n", ext.display()),
+        format!(
+            "[dependencies.ext]\ngit = \"{}\"\nref = \"main\"\n",
+            ext.display()
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -235,7 +250,10 @@ async fn ac04_capabilities_forbidden_bindings_ceilings_and_stdio_mcp() {
     .unwrap();
     let val = mgr.draft_validate(&draft.draft_id).await.unwrap();
     assert!(!val.valid);
-    assert!(val.issues.iter().any(|i| i.code == "INSUFFICIENT_CAPABILITY"));
+    assert!(val
+        .issues
+        .iter()
+        .any(|i| i.code == "INSUFFICIENT_CAPABILITY"));
     mgr.draft_abort(&draft.draft_id).await.unwrap();
 
     // 2. Service principal ceiling in YAML cannot self-grant without Admin approval
@@ -321,7 +339,12 @@ async fn ac05_secrets_zero_leakage_and_host_mediated_http() {
     let res = mgr
         .engine()
         .queries
-        .query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, false)
+        .query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
     let serialized = serde_json::to_string(&res).unwrap();
@@ -345,7 +368,12 @@ async fn ac06_reactive_graph_dedup_params_isolation_and_dynamic_cleanup() {
         let p = admin.clone();
         futs.push(tokio::spawn(async move {
             eng.queries
-                .query("linked_prs", json!({"repository": "acme/platform", "state": "open"}), &p, false)
+                .query(
+                    "linked_prs",
+                    json!({"repository": "acme/platform", "state": "open"}),
+                    &p,
+                    false,
+                )
                 .await
                 .unwrap()
         }));
@@ -359,7 +387,12 @@ async fn ac06_reactive_graph_dedup_params_isolation_and_dynamic_cleanup() {
 
     // Separate params remain independent
     let pay = services
-        .provider_query("linked_prs", json!({"repository": "acme/payments", "state": "open"}), &admin, false)
+        .provider_query(
+            "linked_prs",
+            json!({"repository": "acme/payments", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(pay.value.unwrap().as_array().unwrap().len(), 1);
@@ -376,7 +409,12 @@ async fn ac07_updates_polling_push_deltas_gap_resync_and_stale_retention() {
     services.engine().graph.store(std::sync::Arc::new(g));
 
     let init = services
-        .provider_query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, false)
+        .provider_query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
     let mut rx = services.engine().signals.subscribe_stream(&init.query_key);
@@ -403,14 +441,22 @@ async fn ac07_updates_polling_push_deltas_gap_resync_and_stale_retention() {
     assert!(apply_delta_envelope(&mut bad_ver, &mut rows, &delta, "id").is_err());
 
     // Failure retains stale data
-    services.engine().telemetry.inject_failure(FailureInjectionRule {
-        instance_id: "open_prs".into(),
-        mode: "error".into(),
-        message: "down".into(),
-        remaining: Some(1),
-    });
+    services
+        .engine()
+        .telemetry
+        .inject_failure(FailureInjectionRule {
+            instance_id: "open_prs".into(),
+            mode: "error".into(),
+            message: "down".into(),
+            remaining: Some(1),
+        });
     let stale = services
-        .provider_query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, true)
+        .provider_query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &admin,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(stale.status, QueryStatus::Stale);
@@ -426,9 +472,14 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
 
     {
         let store = SqliteStore::open(&data).unwrap();
-        let mgr = DraftManager::initialize(ws.clone(), data.clone(), store.clone(), ResourceBudget::default())
-            .await
-            .unwrap();
+        let mgr = DraftManager::initialize(
+            ws.clone(),
+            data.clone(),
+            store.clone(),
+            ResourceBudget::default(),
+        )
+        .await
+        .unwrap();
         let admin = Principal::administrator();
 
         let mut g = (*mgr.engine().graph.load_full()).clone();
@@ -443,7 +494,10 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
                 serde_json::to_value(CapabilityCeiling {
                     allowed_actions: BTreeSet::from(["transition_issue".into()]),
                     allowed_connectors: BTreeSet::from(["jira_transitioner".into()]),
-                    allowed_capabilities: BTreeSet::from(["issues.read".into(), "issues.transition".into()]),
+                    allowed_capabilities: BTreeSet::from([
+                        "issues.read".into(),
+                        "issues.transition".into(),
+                    ]),
                     ..Default::default()
                 })
                 .unwrap(),
@@ -475,14 +529,24 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
             retention_days: 30,
             service_principal: "pr_history_sampler".into(),
         };
-        let count = mgr.engine().history.sample_series(&series, None).await.unwrap();
+        let count = mgr
+            .engine()
+            .history
+            .sample_series(&series, None)
+            .await
+            .unwrap();
         assert_eq!(count, 3.0);
 
         // 2. Initial poll sees PR #42 open; then external merge happens; next poll emits github.pr_merged!
         let _ = mgr
             .engine()
             .queries
-            .query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, true)
+            .query(
+                "open_prs",
+                json!({"repository": "acme/platform", "state": "open"}),
+                &admin,
+                true,
+            )
             .await
             .unwrap();
         // Simulate the external merge through the host-side Mock state API: the reader-bound
@@ -508,11 +572,18 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
                 pr["merged"] = json!(true);
             }
         }
-        mgr.engine().queries.mock_state_set("github.mock", "prs", prs);
+        mgr.engine()
+            .queries
+            .mock_state_set("github.mock", "prs", prs);
         let after_poll = mgr
             .engine()
             .queries
-            .query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, true)
+            .query(
+                "open_prs",
+                json!({"repository": "acme/platform", "state": "open"}),
+                &admin,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(after_poll.value.unwrap().as_array().unwrap().len(), 2);
@@ -527,7 +598,10 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
         // Dispatch once + replay once -> identical execution_id (no duplicate Jira transitions!)
         let d1 = mgr.engine().automations.dispatch_event(merged_ev).await;
         let d2 = mgr.engine().automations.dispatch_event(merged_ev).await;
-        assert_eq!(d1[0].as_ref().unwrap()["execution_id"], d2[0].as_ref().unwrap()["execution_id"]);
+        assert_eq!(
+            d1[0].as_ref().unwrap()["execution_id"],
+            d2[0].as_ref().unwrap()["execution_id"]
+        );
     }
 
     // Full restart: history sample survives in SQLite and is served via `pr_count_history`!
@@ -538,7 +612,12 @@ async fn ac08_events_durable_replay_idempotency_poll_emit_and_history_restart() 
     let hist = mgr2
         .engine()
         .queries
-        .query("pr_count_history", json!({"series_id": "open_prs_30d"}), &Principal::administrator(), false)
+        .query(
+            "pr_count_history",
+            json!({"series_id": "open_prs_30d"}),
+            &Principal::administrator(),
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(hist.value.unwrap().as_array().unwrap().len(), 1);
@@ -563,10 +642,20 @@ async fn ac09_state_scopes_stable_widget_ids_and_layout_overrides() {
     services
         .engine()
         .state
-        .set("dashboard", "engineering", "selected_repository", 1, 1, json!("acme/payments"), None)
+        .set(
+            "dashboard",
+            "engineering",
+            "selected_repository",
+            1,
+            1,
+            json!("acme/payments"),
+            None,
+        )
         .unwrap();
     let r2 = services.dashboard_get("engineering", &admin).await.unwrap();
-    assert!(serde_json::to_string(&r2["rendered"]).unwrap().contains("PAY-9"));
+    assert!(serde_json::to_string(&r2["rendered"])
+        .unwrap()
+        .contains("PAY-9"));
     h.abort();
 }
 
@@ -598,7 +687,13 @@ async fn ac10_actions_dry_run_nested_permissions_invalidation_unknown_reconcile_
     let unk = mgr
         .engine()
         .actions
-        .invoke("merge_pr", json!({"repository": "acme/platform", "number": 42}), &admin, None, None)
+        .invoke(
+            "merge_pr",
+            json!({"repository": "acme/platform", "number": 42}),
+            &admin,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(unk.status, "unknown");
@@ -631,19 +726,26 @@ async fn ac11_visual_ui_embedded_assets_and_api_flows() {
     // Widget assets require an authenticated Principal (the shell iframe carries the session
     // cookie) and are isolated by a CSP `sandbox` even when opened top-level (§10.1, §14.3).
     let anon = client
-        .get(format!("{base}/widgets/engineering.pr_badge_widget/assets/index.html"))
+        .get(format!(
+            "{base}/widgets/engineering.pr_badge_widget/assets/index.html"
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(anon.status(), 401);
     let widget = client
-        .get(format!("{base}/widgets/engineering.pr_badge_widget/assets/index.html"))
+        .get(format!(
+            "{base}/widgets/engineering.pr_badge_widget/assets/index.html"
+        ))
         .header("authorization", "Bearer adm_test_local")
         .send()
         .await
         .unwrap();
     assert_eq!(widget.status(), 200);
-    let csp = widget.headers()["content-security-policy"].to_str().unwrap().to_string();
+    let csp = widget.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(csp.contains("sandbox allow-scripts"));
     assert!(widget.text().await.unwrap().contains("dash.widget/1"));
 
@@ -669,7 +771,10 @@ async fn ac12_mcp_full_autonomous_draft_preview_rebase_activate_and_action_cycle
                 allowed_providers: BTreeSet::from(["*".into()]),
                 allowed_actions: BTreeSet::from(["transition_issue".into()]),
                 allowed_connectors: BTreeSet::from(["jira_transitioner".into()]),
-                allowed_capabilities: BTreeSet::from(["issues.transition".into(), "issues.read".into()]),
+                allowed_capabilities: BTreeSet::from([
+                    "issues.transition".into(),
+                    "issues.read".into(),
+                ]),
                 can_author_drafts: true,
                 can_activate_drafts: true,
                 ..Default::default()
@@ -700,12 +805,29 @@ async fn ac12_mcp_full_autonomous_draft_preview_rebase_activate_and_action_cycle
         }
     };
 
-    assert_eq!(mcp(1, "initialize", json!({"protocolVersion": "2026-07-28"})).await["result"]["serverInfo"]["name"], "dash-mcp");
-    let cat = mcp(2, "tools/call", json!({"name": "catalog_search", "arguments": {"query": "linked_prs"}})).await;
+    assert_eq!(
+        mcp(1, "initialize", json!({"protocolVersion": "2026-07-28"})).await["result"]
+            ["serverInfo"]["name"],
+        "dash-mcp"
+    );
+    let cat = mcp(
+        2,
+        "tools/call",
+        json!({"name": "catalog_search", "arguments": {"query": "linked_prs"}}),
+    )
+    .await;
     assert_eq!(cat["result"]["isError"], false);
 
-    let begin = mcp(3, "tools/call", json!({"name": "draft_begin", "arguments": {}})).await;
-    let draft_id = begin["result"]["structuredContent"]["draft_id"].as_str().unwrap().to_string();
+    let begin = mcp(
+        3,
+        "tools/call",
+        json!({"name": "draft_begin", "arguments": {}}),
+    )
+    .await;
+    let draft_id = begin["result"]["structuredContent"]["draft_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let def_res = mcp(4, "tools/call", json!({
         "name": "definition_create",
@@ -719,26 +841,46 @@ async fn ac12_mcp_full_autonomous_draft_preview_rebase_activate_and_action_cycle
     })).await;
     assert_eq!(def_res["result"]["isError"], false);
 
-    let inst_res = mcp(5, "tools/call", json!({
-        "name": "instance_create",
-        "arguments": {
-            "draft_id": draft_id,
-            "instance": {
-                "id": "mcp_metric",
-                "category": "data_provider",
-                "definition": "engineering.mcp_widget_metric"
+    let inst_res = mcp(
+        5,
+        "tools/call",
+        json!({
+            "name": "instance_create",
+            "arguments": {
+                "draft_id": draft_id,
+                "instance": {
+                    "id": "mcp_metric",
+                    "category": "data_provider",
+                    "definition": "engineering.mcp_widget_metric"
+                }
             }
-        }
-    })).await;
+        }),
+    )
+    .await;
     assert_eq!(inst_res["result"]["isError"], false);
 
-    let prev = mcp(6, "tools/call", json!({"name": "draft_preview", "arguments": {"draft_id": draft_id}})).await;
+    let prev = mcp(
+        6,
+        "tools/call",
+        json!({"name": "draft_preview", "arguments": {"draft_id": draft_id}}),
+    )
+    .await;
     assert_eq!(prev["result"]["structuredContent"]["all_passed"], true);
 
-    let act = mcp(7, "tools/call", json!({"name": "draft_activate", "arguments": {"draft_id": draft_id}})).await;
+    let act = mcp(
+        7,
+        "tools/call",
+        json!({"name": "draft_activate", "arguments": {"draft_id": draft_id}}),
+    )
+    .await;
     assert_eq!(act["result"]["isError"], false);
 
-    let q = mcp(8, "tools/call", json!({"name": "provider_query", "arguments": {"instance_id": "mcp_metric"}})).await;
+    let q = mcp(
+        8,
+        "tools/call",
+        json!({"name": "provider_query", "arguments": {"instance_id": "mcp_metric"}}),
+    )
+    .await;
     assert_eq!(q["result"]["structuredContent"]["value"]["value"], 77);
     h.abort();
 }
@@ -804,7 +946,10 @@ async fn ac14_git_transaction_single_commit_unsynced_retry_and_crash_recovery() 
             .await
             .unwrap();
         // Incomplete journal must be reconciled deterministically on startup!
-        assert!(store.list_incomplete_activation_journals().unwrap().is_empty());
+        assert!(store
+            .list_incomplete_activation_journals()
+            .unwrap()
+            .is_empty());
         assert_eq!(mgr.engine().graph.load().generation_id, 1);
     }
 }
@@ -844,12 +989,20 @@ async fn ac15_sandbox_denials_and_runaway_isolation() {
             &admin,
         )
         .unwrap();
-    services.draft_activate(&draft.draft_id, &admin).await.unwrap();
+    services
+        .draft_activate(&draft.draft_id, &admin)
+        .await
+        .unwrap();
 
     let eng = services.engine().clone();
     let loop_task = tokio::spawn(async move {
         eng.queries
-            .query("runaway_inst", json!({}), &Principal::administrator(), false)
+            .query(
+                "runaway_inst",
+                json!({}),
+                &Principal::administrator(),
+                false,
+            )
             .await
     });
 
@@ -892,7 +1045,13 @@ async fn ac16_tailnet_loopback_auth_csrf_origin_and_trusted_proxy() {
         .await
         .unwrap();
     assert_eq!(login.status(), 200);
-    let cookie = login.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(cookie.contains("Secure"));
     assert!(cookie.contains("HttpOnly"));
 
@@ -917,7 +1076,11 @@ async fn ac17_benchmark_gates_sanity() {
         .await
         .unwrap();
     assert_eq!(hz.status(), 200);
-    assert!(t0.elapsed() < Duration::from_secs(2), "startup took {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "startup took {:?}",
+        t0.elapsed()
+    );
 
     // Warm cache query under 5ms
     let admin = Principal::administrator();
@@ -925,12 +1088,22 @@ async fn ac17_benchmark_gates_sanity() {
     g.is_preview = true;
     services.engine().graph.store(std::sync::Arc::new(g));
     let _ = services
-        .provider_query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, false)
+        .provider_query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
     let q0 = Instant::now();
     let _ = services
-        .provider_query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, false)
+        .provider_query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
     assert!(q0.elapsed() < Duration::from_millis(5));

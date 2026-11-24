@@ -20,12 +20,12 @@
 
 use crate::git_cli::{
     commit_trailer, create_worktree, ensure_git_repo, git_commit_message, git_commit_tree,
-    git_diff_name_status, git_export_tree, git_head, git_history, git_index_tree,
-    git_is_ancestor, git_push, git_read_tree_fast_forward, git_read_tree_index_only,
-    git_read_tree_reset, git_remote_tracking_commit, git_remote_url, git_resolve_commit,
-    git_show_file, git_snapshot_worktree_tree, git_stage_all_tree, git_tracked_changes,
-    git_tree_of, git_update_head, remove_worktree, run_git, run_git_bytes, GitCommitInfo,
-    GitError, GitStatusReport,
+    git_diff_name_status, git_export_tree, git_head, git_history, git_index_tree, git_is_ancestor,
+    git_push, git_read_tree_fast_forward, git_read_tree_index_only, git_read_tree_reset,
+    git_remote_tracking_commit, git_remote_url, git_resolve_commit, git_show_file,
+    git_snapshot_worktree_tree, git_stage_all_tree, git_tracked_changes, git_tree_of,
+    git_update_head, remove_worktree, run_git, run_git_bytes, GitCommitInfo, GitError,
+    GitStatusReport,
 };
 use crate::packages::{
     fetch_locked_packages, missing_locked_packages, read_packages_lock, read_packages_toml,
@@ -159,8 +159,8 @@ impl DraftManager {
         // The active Generation is built exactly from its Revision: uncommitted external
         // modifications are never silently activated (§12.3). `--use-mocks` substitutes Mock
         // connectors but keeps live authority (SQLite grants).
-        let mut graph = load_revision_graph(&workspace_dir, &data_dir, &head, use_mocks, &mut warnings)
-            .await?;
+        let mut graph =
+            load_revision_graph(&workspace_dir, &data_dir, &head, use_mocks, &mut warnings).await?;
         let gen_id = store
             .record_generation(&head, &graph.graph_digest())
             .map_err(|e| GitError::Workspace(e.to_string()))?;
@@ -184,9 +184,7 @@ impl DraftManager {
 
         let engine = RuntimeEngine::new(graph.clone(), store.clone(), budget)
             .map_err(|e| GitError::Workspace(e.to_string()))?;
-        let _ = engine
-            .history
-            .sync_series_configs(&graph.workspace.history);
+        let _ = engine.history.sync_series_configs(&graph.workspace.history);
         for dash in graph.dashboards.values() {
             let _ = engine.state.seed_dashboard_defaults(dash, gen_id);
         }
@@ -286,10 +284,7 @@ impl DraftManager {
     }
 
     fn busy_op(&self, draft_id: &str) -> Option<String> {
-        self.busy
-            .lock()
-            .ok()
-            .and_then(|s| s.get(draft_id).cloned())
+        self.busy.lock().ok().and_then(|s| s.get(draft_id).cloned())
     }
 
     fn acquire_busy(&self, draft_id: &str, op: &str) -> Result<BusyGuard, GitError> {
@@ -348,7 +343,9 @@ impl DraftManager {
             Some(rev) => git_resolve_commit(&self.workspace_dir, rev)
                 .await
                 .map_err(|_| {
-                    GitError::Workspace(format!("base revision '{rev}' is not a commit of the Workspace"))
+                    GitError::Workspace(format!(
+                        "base revision '{rev}' is not a commit of the Workspace"
+                    ))
                 })?,
             None => self.active_revision().await?,
         };
@@ -421,12 +418,17 @@ impl DraftManager {
 
     /// Abort as the Administrator (trusted in-process callers).
     pub async fn draft_abort(&self, draft_id: &str) -> Result<(), GitError> {
-        self.draft_abort_as(draft_id, &Principal::administrator()).await
+        self.draft_abort_as(draft_id, &Principal::administrator())
+            .await
     }
 
     /// Abort and discard an unactivated draft. Aborting an aborted draft is a no-op; an
     /// activated draft cannot be aborted.
-    pub async fn draft_abort_as(&self, draft_id: &str, principal: &Principal) -> Result<(), GitError> {
+    pub async fn draft_abort_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<(), GitError> {
         let draft = self.draft_status(draft_id)?;
         self.authorize(&draft, principal, "abort", true)?;
         match draft.status.as_str() {
@@ -513,7 +515,11 @@ impl DraftManager {
             runtime_luau,
             tests_luau,
         )?;
-        self.record_draft_mutation(draft_id, principal, format!("definition:{package}.{def_name}"))
+        self.record_draft_mutation(
+            draft_id,
+            principal,
+            format!("definition:{package}.{def_name}"),
+        )
     }
 
     pub fn draft_upsert_instance(
@@ -553,7 +559,11 @@ impl DraftManager {
         let draft = self.begin_mutation(draft_id, principal, "edit")?;
         let wt = Path::new(&draft.worktree_path);
         delete_instance_in_workspace(wt, instance_id)?;
-        self.record_draft_mutation(draft_id, principal, format!("instance.delete:{instance_id}"))
+        self.record_draft_mutation(
+            draft_id,
+            principal,
+            format!("instance.delete:{instance_id}"),
+        )
     }
 
     pub fn draft_update_dashboard(
@@ -600,7 +610,8 @@ impl DraftManager {
         cfg.dependencies.insert(pkg_name.to_string(), spec);
         write_packages_toml(wt, &cfg)?;
         let lock = update_package_lock(wt, &self.data_dir, pkg_name).await?;
-        let rec = self.record_draft_mutation(draft_id, principal, format!("dependency:{pkg_name}"))?;
+        let rec =
+            self.record_draft_mutation(draft_id, principal, format!("dependency:{pkg_name}"))?;
         Ok((rec, lock))
     }
 
@@ -621,7 +632,8 @@ impl DraftManager {
         self.authorize(&draft, principal, "validate", true)?;
         let changes_before = draft.changes.len();
         let wt = Path::new(&draft.worktree_path);
-        let graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, false).await?;
+        let graph =
+            load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, false).await?;
         let mut report = validate_graph_with_contracts(&graph, &self.store, false);
         merge_issues(&mut report, lock_issues(wt));
         // Report grants the draft's editors lack (the activator is checked again on activation).
@@ -656,7 +668,9 @@ impl DraftManager {
         let report_json = serde_json::to_value(&report).unwrap_or_default();
         let valid = report.valid;
         self.update_record(draft_id, |r| {
-            if DRAFT_STATUSES_FINAL.contains(&r.status.as_str()) || r.changes.len() != changes_before {
+            if DRAFT_STATUSES_FINAL.contains(&r.status.as_str())
+                || r.changes.len() != changes_before
+            {
                 return Ok(()); // the draft moved on; this report no longer describes it
             }
             r.validation_report = Some(report_json);
@@ -723,7 +737,8 @@ impl DraftManager {
                     severity: "error".into(),
                     code: "DRAFT_CHANGED_DURING_PREVIEW".into(),
                     target: draft_id.to_string(),
-                    message: "draft files changed while Preview was running; run Preview again".into(),
+                    message: "draft files changed while Preview was running; run Preview again"
+                        .into(),
                 }],
             );
             report.all_passed = false;
@@ -734,7 +749,9 @@ impl DraftManager {
         let test_json = serde_json::to_value(&report).unwrap_or_default();
         let passed = report.all_passed;
         self.update_record(draft_id, |r| {
-            if DRAFT_STATUSES_FINAL.contains(&r.status.as_str()) || r.changes.len() != changes_before {
+            if DRAFT_STATUSES_FINAL.contains(&r.status.as_str())
+                || r.changes.len() != changes_before
+            {
                 return Ok(()); // a concurrent mutation superseded this report; keep it unapproved
             }
             r.validation_report = Some(val_json);
@@ -752,9 +769,16 @@ impl DraftManager {
         let wt = Path::new(&draft.worktree_path);
         let base_dir = tempfile::tempdir()?;
         git_export_tree(&self.workspace_dir, &draft.base_revision, base_dir.path()).await?;
-        let base_graph =
-            load_workspace_graph(base_dir.path(), &self.data_dir, &draft.base_revision, 0, true).await?;
-        let draft_graph = load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, true).await?;
+        let base_graph = load_workspace_graph(
+            base_dir.path(),
+            &self.data_dir,
+            &draft.base_revision,
+            0,
+            true,
+        )
+        .await?;
+        let draft_graph =
+            load_workspace_graph(wt, &self.data_dir, &draft.base_revision, 0, true).await?;
         let mut changed = Vec::new();
         for (id, def) in &draft_graph.definitions {
             let unchanged = base_graph
@@ -937,7 +961,8 @@ impl DraftManager {
 
         // State migrations must be possible before anything is committed (§8). Checked before
         // Preview so a draft whose State cannot migrate is refused with that reason.
-        let candidate_graph = load_workspace_graph(&wt, &self.data_dir, &active_rev, 0, false).await?;
+        let candidate_graph =
+            load_workspace_graph(&wt, &self.data_dir, &active_rev, 0, false).await?;
         self.engine
             .state
             .check_generation_state(&candidate_graph.dashboards)
@@ -1030,7 +1055,8 @@ impl DraftManager {
             })?;
 
         // Workspace precondition: never overwrite or delete external modifications (§12.3)
-        self.check_workspace_precondition(&active_rev, &tree, mode).await?;
+        self.check_workspace_precondition(&active_rev, &tree, mode)
+            .await?;
 
         // Activation journal (`started`) + exactly one commit for the whole draft (§12.2 step 6)
         let journal_id = format!("jrn_{}", Uuid::now_v7().simple());
@@ -1094,11 +1120,14 @@ impl DraftManager {
                 return Err(e);
             }
         }
-        if let Err(e) = self
-            .store
-            .upsert_activation_journal(&journal("committed", Some(&new_commit), None, None))
-        {
-            self.rollback_workspace(&active_rev, &new_commit, mode).await;
+        if let Err(e) = self.store.upsert_activation_journal(&journal(
+            "committed",
+            Some(&new_commit),
+            None,
+            None,
+        )) {
+            self.rollback_workspace(&active_rev, &new_commit, mode)
+                .await;
             let _ = self.store.upsert_activation_journal(&journal(
                 "failed",
                 Some(&new_commit),
@@ -1117,12 +1146,15 @@ impl DraftManager {
             Ok(id) => id,
             Err(e) => {
                 // Restore the old Revision and mark the commit as not active (§12.2 step 7)
-                self.rollback_workspace(&active_rev, &new_commit, mode).await;
+                self.rollback_workspace(&active_rev, &new_commit, mode)
+                    .await;
                 let _ = self.store.upsert_activation_journal(&journal(
                     "failed",
                     Some(&new_commit),
                     None,
-                    Some(format!("recording the Generation failed: {e}; commit not active")),
+                    Some(format!(
+                        "recording the Generation failed: {e}; commit not active"
+                    )),
                 ));
                 return Err(GitError::Workspace(e.to_string()));
             }
@@ -1131,19 +1163,22 @@ impl DraftManager {
 
         // Migrate State transactionally and seed defaults before touching the live runtime; a
         // failed migration rolls back and leaves the live Generation and its State untouched (§8).
-        if let Err(e) = self
-            .engine
-            .state
-            .apply_generation_state(&live_graph.dashboards, new_gen_id, principal)
+        if let Err(e) =
+            self.engine
+                .state
+                .apply_generation_state(&live_graph.dashboards, new_gen_id, principal)
         {
-            self.rollback_workspace(&active_rev, &new_commit, mode).await;
+            self.rollback_workspace(&active_rev, &new_commit, mode)
+                .await;
             let _ = self.store.upsert_activation_journal(&journal(
                 "failed",
                 Some(&new_commit),
                 Some(new_gen_id),
                 Some(format!("{e}; commit not active")),
             ));
-            return Err(GitError::Workspace(format!("{e}; live Generation preserved")));
+            return Err(GitError::Workspace(format!(
+                "{e}; live Generation preserved"
+            )));
         }
 
         let _ = self.store.record_revision(
@@ -1281,7 +1316,8 @@ impl DraftManager {
             ActivationMode::Reload => git_read_tree_index_only(ws, new_commit).await,
         };
         if let Err(e) = res {
-            let _ = git_update_head(ws, base, new_commit, "dash: roll back failed activation").await;
+            let _ =
+                git_update_head(ws, base, new_commit, "dash: roll back failed activation").await;
             return Err(e);
         }
         Ok(())
@@ -1293,7 +1329,9 @@ impl DraftManager {
             return;
         }
         let ws = &self.workspace_dir;
-        if let Err(e) = git_update_head(ws, base, new_commit, "dash: roll back failed activation").await {
+        if let Err(e) =
+            git_update_head(ws, base, new_commit, "dash: roll back failed activation").await
+        {
             tracing::error!("rollback of HEAD to {base} failed: {e}");
             return;
         }
@@ -1309,7 +1347,10 @@ impl DraftManager {
     /// Turn external modifications of the Workspace working tree (edits, additions and
     /// deletions) into a draft proposal and run it through the full validation and activation
     /// pipeline (§12.3 "file watchers can create draft proposals").
-    pub async fn reload_workspace(&self, principal: &Principal) -> Result<ActivationResult, GitError> {
+    pub async fn reload_workspace(
+        &self,
+        principal: &Principal,
+    ) -> Result<ActivationResult, GitError> {
         if !principal.ceiling.unrestricted
             && !(principal.ceiling.can_author_drafts && principal.ceiling.can_activate_drafts)
         {
@@ -1323,7 +1364,11 @@ impl DraftManager {
         let wt = PathBuf::from(&draft.worktree_path);
         // Mirror the Workspace exactly, deletions included
         run_git(&wt, &["read-tree", "--reset", "-u", &snapshot]).await?;
-        self.record_draft_mutation(&draft.draft_id, principal, "reload:workspace_changes".into())?;
+        self.record_draft_mutation(
+            &draft.draft_id,
+            principal,
+            "reload:workspace_changes".into(),
+        )?;
         let _busy = self.acquire_busy(&draft.draft_id, "activate")?;
         let draft = self.require_mutable_status(&draft.draft_id)?;
         self.activate_locked(draft, principal, ActivationMode::Reload)
@@ -1546,7 +1591,10 @@ fn commit_message(draft: &DraftRecord, activator: &Principal) -> (String, String
         msg.push_str(&format!("\nDash-Contributor: {c}"));
     }
     msg.push_str(&format!("\nDash-Principal: {}", activator.id));
-    msg.push_str(&format!("\nDash-Principal-Kind: {}", activator.kind.as_str()));
+    msg.push_str(&format!(
+        "\nDash-Principal-Kind: {}",
+        activator.kind.as_str()
+    ));
     (subject, msg)
 }
 
@@ -1556,13 +1604,16 @@ fn instance_bundles(graph: &ConfiguredGraph) -> Vec<CompiledInstanceBundle> {
         .instances
         .values()
         .filter_map(|inst| {
-            graph.definitions.get(&inst.definition).map(|def| CompiledInstanceBundle {
-                instance_id: inst.id.clone(),
-                manifest: def.manifest.clone(),
-                runtime_source: def.runtime_source.clone(),
-                config_digest: inst.config_digest(),
-                resolved_libraries: libs.clone(),
-            })
+            graph
+                .definitions
+                .get(&inst.definition)
+                .map(|def| CompiledInstanceBundle {
+                    instance_id: inst.id.clone(),
+                    manifest: def.manifest.clone(),
+                    runtime_source: def.runtime_source.clone(),
+                    config_digest: inst.config_digest(),
+                    resolved_libraries: libs.clone(),
+                })
         })
         .collect()
 }
@@ -1609,13 +1660,18 @@ async fn merge_file_bytes(
 /// Check that `packages.lock` pins exactly what `packages.toml` requests (§4.4): every
 /// top-level dependency has a locked entry with the same git URL, requested ref and subdir,
 /// and every locked entry is reachable from a top-level dependency (no orphans).
-pub fn verify_lock_matches_manifest(manifest: &PackagesToml, lock: &PackagesLock) -> Result<(), String> {
+pub fn verify_lock_matches_manifest(
+    manifest: &PackagesToml,
+    lock: &PackagesLock,
+) -> Result<(), String> {
     let by_name: BTreeMap<&str, &crate::packages::LockedPackage> =
         lock.packages.iter().map(|p| (p.name.as_str(), p)).collect();
     let mut problems = Vec::new();
     for (name, spec) in &manifest.dependencies {
         match by_name.get(name.as_str()) {
-            None => problems.push(format!("dependency '{name}' is not pinned in packages.lock")),
+            None => problems.push(format!(
+                "dependency '{name}' is not pinned in packages.lock"
+            )),
             Some(l) => {
                 if l.git != spec.git || l.requested_ref != spec.git_ref || l.subdir != spec.subdir {
                     problems.push(format!(
@@ -1709,7 +1765,11 @@ async fn load_revision_graph(
 /// when the last known remote-tracking ref contains it, or when the last successful push
 /// recorded exactly this HEAD. Anything else is `unsynced` (§12.2 step 8: never falsely
 /// report remote success).
-async fn derive_sync_state(ws: &Path, store: &SqliteStore, configured_branch: &str) -> GitSyncRecord {
+async fn derive_sync_state(
+    ws: &Path,
+    store: &SqliteStore,
+    configured_branch: &str,
+) -> GitSyncRecord {
     let head = git_head(ws).await.ok();
     let remote_url = git_remote_url(ws, "origin").await;
     let rec = store.get_git_sync_state().ok().flatten();
@@ -1744,14 +1804,12 @@ async fn derive_sync_state(ws: &Path, store: &SqliteStore, configured_branch: &s
     let last_error = if synced {
         None
     } else {
-        rec.as_ref()
-            .and_then(|r| r.last_error.clone())
-            .or_else(|| {
-                Some(format!(
-                    "HEAD {} has not been confirmed pushed to origin/{branch}; run git_sync",
-                    head.as_deref().map(short).unwrap_or("?")
-                ))
-            })
+        rec.as_ref().and_then(|r| r.last_error.clone()).or_else(|| {
+            Some(format!(
+                "HEAD {} has not been confirmed pushed to origin/{branch}; run git_sync",
+                head.as_deref().map(short).unwrap_or("?")
+            ))
+        })
     };
     GitSyncRecord {
         active_revision: head,
@@ -1917,11 +1975,18 @@ mod tests {
         let mut manifest = PackagesToml::default();
         manifest.dependencies.insert(
             "a".into(),
-            PackageDependencySpec { git: "g/a".into(), git_ref: "main".into(), subdir: None },
+            PackageDependencySpec {
+                git: "g/a".into(),
+                git_ref: "main".into(),
+                subdir: None,
+            },
         );
         let ok = PackagesLock {
             version: 1,
-            packages: vec![locked("a", "g/a", "main", &["b"]), locked("b", "g/b", "v1", &[])],
+            packages: vec![
+                locked("a", "g/a", "main", &["b"]),
+                locked("b", "g/b", "v1", &[]),
+            ],
         };
         verify_lock_matches_manifest(&manifest, &ok).unwrap();
 
@@ -1935,15 +2000,20 @@ mod tests {
 
         let orphan = PackagesLock {
             version: 1,
-            packages: vec![locked("a", "g/a", "main", &[]), locked("z", "g/z", "main", &[])],
+            packages: vec![
+                locked("a", "g/a", "main", &[]),
+                locked("z", "g/z", "main", &[]),
+            ],
         };
         assert!(verify_lock_matches_manifest(&manifest, &orphan)
             .unwrap_err()
             .contains("'z'"));
 
-        assert!(verify_lock_matches_manifest(&manifest, &PackagesLock::default())
-            .unwrap_err()
-            .contains("not pinned"));
+        assert!(
+            verify_lock_matches_manifest(&manifest, &PackagesLock::default())
+                .unwrap_err()
+                .contains("not pinned")
+        );
     }
 
     #[test]
@@ -1964,10 +2034,22 @@ mod tests {
             updated_at: String::new(),
         };
         let (subject, msg) = commit_message(&draft, &Principal::administrator());
-        assert_eq!(subject, "Activate draft dft_1: instance.upsert:x, dashboard:ops");
-        assert_eq!(commit_trailer(&msg, "Dash-Author").as_deref(), Some("agt_a"));
-        assert_eq!(commit_trailer(&msg, "Dash-Contributor").as_deref(), Some("admin"));
-        assert_eq!(commit_trailer(&msg, "Dash-Principal").as_deref(), Some("admin"));
+        assert_eq!(
+            subject,
+            "Activate draft dft_1: instance.upsert:x, dashboard:ops"
+        );
+        assert_eq!(
+            commit_trailer(&msg, "Dash-Author").as_deref(),
+            Some("agt_a")
+        );
+        assert_eq!(
+            commit_trailer(&msg, "Dash-Contributor").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            commit_trailer(&msg, "Dash-Principal").as_deref(),
+            Some("admin")
+        );
         assert_eq!(commit_trailer(&msg, "Dash-Draft").as_deref(), Some("dft_1"));
     }
 }

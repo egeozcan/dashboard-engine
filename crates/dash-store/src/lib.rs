@@ -592,7 +592,10 @@ impl SqliteStore {
         })
     }
 
-    pub fn resolve_secret_plaintext(&self, name: &str) -> Result<(SecretMetadata, String), StoreError> {
+    pub fn resolve_secret_plaintext(
+        &self,
+        name: &str,
+    ) -> Result<(SecretMetadata, String), StoreError> {
         self.with_conn_sync(|conn| {
             let row = conn
                 .query_row(
@@ -1140,8 +1143,8 @@ impl SqliteStore {
     /// Distinct source Instances that have durable Events in the log.
     pub fn list_event_sources(&self) -> Result<Vec<String>, StoreError> {
         self.with_conn_sync(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT DISTINCT source_instance FROM events ORDER BY source_instance")?;
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT source_instance FROM events ORDER BY source_instance")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             let mut out = Vec::new();
             for row in rows {
@@ -1158,7 +1161,9 @@ impl SqliteStore {
     pub fn prune_events_before(&self, cutoff: &str) -> Result<usize, StoreError> {
         let cutoff_dt = DateTime::parse_from_rfc3339(cutoff)
             .map(|d| d.with_timezone(&Utc))
-            .map_err(|e| StoreError::NotFound(format!("invalid retention cutoff '{cutoff}': {e}")))?;
+            .map_err(|e| {
+                StoreError::NotFound(format!("invalid retention cutoff '{cutoff}': {e}"))
+            })?;
         self.with_conn_sync(|conn| {
             let candidates: Vec<(String, String)> = {
                 let mut stmt = conn.prepare(
@@ -1184,7 +1189,8 @@ impl SqliteStore {
                     .map(|d| d.with_timezone(&Utc) < cutoff_dt)
                     .unwrap_or(false);
                 if old {
-                    deleted += tx.execute("DELETE FROM events WHERE event_id = ?1", params![event_id])?;
+                    deleted +=
+                        tx.execute("DELETE FROM events WHERE event_id = ?1", params![event_id])?;
                 }
             }
             // Automation execution records older than the cutoff whose Event is gone (or that had
@@ -1585,11 +1591,10 @@ impl SqliteStore {
         })
     }
 
-    #[deprecated(note = "does not claim the idempotency key atomically (a conflicting key is silently ignored); use claim_idempotency_and_insert")]
-    pub fn insert_action_execution(
-        &self,
-        rec: &ActionExecutionRecord,
-    ) -> Result<(), StoreError> {
+    #[deprecated(
+        note = "does not claim the idempotency key atomically (a conflicting key is silently ignored); use claim_idempotency_and_insert"
+    )]
+    pub fn insert_action_execution(&self, rec: &ActionExecutionRecord) -> Result<(), StoreError> {
         let safe_args = self.redactor().redact_json(&rec.args);
         let safe_res = rec.result.as_ref().map(|v| self.redactor().redact_json(v));
         let safe_reason = rec.reason.as_ref().map(|r| self.redactor().redact_str(r));
@@ -1634,7 +1639,9 @@ impl SqliteStore {
         })
     }
 
-    #[deprecated(note = "unconditional update can overwrite a concurrent outcome; use transition_action_execution")]
+    #[deprecated(
+        note = "unconditional update can overwrite a concurrent outcome; use transition_action_execution"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn update_action_execution(
         &self,
@@ -1689,11 +1696,17 @@ impl SqliteStore {
         })
     }
 
-    pub fn get_action_execution(&self, execution_id: &str) -> Result<Option<ActionExecutionRecord>, StoreError> {
+    pub fn get_action_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<ActionExecutionRecord>, StoreError> {
         self.with_conn_sync(|conn| Self::get_action_execution_conn(conn, execution_id))
     }
 
-    pub fn list_action_executions(&self, limit: usize) -> Result<Vec<ActionExecutionRecord>, StoreError> {
+    pub fn list_action_executions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ActionExecutionRecord>, StoreError> {
         self.with_conn_sync(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT execution_id, action_instance, parent_execution_id, principal_id, principal_kind,
@@ -1710,7 +1723,9 @@ impl SqliteStore {
         })
     }
 
-    #[deprecated(note = "marks never-started queued records unknown too; use recover_inflight_actions")]
+    #[deprecated(
+        note = "marks never-started queued records unknown too; use recover_inflight_actions"
+    )]
     pub fn mark_inflight_actions_unknown(&self, reason: &str) -> Result<usize, StoreError> {
         let now = Utc::now().to_rfc3339();
         self.with_conn_sync(|conn| {
@@ -1883,8 +1898,9 @@ impl SqliteStore {
         let res_json = safe_res.as_ref().map(serde_json::to_string).transpose()?;
         let safe_reason = next.reason.map(|r| self.redactor().redact_str(r));
         self.with_conn_sync(|conn| {
-            let placeholders: Vec<String> =
-                (0..expected_statuses.len()).map(|i| format!("?{}", i + 9)).collect();
+            let placeholders: Vec<String> = (0..expected_statuses.len())
+                .map(|i| format!("?{}", i + 9))
+                .collect();
             let sql = format!(
                 "UPDATE action_executions
                  SET status = ?1, result_json = ?2, reason = ?3, retry_safe = ?4,
@@ -1902,7 +1918,11 @@ impl SqliteStore {
                 next.duration_ms.into(),
                 execution_id.to_string().into(),
             ];
-            values.extend(expected_statuses.iter().map(|s| rusqlite::types::Value::from(s.to_string())));
+            values.extend(
+                expected_statuses
+                    .iter()
+                    .map(|s| rusqlite::types::Value::from(s.to_string())),
+            );
             let n = conn.execute(&sql, rusqlite::params_from_iter(values))?;
             Ok(n == 1)
         })
@@ -1974,7 +1994,10 @@ impl SqliteStore {
         })
     }
 
-    pub fn get_action_reconcile_schedule(&self, execution_id: &str) -> Result<Option<String>, StoreError> {
+    pub fn get_action_reconcile_schedule(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<String>, StoreError> {
         self.with_conn_sync(|conn| {
             conn.query_row(
                 "SELECT next_attempt_at FROM action_reconcile_schedule WHERE execution_id = ?1",
@@ -1999,7 +2022,9 @@ impl SqliteStore {
                  WHERE e.status = 'unknown' AND s.next_attempt_at <= ?1
                  ORDER BY s.next_attempt_at ASC LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![now_rfc3339, limit as i64], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![now_rfc3339, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -2009,7 +2034,10 @@ impl SqliteStore {
     }
 
     /// `unknown` executions that have no reconcile schedule row (e.g. left by an older process).
-    pub fn list_unscheduled_unknown_executions(&self, limit: usize) -> Result<Vec<ActionExecutionRecord>, StoreError> {
+    pub fn list_unscheduled_unknown_executions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ActionExecutionRecord>, StoreError> {
         self.with_conn_sync(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT execution_id, action_instance, parent_execution_id, principal_id, principal_kind,
@@ -2442,7 +2470,11 @@ impl SqliteStore {
 
     // ---- Admin Credentials & Sessions ----
 
-    pub fn set_admin_credentials(&self, username: &str, password_hash: &str) -> Result<(), StoreError> {
+    pub fn set_admin_credentials(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         self.with_conn_sync(|conn| {
             conn.execute(
@@ -2579,7 +2611,11 @@ impl SqliteStore {
         })
     }
 
-    pub fn compact_history_series(&self, series_id: &str, retention_days: i64) -> Result<usize, StoreError> {
+    pub fn compact_history_series(
+        &self,
+        series_id: &str,
+        retention_days: i64,
+    ) -> Result<usize, StoreError> {
         let cutoff = (Utc::now() - chrono::Duration::days(retention_days.max(1))).to_rfc3339();
         self.with_conn_sync(|conn| {
             let n = conn.execute(
@@ -2813,7 +2849,10 @@ impl SqliteStore {
         })
     }
 
-    pub fn upsert_activation_journal(&self, rec: &ActivationJournalRecord) -> Result<(), StoreError> {
+    pub fn upsert_activation_journal(
+        &self,
+        rec: &ActivationJournalRecord,
+    ) -> Result<(), StoreError> {
         self.with_conn_sync(|conn| {
             conn.execute(
                 "INSERT INTO activation_journal
@@ -2840,7 +2879,9 @@ impl SqliteStore {
         })
     }
 
-    pub fn list_incomplete_activation_journals(&self) -> Result<Vec<ActivationJournalRecord>, StoreError> {
+    pub fn list_incomplete_activation_journals(
+        &self,
+    ) -> Result<Vec<ActivationJournalRecord>, StoreError> {
         self.with_conn_sync(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT journal_id, draft_id, base_revision, target_revision, generation_id, phase, error_message, updated_at
@@ -2948,7 +2989,12 @@ mod tests {
         assert!(reopened.list_secrets().unwrap().is_empty());
     }
 
-    fn exec(id: &str, status: &str, key: Option<&str>, args: serde_json::Value) -> ActionExecutionRecord {
+    fn exec(
+        id: &str,
+        status: &str,
+        key: Option<&str>,
+        args: serde_json::Value,
+    ) -> ActionExecutionRecord {
         ActionExecutionRecord {
             execution_id: id.into(),
             action_instance: "merge_pr".into(),
@@ -2985,44 +3031,80 @@ mod tests {
 
         // Atomic claim: the second insert with the same key inserts nothing.
         assert!(matches!(
-            store.claim_idempotency_and_insert(&exec("a1", "queued", Some("k"), json!({"n": 1}))).unwrap(),
+            store
+                .claim_idempotency_and_insert(&exec("a1", "queued", Some("k"), json!({"n": 1})))
+                .unwrap(),
             IdempotencyClaim::New
         ));
-        match store.claim_idempotency_and_insert(&exec("a2", "queued", Some("k"), json!({"n": 1}))).unwrap() {
+        match store
+            .claim_idempotency_and_insert(&exec("a2", "queued", Some("k"), json!({"n": 1})))
+            .unwrap()
+        {
             IdempotencyClaim::Existing(r) => assert_eq!(r.execution_id, "a1"),
             other => panic!("expected Existing, got {other:?}"),
         }
         assert!(store.get_action_execution("a2").unwrap().is_none());
         assert!(matches!(
-            store.claim_idempotency_and_insert(&exec("a3", "queued", Some("k"), json!({"n": 2}))).unwrap(),
+            store
+                .claim_idempotency_and_insert(&exec("a3", "queued", Some("k"), json!({"n": 2})))
+                .unwrap(),
             IdempotencyClaim::ArgsMismatch(_)
         ));
 
         // Conditional transitions.
-        assert!(store.transition_action_execution("a1", &["queued"], t("running", false)).unwrap());
-        assert!(!store.transition_action_execution("a1", &["queued"], t("cancelled", true)).unwrap());
-        assert!(store.transition_action_execution("a1", &["running"], t("failed", true)).unwrap());
+        assert!(store
+            .transition_action_execution("a1", &["queued"], t("running", false))
+            .unwrap());
+        assert!(!store
+            .transition_action_execution("a1", &["queued"], t("cancelled", true))
+            .unwrap());
+        assert!(store
+            .transition_action_execution("a1", &["running"], t("failed", true))
+            .unwrap());
         // A retry-safe failure is superseded atomically by the next claim.
         assert!(matches!(
-            store.claim_idempotency_and_insert(&exec("a4", "queued", Some("k"), json!({"n": 1}))).unwrap(),
+            store
+                .claim_idempotency_and_insert(&exec("a4", "queued", Some("k"), json!({"n": 1})))
+                .unwrap(),
             IdempotencyClaim::New
         ));
-        assert_eq!(store.lookup_action_idempotency("merge_pr", "k").unwrap().unwrap().execution_id, "a4");
-        assert!(store.transition_action_execution("a4", &["queued"], t("running", false)).unwrap());
-        assert!(store.transition_action_execution("a4", &["running"], t("unknown", false)).unwrap());
+        assert_eq!(
+            store
+                .lookup_action_idempotency("merge_pr", "k")
+                .unwrap()
+                .unwrap()
+                .execution_id,
+            "a4"
+        );
+        assert!(store
+            .transition_action_execution("a4", &["queued"], t("running", false))
+            .unwrap());
+        assert!(store
+            .transition_action_execution("a4", &["running"], t("unknown", false))
+            .unwrap());
         // An unknown outcome is never superseded.
-        match store.claim_idempotency_and_insert(&exec("a5", "queued", Some("k"), json!({"n": 1}))).unwrap() {
+        match store
+            .claim_idempotency_and_insert(&exec("a5", "queued", Some("k"), json!({"n": 1})))
+            .unwrap()
+        {
             IdempotencyClaim::Existing(r) => assert_eq!(r.execution_id, "a4"),
             other => panic!("expected Existing, got {other:?}"),
         }
 
         // Crash recovery + reconcile schedule.
-        store.claim_idempotency_and_insert(&exec("r1", "running", None, json!({}))).unwrap();
-        store.claim_idempotency_and_insert(&exec("q1", "queued", None, json!({}))).unwrap();
+        store
+            .claim_idempotency_and_insert(&exec("r1", "running", None, json!({})))
+            .unwrap();
+        store
+            .claim_idempotency_and_insert(&exec("q1", "queued", None, json!({})))
+            .unwrap();
         let rec = store.recover_inflight_actions("restart").unwrap();
         assert_eq!(rec.marked_unknown, vec!["r1".to_string()]);
         assert_eq!(rec.marked_not_started, vec!["q1".to_string()]);
-        assert_eq!(store.get_action_execution("r1").unwrap().unwrap().status, "unknown");
+        assert_eq!(
+            store.get_action_execution("r1").unwrap().unwrap().status,
+            "unknown"
+        );
         let q = store.get_action_execution("q1").unwrap().unwrap();
         assert_eq!(q.status, "failed");
         assert!(q.retry_safe);
@@ -3034,18 +3116,33 @@ mod tests {
             .map(|r| r.execution_id)
             .collect();
         assert_eq!(unscheduled, vec!["a4".to_string(), "r1".to_string()]);
-        store.schedule_action_reconcile("r1", "2000-01-01T00:00:00.000Z").unwrap();
-        store.schedule_action_reconcile("a4", "2999-01-01T00:00:00.000Z").unwrap();
+        store
+            .schedule_action_reconcile("r1", "2000-01-01T00:00:00.000Z")
+            .unwrap();
+        store
+            .schedule_action_reconcile("a4", "2999-01-01T00:00:00.000Z")
+            .unwrap();
         assert_eq!(
-            store.list_due_action_reconciles("2026-01-01T00:00:00.000Z", 10).unwrap(),
+            store
+                .list_due_action_reconciles("2026-01-01T00:00:00.000Z", 10)
+                .unwrap(),
             vec!["r1".to_string()]
         );
         store.clear_action_reconcile("r1").unwrap();
-        assert!(store.list_due_action_reconciles("2026-01-01T00:00:00.000Z", 10).unwrap().is_empty());
+        assert!(store
+            .list_due_action_reconciles("2026-01-01T00:00:00.000Z", 10)
+            .unwrap()
+            .is_empty());
         drop(store);
         // The additive ledger schema survives reopening.
         let reopened = SqliteStore::open(dir.path()).unwrap();
-        assert_eq!(reopened.get_action_reconcile_schedule("a4").unwrap().as_deref(), Some("2999-01-01T00:00:00.000Z"));
+        assert_eq!(
+            reopened
+                .get_action_reconcile_schedule("a4")
+                .unwrap()
+                .as_deref(),
+            Some("2999-01-01T00:00:00.000Z")
+        );
     }
 
     #[test]
@@ -3086,7 +3183,14 @@ mod tests {
             .append_audit("agt_1", "agent", "draft.edit", "dft_1", "ok", json!({}))
             .unwrap();
         store
-            .append_audit("admin", "administrator", "draft.begin", "dft_1", "ok", json!({}))
+            .append_audit(
+                "admin",
+                "administrator",
+                "draft.begin",
+                "dft_1",
+                "ok",
+                json!({}),
+            )
             .unwrap();
         store
             .append_audit("agt_2", "agent", "draft.edit", "dft_2", "ok", json!({}))
@@ -3108,19 +3212,49 @@ mod tests {
     fn test_state_cas_prevents_lost_updates() {
         let store = SqliteStore::open_in_memory().unwrap();
         let r1 = store
-            .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/a"), Some(0))
+            .set_state(
+                "dashboard",
+                "engineering",
+                "selected_repo",
+                1,
+                1,
+                json!("acme/a"),
+                Some(0),
+            )
             .unwrap();
         assert_eq!(r1.version, 1);
 
         let r2 = store
-            .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/b"), Some(1))
+            .set_state(
+                "dashboard",
+                "engineering",
+                "selected_repo",
+                1,
+                1,
+                json!("acme/b"),
+                Some(1),
+            )
             .unwrap();
         assert_eq!(r2.version, 2);
 
         let err = store
-            .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/stale"), Some(1))
+            .set_state(
+                "dashboard",
+                "engineering",
+                "selected_repo",
+                1,
+                1,
+                json!("acme/stale"),
+                Some(1),
+            )
             .unwrap_err();
-        assert!(matches!(err, StoreError::CasConflict { expected: 1, actual: 2 }));
+        assert!(matches!(
+            err,
+            StoreError::CasConflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
     }
 
     #[test]
@@ -3141,7 +3275,15 @@ mod tests {
             .unwrap();
         assert_eq!(seeded.unwrap().version, 1);
         store
-            .set_state("dashboard", "d", "repo", 1, 1, json!("client-write"), Some(1))
+            .set_state(
+                "dashboard",
+                "d",
+                "repo",
+                1,
+                1,
+                json!("client-write"),
+                Some(1),
+            )
             .unwrap();
         // Seeding again never overwrites the concurrent write.
         assert!(store
@@ -3149,7 +3291,11 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(
-            store.get_state("dashboard", "d", "repo").unwrap().unwrap().value,
+            store
+                .get_state("dashboard", "d", "repo")
+                .unwrap()
+                .unwrap()
+                .value,
             json!("client-write")
         );
     }
@@ -3157,8 +3303,12 @@ mod tests {
     #[test]
     fn test_state_migrations_are_transactional() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.set_state("dashboard", "d", "a", 1, 1, json!(1), None).unwrap();
-        store.set_state("dashboard", "d", "b", 1, 1, json!(2), None).unwrap();
+        store
+            .set_state("dashboard", "d", "a", 1, 1, json!(1), None)
+            .unwrap();
+        store
+            .set_state("dashboard", "d", "b", 1, 1, json!(2), None)
+            .unwrap();
         let step = |key: &str, expected: i64, v: Option<serde_json::Value>| StateMigrationStep {
             scope: "dashboard".into(),
             owner: "d".into(),
@@ -3172,7 +3322,13 @@ mod tests {
         let err = store
             .apply_state_migrations(&[step("a", 1, Some(json!(10))), step("b", 7, None)])
             .unwrap_err();
-        assert!(matches!(err, StoreError::CasConflict { expected: 7, actual: 1 }));
+        assert!(matches!(
+            err,
+            StoreError::CasConflict {
+                expected: 7,
+                actual: 1
+            }
+        ));
         let a = store.get_state("dashboard", "d", "a").unwrap().unwrap();
         assert_eq!((a.value, a.schema_version, a.version), (json!(1), 1, 1));
 
@@ -3194,7 +3350,12 @@ mod tests {
         let store = SqliteStore::open(&data_dir).unwrap();
         let secret_val = "ghp_super_secret_token_987654321";
         store
-            .set_secret("github-work", "Work GitHub PAT", secret_val, &["github_reader".into()])
+            .set_secret(
+                "github-work",
+                "Work GitHub PAT",
+                secret_val,
+                &["github_reader".into()],
+            )
             .unwrap();
 
         let (meta, decrypted) = store.resolve_secret_plaintext("github-work").unwrap();
@@ -3217,12 +3378,25 @@ mod tests {
     fn unverified_tokens_never_poison_redaction() {
         let store = SqliteStore::open_in_memory().unwrap();
         // Unauthenticated callers present arbitrary words as Bearer tokens / session cookies.
-        assert!(store.authenticate_agent_token("merge_pr").unwrap().is_none());
+        assert!(store
+            .authenticate_agent_token("merge_pr")
+            .unwrap()
+            .is_none());
         assert!(store.validate_session("open").unwrap().is_none());
-        assert!(store.authenticate_agent_token("acme/platform").unwrap().is_none());
+        assert!(store
+            .authenticate_agent_token("acme/platform")
+            .unwrap()
+            .is_none());
         assert_eq!(store.redactor().registered_len(), 0);
         store
-            .append_audit("admin", "administrator", "action.invoke", "merge_pr", "ok", json!({"repo": "acme/platform", "state": "open"}))
+            .append_audit(
+                "admin",
+                "administrator",
+                "action.invoke",
+                "merge_pr",
+                "ok",
+                json!({"repo": "acme/platform", "state": "open"}),
+            )
             .unwrap();
         let audits = store.list_audits(1).unwrap();
         assert_eq!(audits[0].detail["repo"], "acme/platform");
@@ -3230,7 +3404,9 @@ mod tests {
 
         // A real, server-issued token is registered once verified (e.g. after restart).
         let tok = "dsh_agt_0123456789abcdef0123456789abcdef";
-        store.create_agent_principal("bot", tok, json!({}), None).unwrap();
+        store
+            .create_agent_principal("bot", tok, json!({}), None)
+            .unwrap();
         let fresh = store.redactor().clone();
         fresh.unregister_secret(tok);
         assert!(!fresh.is_registered(tok));
@@ -3258,7 +3434,12 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let tok = "dsh_agt_expired_0123456789abcdef0123456789";
         store
-            .create_agent_principal("old", tok, json!({}), Some(Utc::now() - chrono::Duration::seconds(5)))
+            .create_agent_principal(
+                "old",
+                tok,
+                json!({}),
+                Some(Utc::now() - chrono::Duration::seconds(5)),
+            )
             .unwrap();
         assert!(store.authenticate_agent_token(tok).unwrap().is_none());
     }
@@ -3267,7 +3448,9 @@ mod tests {
     fn db_size_includes_wal() {
         let dir = TempDir::new().unwrap();
         let store = SqliteStore::open(dir.path()).unwrap();
-        store.append_audit("a", "administrator", "op", "t", "ok", json!({})).unwrap();
+        store
+            .append_audit("a", "administrator", "op", "t", "ok", json!({}))
+            .unwrap();
         let main = std::fs::metadata(dir.path().join("dash.db")).unwrap().len();
         assert!(store.wal_size_bytes() > 0);
         assert!(store.db_size_bytes() > main);
@@ -3277,10 +3460,24 @@ mod tests {
     fn test_events_checkpoints_dlq_and_activation_journal() {
         let store = SqliteStore::open_in_memory().unwrap();
         let e1 = store
-            .append_event("merge_pr", "github.pr_merged", "1", "tr_1", true, json!({"pr": 42}))
+            .append_event(
+                "merge_pr",
+                "github.pr_merged",
+                "1",
+                "tr_1",
+                true,
+                json!({"pr": 42}),
+            )
             .unwrap();
         let e2 = store
-            .append_event("merge_pr", "github.pr_merged", "1", "tr_2", true, json!({"pr": 43}))
+            .append_event(
+                "merge_pr",
+                "github.pr_merged",
+                "1",
+                "tr_2",
+                true,
+                json!({"pr": 43}),
+            )
             .unwrap();
         assert_eq!(e1.sequence, 1);
         assert_eq!(e2.sequence, 2);
@@ -3289,10 +3486,19 @@ mod tests {
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].event_id, e2.event_id);
 
-        store.set_consumer_checkpoint("complete_work", "merge_pr", 1).unwrap();
-        assert_eq!(store.get_consumer_checkpoint("complete_work", "merge_pr").unwrap(), 1);
+        store
+            .set_consumer_checkpoint("complete_work", "merge_pr", 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_consumer_checkpoint("complete_work", "merge_pr")
+                .unwrap(),
+            1
+        );
 
-        let dlq_id = store.record_dead_letter("complete_work", &e2.event_id, 3, "jira 503").unwrap();
+        let dlq_id = store
+            .record_dead_letter("complete_work", &e2.event_id, 3, "jira 503")
+            .unwrap();
         assert!(dlq_id.starts_with("dlq_"));
 
         store
@@ -3325,11 +3531,16 @@ mod tests {
             .append_event_min_sequence("src", "t", "1", "tr", true, json!({}), 7)
             .unwrap();
         assert_eq!(e1.sequence, 7);
-        let e2 = store.append_event("src", "t", "1", "tr", true, json!({})).unwrap();
+        let e2 = store
+            .append_event("src", "t", "1", "tr", true, json!({}))
+            .unwrap();
         assert_eq!(e2.sequence, 8);
         assert_eq!(store.max_event_sequence("src").unwrap(), 8);
         assert_eq!(store.get_event(&e1.event_id).unwrap().unwrap().sequence, 7);
-        assert_eq!(store.list_events_since_limited("src", 0, 1).unwrap().len(), 1);
+        assert_eq!(
+            store.list_events_since_limited("src", 0, 1).unwrap().len(),
+            1
+        );
         assert_eq!(store.list_event_sources().unwrap(), vec!["src".to_string()]);
         let future = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
         assert_eq!(store.max_event_sequence_before("src", &future).unwrap(), 8);
@@ -3340,12 +3551,22 @@ mod tests {
     #[test]
     fn test_dead_letter_listing_resolution_and_event_retention() {
         let store = SqliteStore::open_in_memory().unwrap();
-        let e1 = store.append_event("src", "t", "1", "tr", true, json!({"n": 1})).unwrap();
-        let e2 = store.append_event("src", "t", "1", "tr", true, json!({"n": 2})).unwrap();
-        let e3 = store.append_event("src", "t", "1", "tr", true, json!({"n": 3})).unwrap();
+        let e1 = store
+            .append_event("src", "t", "1", "tr", true, json!({"n": 1}))
+            .unwrap();
+        let e2 = store
+            .append_event("src", "t", "1", "tr", true, json!({"n": 2}))
+            .unwrap();
+        let e3 = store
+            .append_event("src", "t", "1", "tr", true, json!({"n": 3}))
+            .unwrap();
         // Consumer acked e1 and e2; e2 is dead-lettered and unresolved.
-        store.set_consumer_checkpoint("auto", "src", e2.sequence).unwrap();
-        let dlq = store.record_dead_letter("auto", &e2.event_id, 3, "boom").unwrap();
+        store
+            .set_consumer_checkpoint("auto", "src", e2.sequence)
+            .unwrap();
+        let dlq = store
+            .record_dead_letter("auto", &e2.event_id, 3, "boom")
+            .unwrap();
         assert_eq!(store.list_dead_letters(false, 10).unwrap().len(), 1);
 
         let old_run = |id: &str, event_id: Option<&str>| AutomationExecutionRecord {
@@ -3364,8 +3585,12 @@ mod tests {
             started_at: (Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
             finished_at: None,
         };
-        store.insert_automation_execution(&old_run("aex_e1", Some(&e1.event_id))).unwrap();
-        store.insert_automation_execution(&old_run("aex_e3", Some(&e3.event_id))).unwrap();
+        store
+            .insert_automation_execution(&old_run("aex_e1", Some(&e1.event_id)))
+            .unwrap();
+        store
+            .insert_automation_execution(&old_run("aex_e3", Some(&e3.event_id)))
+            .unwrap();
 
         let cutoff = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
         // Only e1: acked by every consumer and not referenced by an unresolved dead letter.
@@ -3427,19 +3652,42 @@ mod tests {
             .unwrap();
         assert_eq!(found.result.unwrap()["ok"], true);
         assert_eq!(found.action_executions, vec!["act_1".to_string()]);
-        assert_eq!(store.list_automation_executions(Some("complete_work"), 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_automation_executions(Some("complete_work"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(store.list_automation_executions(None, 10).unwrap().len(), 1);
-        assert!(store.list_automation_executions(Some("other"), 10).unwrap().is_empty());
+        assert!(store
+            .list_automation_executions(Some("other"), 10)
+            .unwrap()
+            .is_empty());
 
-        assert!(store.get_automation_trigger_state("a", "cron:0").unwrap().is_none());
+        assert!(store
+            .get_automation_trigger_state("a", "cron:0")
+            .unwrap()
+            .is_none());
         store
             .set_automation_trigger_state("a", "cron:0", Some("2026-01-01T00:00:00+00:00"), None)
             .unwrap();
         store
-            .set_automation_trigger_state("a", "cron:0", Some("2026-01-02T00:00:00+00:00"), Some("fp"))
+            .set_automation_trigger_state(
+                "a",
+                "cron:0",
+                Some("2026-01-02T00:00:00+00:00"),
+                Some("fp"),
+            )
             .unwrap();
-        let st = store.get_automation_trigger_state("a", "cron:0").unwrap().unwrap();
-        assert_eq!(st.last_fired_at.as_deref(), Some("2026-01-02T00:00:00+00:00"));
+        let st = store
+            .get_automation_trigger_state("a", "cron:0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            st.last_fired_at.as_deref(),
+            Some("2026-01-02T00:00:00+00:00")
+        );
         assert_eq!(st.last_fingerprint.as_deref(), Some("fp"));
     }
 
@@ -3461,12 +3709,20 @@ mod tests {
         let base = Utc::now() - chrono::Duration::hours(10);
         for i in 0..10 {
             let ts = (base + chrono::Duration::hours(i)).to_rfc3339();
-            store.append_history_sample("s", &ts, i as f64, None).unwrap();
+            store
+                .append_history_sample("s", &ts, i as f64, None)
+                .unwrap();
         }
         let recent = store.query_history_samples("s", None, 3).unwrap();
         let values: Vec<f64> = recent.iter().map(|r| r.value_num).collect();
         assert_eq!(values, vec![7.0, 8.0, 9.0], "newest samples, oldest first");
         // Query budget clamps absurd limits.
-        assert_eq!(store.query_history_samples("s", None, usize::MAX).unwrap().len(), 10);
+        assert_eq!(
+            store
+                .query_history_samples("s", None, usize::MAX)
+                .unwrap()
+                .len(),
+            10
+        );
     }
 }

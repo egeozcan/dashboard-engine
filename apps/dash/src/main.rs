@@ -70,7 +70,11 @@ enum Commands {
         /// Additional accepted Host names (DNS-rebinding allowlist), e.g. the Tailscale Serve
         /// MagicDNS name `box.tailnet.ts.net`; `.suffix` accepts subdomains. Loopback names are
         /// always accepted.
-        #[arg(long = "allowed-host", env = "DASH_ALLOWED_HOSTS", value_delimiter = ',')]
+        #[arg(
+            long = "allowed-host",
+            env = "DASH_ALLOWED_HOSTS",
+            value_delimiter = ','
+        )]
         allowed_hosts: Vec<String>,
         /// When session cookies get `Secure`: auto (HTTPS via trusted proxy or non-loopback bind), always, never.
         #[arg(long = "secure-cookies", default_value = "auto")]
@@ -206,7 +210,9 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&cli.data_dir)?;
             let _lock = match InstallationLock::try_acquire(&cli.data_dir)? {
                 Some(l) => l,
-                None => bail!("a running `dash serve` holds this Installation; stop it before `dash init`"),
+                None => bail!(
+                    "a running `dash serve` holds this Installation; stop it before `dash init`"
+                ),
             };
             if let Some(src) = from_fixture {
                 dash_git::packages::copy_tree_excluding_git(src, &cli.workspace)
@@ -292,9 +298,14 @@ async fn main() -> Result<()> {
             let ctx = ServerContext::default()
                 .with_allowed_hosts(Some(bind.ip()), allowed_hosts)
                 .with_secure_cookies(secure_cookies);
-            let services = open_services(&cli.workspace, &cli.data_dir, trusted_proxies.clone(), use_mocks)
-                .await?
-                .with_server_context(ctx);
+            let services = open_services(
+                &cli.workspace,
+                &cli.data_dir,
+                trusted_proxies.clone(),
+                use_mocks,
+            )
+            .await?
+            .with_server_context(ctx);
 
             // Crash recovery before admitting work (§15.2): we hold the exclusive Installation
             // lock, so executions left running by a previous process (crash, SIGKILL, OOM) have an
@@ -323,7 +334,10 @@ async fn main() -> Result<()> {
             let signal_services = services.clone();
             tokio::spawn(async move {
                 shutdown_signal().await;
-                tracing::info!("shutdown requested; draining for up to {}s", drain.as_secs());
+                tracing::info!(
+                    "shutdown requested; draining for up to {}s",
+                    drain.as_secs()
+                );
                 signal_services.server.begin_shutdown();
                 let _ = shutdown_tx.send(true);
             });
@@ -353,11 +367,18 @@ async fn main() -> Result<()> {
             // automation-initiated action) within the remaining drain budget, then is aborted.
             let remaining = drain.saturating_sub(started_drain.elapsed());
             let abort = worker_handle.abort_handle();
-            if tokio::time::timeout(remaining, worker_handle).await.is_err() {
+            if tokio::time::timeout(remaining, worker_handle)
+                .await
+                .is_err()
+            {
                 abort.abort();
             }
             // Wait for admitted actions still running in detached tasks.
-            while services.store().count_inflight_action_executions().unwrap_or(0) > 0
+            while services
+                .store()
+                .count_inflight_action_executions()
+                .unwrap_or(0)
+                > 0
                 && started_drain.elapsed() < drain
             {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -371,7 +392,10 @@ async fn main() -> Result<()> {
                     "marked {unknown_marked} incomplete in-flight action(s) as unknown during shutdown"
                 );
             }
-            services.engine().telemetry.flush_spans(Duration::from_secs(2));
+            services
+                .engine()
+                .telemetry
+                .flush_spans(Duration::from_secs(2));
             let _ = services.store().checkpoint_wal_truncate();
             drop(daemon_file);
         }
@@ -386,8 +410,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::Manifest { ref definition_id } => {
-            let graph = dash_git::load_workspace_graph(&cli.workspace, &cli.data_dir, "cli", 0, false)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let graph =
+                dash_git::load_workspace_graph(&cli.workspace, &cli.data_dir, "cli", 0, false)
+                    .map_err(|e| anyhow::anyhow!(e))?;
             let out = match definition_id {
                 Some(id) => {
                     let def = graph
@@ -401,7 +426,8 @@ async fn main() -> Result<()> {
                     for (id, def) in &graph.definitions {
                         all.insert(
                             id.clone(),
-                            dash_server::services::contract_json(def).map_err(|e| anyhow::anyhow!(e))?,
+                            dash_server::services::contract_json(def)
+                                .map_err(|e| anyhow::anyhow!(e))?,
                         );
                     }
                     Value::Object(all)
@@ -435,18 +461,41 @@ async fn run_admin_command(cli: &Cli) -> Result<()> {
     let admin = Principal::administrator();
     let out: Value = match (&cli.command, &target) {
         (Commands::Reload, Target::Local(s)) => {
-            json!(s.workspace_reload(&admin).await.map_err(|e| anyhow::anyhow!(e))?)
+            json!(s
+                .workspace_reload(&admin)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?)
         }
         (Commands::Reload, Target::Daemon(d)) => d.post("/api/workspace/reload", json!({})).await?,
 
-        (Commands::Git { action: GitAction::Status }, Target::Local(s)) => {
+        (
+            Commands::Git {
+                action: GitAction::Status,
+            },
+            Target::Local(s),
+        ) => {
             json!(s.git_status().await.map_err(|e| anyhow::anyhow!(e))?)
         }
-        (Commands::Git { action: GitAction::Status }, Target::Daemon(d)) => d.get("/api/git/status").await?,
-        (Commands::Git { action: GitAction::Sync }, Target::Local(s)) => {
+        (
+            Commands::Git {
+                action: GitAction::Status,
+            },
+            Target::Daemon(d),
+        ) => d.get("/api/git/status").await?,
+        (
+            Commands::Git {
+                action: GitAction::Sync,
+            },
+            Target::Local(s),
+        ) => {
             json!(s.git_sync(&admin).await.map_err(|e| anyhow::anyhow!(e))?)
         }
-        (Commands::Git { action: GitAction::Sync }, Target::Daemon(d)) => d.post("/api/git/sync", json!({})).await?,
+        (
+            Commands::Git {
+                action: GitAction::Sync,
+            },
+            Target::Daemon(d),
+        ) => d.post("/api/git/sync", json!({})).await?,
 
         (Commands::Doctor, t) => {
             let doc = match t {
@@ -523,13 +572,11 @@ async fn run_admin_command(cli: &Cli) -> Result<()> {
                 expires_in,
             } => {
                 let parsed: CapabilityCeiling = serde_json::from_str(ceiling)?;
-                let secs = expires_in
-                    .as_deref()
-                    .map(parse_duration_secs)
-                    .transpose()?;
+                let secs = expires_in.as_deref().map(parse_duration_secs).transpose()?;
                 match t {
                     Target::Local(s) => {
-                        let exp = resolve_agent_token_expiry(secs, None).map_err(|e| anyhow::anyhow!(e))?;
+                        let exp = resolve_agent_token_expiry(secs, None)
+                            .map_err(|e| anyhow::anyhow!(e))?;
                         let (rec, plaintext) = s
                             .agent_create(name, parsed, Some(exp), &admin)
                             .map_err(|e| anyhow::anyhow!(e))?;
@@ -548,7 +595,10 @@ async fn run_admin_command(cli: &Cli) -> Result<()> {
                 Target::Local(s) => {
                     json!({ "revoked": s.agent_revoke(agent_id, &admin).map_err(|e| anyhow::anyhow!(e))? })
                 }
-                Target::Daemon(d) => d.post(&format!("/api/agents/{agent_id}/revoke"), json!({})).await?,
+                Target::Daemon(d) => {
+                    d.post(&format!("/api/agents/{agent_id}/revoke"), json!({}))
+                        .await?
+                }
             },
         },
 
@@ -567,8 +617,11 @@ async fn run_admin_command(cli: &Cli) -> Result<()> {
                     json!({ "granted": true, "principal_id": principal_id })
                 }
                 Target::Daemon(d) => {
-                    d.post(&format!("/api/service-principals/{principal_id}/grant"), json!(parsed))
-                        .await?
+                    d.post(
+                        &format!("/api/service-principals/{principal_id}/grant"),
+                        json!(parsed),
+                    )
+                    .await?
                 }
             }
         }
@@ -716,7 +769,8 @@ impl DaemonClient {
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
-        self.send(self.http.get(format!("{}{path}", self.base))).await
+        self.send(self.http.get(format!("{}{path}", self.base)))
+            .await
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
@@ -841,7 +895,10 @@ async fn forward_mcp_message(
         Ok(r) => r,
         Err(e) => {
             let m = format!("dash daemon unreachable at {url}: {e}");
-            return ids.iter().map(|id| rpc_error_line(id, -32000, &m)).collect();
+            return ids
+                .iter()
+                .map(|id| rpc_error_line(id, -32000, &m))
+                .collect();
         }
     };
     let status = resp.status();
@@ -932,7 +989,11 @@ pub async fn run_mcp_stdio_proxy(url: &str, token: &str) -> Result<()> {
             Ok(v) => v,
             Err(e) => {
                 let _ = out_tx
-                    .send(rpc_error_line(&Value::Null, -32700, &format!("Parse error: {e}")))
+                    .send(rpc_error_line(
+                        &Value::Null,
+                        -32700,
+                        &format!("Parse error: {e}"),
+                    ))
                     .await;
                 continue;
             }
@@ -1011,7 +1072,10 @@ mod tests {
             { "jsonrpc": "2.0", "id": 5, "result": {} }
         ]);
         assert_eq!(request_ids(&batch), vec![json!(1)]);
-        assert!(request_ids(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled" })).is_empty());
+        assert!(
+            request_ids(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled" }))
+                .is_empty()
+        );
     }
 
     #[test]

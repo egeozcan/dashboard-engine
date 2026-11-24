@@ -144,7 +144,9 @@ impl StateKeyDeclaration {
                 if self.nullable { " or null" } else { "" }
             )));
         }
-        let size = serde_json::to_string(value).map(|s| s.len()).unwrap_or(usize::MAX);
+        let size = serde_json::to_string(value)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
         let limit = self.effective_max_bytes();
         if size > limit {
             return Err(StateError::TooLarge {
@@ -178,7 +180,11 @@ pub enum StateError {
     #[error("invalid state write: {0}")]
     Invalid(String),
     #[error("state value for '{key}' is {size} bytes; limit is {limit} bytes")]
-    TooLarge { key: String, size: usize, limit: usize },
+    TooLarge {
+        key: String,
+        size: usize,
+        limit: usize,
+    },
     #[error("state migration failed: {0}")]
     Migration(String),
     #[error(transparent)]
@@ -248,12 +254,15 @@ pub fn authorize_dashboard_read<'g>(
         .get(dashboard_id)
         .ok_or_else(|| StateError::DashboardNotFound(dashboard_id.to_string()))?;
     for placement in &doc.adapters {
-        let inst = graph.instances.get(&placement.adapter_instance).ok_or_else(|| {
-            StateError::Forbidden(format!(
-                "dashboard '{dashboard_id}' places unknown adapter instance '{}'",
-                placement.adapter_instance
-            ))
-        })?;
+        let inst = graph
+            .instances
+            .get(&placement.adapter_instance)
+            .ok_or_else(|| {
+                StateError::Forbidden(format!(
+                    "dashboard '{dashboard_id}' places unknown adapter instance '{}'",
+                    placement.adapter_instance
+                ))
+            })?;
         check_provider_access(principal, inst).map_err(|e| StateError::Forbidden(e.to_string()))?;
     }
     Ok(doc)
@@ -287,7 +296,12 @@ impl StateManager {
         Self { store, signals }
     }
 
-    pub fn get(&self, scope: &str, owner: &str, key: &str) -> Result<Option<StateRecord>, StoreError> {
+    pub fn get(
+        &self,
+        scope: &str,
+        owner: &str,
+        key: &str,
+    ) -> Result<Option<StateRecord>, StoreError> {
         self.store.get_state(scope, owner, key)
     }
 
@@ -567,13 +581,14 @@ impl StateManager {
                 detail,
             );
         };
-        let (steps, migrations) = match self.plan_dashboard_state_migrations(dashboards, generation_id) {
-            Ok(p) => p,
-            Err(e) => {
-                audit("failed", serde_json::json!({ "error": e.to_string() }));
-                return Err(e);
-            }
-        };
+        let (steps, migrations) =
+            match self.plan_dashboard_state_migrations(dashboards, generation_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    audit("failed", serde_json::json!({ "error": e.to_string() }));
+                    return Err(e);
+                }
+            };
         let mut applied = 0;
         if !steps.is_empty() {
             let results = match self.store.apply_state_migrations(&steps) {
@@ -690,7 +705,10 @@ mod tests {
         let rec = sm
             .set_dashboard_state(&g, &admin, "eng", "repo", json!("acme/b"), Some(0))
             .unwrap();
-        assert_eq!((rec.version, rec.schema_version, rec.generation_id), (1, 2, 3));
+        assert_eq!(
+            (rec.version, rec.schema_version, rec.generation_id),
+            (1, 2, 3)
+        );
 
         let e = sm
             .set_dashboard_state(&g, &admin, "missing", "repo", json!("x"), None)
@@ -724,10 +742,15 @@ mod tests {
         assert_eq!(e.http_status(), 403);
         let blind = agent(&[]);
         assert_eq!(
-            sm.list_dashboard_state_for(&g, &blind, "eng").unwrap_err().http_status(),
+            sm.list_dashboard_state_for(&g, &blind, "eng")
+                .unwrap_err()
+                .http_status(),
             403
         );
-        assert_eq!(sm.get("dashboard", "eng", "repo").unwrap().unwrap().value, json!("acme/b"));
+        assert_eq!(
+            sm.get("dashboard", "eng", "repo").unwrap().unwrap().value,
+            json!("acme/b")
+        );
     }
 
     #[test]
@@ -737,11 +760,23 @@ mod tests {
         let mut rx = hub.subscribe_state();
         sm.seed_dashboard_defaults(&doc, 1).unwrap();
         assert_eq!(rx.try_recv().unwrap().value, json!("acme/a"));
-        sm.set("dashboard", "eng", "repo", 1, 1, json!("acme/user"), Some(1)).unwrap();
+        sm.set(
+            "dashboard",
+            "eng",
+            "repo",
+            1,
+            1,
+            json!("acme/user"),
+            Some(1),
+        )
+        .unwrap();
         let _ = rx.try_recv();
         sm.seed_dashboard_defaults(&doc, 1).unwrap();
         assert!(rx.try_recv().is_err());
-        assert_eq!(sm.get("dashboard", "eng", "repo").unwrap().unwrap().value, json!("acme/user"));
+        assert_eq!(
+            sm.get("dashboard", "eng", "repo").unwrap().unwrap().value,
+            json!("acme/user")
+        );
     }
 
     #[test]
@@ -749,9 +784,19 @@ mod tests {
         let (sm, _) = manager();
         let admin = Principal::administrator();
         let mut doc = dashboard("eng");
-        doc.initial_state.insert("filters".into(), json!({"open": true}));
+        doc.initial_state
+            .insert("filters".into(), json!({"open": true}));
         sm.seed_dashboard_defaults(&doc, 1).unwrap();
-        sm.set("dashboard", "eng", "filters", 1, 1, json!({"open": false}), None).unwrap();
+        sm.set(
+            "dashboard",
+            "eng",
+            "filters",
+            1,
+            1,
+            json!({"open": false}),
+            None,
+        )
+        .unwrap();
 
         // v2: `repo` keeps its value (still a string); `filters` resets to the default.
         let mut v2 = doc.clone();
@@ -775,16 +820,30 @@ mod tests {
         let check = sm.check_generation_state(&dashboards).unwrap();
         assert_eq!(check.migrations.len(), 2);
         assert_eq!(check.applied, 0);
-        assert_eq!(sm.get("dashboard", "eng", "filters").unwrap().unwrap().schema_version, 1);
+        assert_eq!(
+            sm.get("dashboard", "eng", "filters")
+                .unwrap()
+                .unwrap()
+                .schema_version,
+            1
+        );
 
         let report = sm.apply_generation_state(&dashboards, 2, &admin).unwrap();
         assert_eq!(report.applied, 2);
         let filters = sm.get("dashboard", "eng", "filters").unwrap().unwrap();
-        assert_eq!((filters.value, filters.schema_version), (json!({"open": true}), 2));
+        assert_eq!(
+            (filters.value, filters.schema_version),
+            (json!({"open": true}), 2)
+        );
         let repo = sm.get("dashboard", "eng", "repo").unwrap().unwrap();
         assert_eq!((repo.value, repo.schema_version), (json!("acme/a"), 2));
         // Re-applying the same Generation is a no-op.
-        assert_eq!(sm.apply_generation_state(&dashboards, 2, &admin).unwrap().applied, 0);
+        assert_eq!(
+            sm.apply_generation_state(&dashboards, 2, &admin)
+                .unwrap()
+                .applied,
+            0
+        );
 
         // v3: `repo` becomes an integer with policy keep -> migration fails; `filters` rejects.
         // Nothing is written (live State preserved).
@@ -818,6 +877,8 @@ mod tests {
         assert_eq!(decl.effective_max_bytes(), 128);
         // Dashboards without declarations serialize without the field (no config drift).
         let plain: DashboardDoc = serde_yaml_ng::from_str("id: d\ntitle: D\n").unwrap();
-        assert!(!serde_json::to_string(&plain).unwrap().contains("state_schema"));
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("state_schema"));
     }
 }

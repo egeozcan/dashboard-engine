@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn copy_fixture_ws(dst: &Path) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
     dash_git::packages::copy_tree_excluding_git(&src, dst).unwrap();
 }
 
@@ -36,9 +37,14 @@ async fn setup(use_mocks: bool) -> (TempDir, PathBuf, PathBuf, DraftManager) {
 
 async fn reopen(ws: &Path, data: &Path) -> DraftManager {
     let store = SqliteStore::open(data).unwrap();
-    DraftManager::initialize(ws.to_path_buf(), data.to_path_buf(), store, ResourceBudget::default())
-        .await
-        .unwrap()
+    DraftManager::initialize(
+        ws.to_path_buf(),
+        data.to_path_buf(),
+        store,
+        ResourceBudget::default(),
+    )
+    .await
+    .unwrap()
 }
 
 fn agent(id: &str, author: bool, activate: bool) -> Principal {
@@ -80,7 +86,9 @@ async fn draft_ownership_is_enforced_and_audited() {
     // Another Agent cannot read, edit, preview, rebase, abort or activate someone else's draft
     let id = &admin_draft.draft_id;
     assert!(mgr.draft_status_as(id, &a1).is_err());
-    assert!(mgr.draft_update_dashboard_as(id, &ops_dashboard("x"), &a1).is_err());
+    assert!(mgr
+        .draft_update_dashboard_as(id, &ops_dashboard("x"), &a1)
+        .is_err());
     assert!(mgr.draft_validate_as(id, &a1).await.is_err());
     assert!(mgr.draft_preview_and_test_as(id, &a1).await.is_err());
     assert!(mgr.draft_rebase_as(id, &a1).await.is_err());
@@ -112,7 +120,8 @@ async fn abort_is_idempotent_and_cannot_rewrite_an_activated_draft() {
     let (_tmp, _ws, _data, mgr) = setup(false).await;
     let admin = Principal::administrator();
     let d = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     mgr.draft_activate(&d.draft_id, &admin).await.unwrap();
     let err = mgr.draft_abort(&d.draft_id).await.unwrap_err().to_string();
     assert!(err.contains("already activated"), "{err}");
@@ -136,10 +145,21 @@ async fn commit_attributes_author_and_activator() {
     assert!(mgr.draft_activate(&d.draft_id, &author).await.is_err());
     let act = mgr.draft_activate(&d.draft_id, &admin).await.unwrap();
 
-    let msg = git_cli::git_commit_message(&ws, &act.revision_commit).await.unwrap();
-    assert_eq!(git_cli::commit_trailer(&msg, "Dash-Author").as_deref(), Some("agt_author"));
-    assert_eq!(git_cli::commit_trailer(&msg, "Dash-Principal").as_deref(), Some("admin"));
-    assert_eq!(git_cli::commit_trailer(&msg, "Dash-Draft").as_deref(), Some(d.draft_id.as_str()));
+    let msg = git_cli::git_commit_message(&ws, &act.revision_commit)
+        .await
+        .unwrap();
+    assert_eq!(
+        git_cli::commit_trailer(&msg, "Dash-Author").as_deref(),
+        Some("agt_author")
+    );
+    assert_eq!(
+        git_cli::commit_trailer(&msg, "Dash-Principal").as_deref(),
+        Some("admin")
+    );
+    assert_eq!(
+        git_cli::commit_trailer(&msg, "Dash-Draft").as_deref(),
+        Some(d.draft_id.as_str())
+    );
     assert!(msg.contains("dashboard:ops by agt_author"), "{msg}");
     let hist = mgr.git_history(1).await.unwrap();
     assert_eq!(hist[0].author, "agt_author");
@@ -150,7 +170,8 @@ async fn stale_passing_report_is_not_trusted_after_a_change() {
     let (_tmp, _ws, _data, mgr) = setup(true).await;
     let admin = Principal::administrator();
     let d = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     let report = mgr.draft_preview_and_test(&d.draft_id).await.unwrap();
     assert!(report.all_passed, "{report:?}");
     assert!(report.tested_tree.is_some());
@@ -167,7 +188,11 @@ async fn stale_passing_report_is_not_trusted_after_a_change() {
     mgr.store().upsert_draft(&passing).unwrap();
 
     let head_before = mgr.active_revision().await.unwrap();
-    let err = mgr.draft_activate(&d.draft_id, &admin).await.unwrap_err().to_string();
+    let err = mgr
+        .draft_activate(&d.draft_id, &admin)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("tests failed"), "{err}");
     assert_eq!(mgr.active_revision().await.unwrap(), head_before);
 }
@@ -180,7 +205,9 @@ async fn activation_keeps_untracked_and_ignored_files_and_refuses_dirty_workspac
     // Ignored and untracked local files survive activation
     std::fs::write(ws.join(".gitignore"), "*.local\n").unwrap();
     run_git(&ws, &["add", ".gitignore"]).await.unwrap();
-    run_git(&ws, &["commit", "-m", "ignore local files"]).await.unwrap();
+    run_git(&ws, &["commit", "-m", "ignore local files"])
+        .await
+        .unwrap();
     // Re-open so the active Generation is the new HEAD
     drop(mgr);
     let mgr = reopen(&ws, &std::fs::canonicalize(ws.join("../data")).unwrap()).await;
@@ -188,10 +215,17 @@ async fn activation_keeps_untracked_and_ignored_files_and_refuses_dirty_workspac
     std::fs::write(ws.join("NOTES.txt"), "untracked notes").unwrap();
 
     let d = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     mgr.draft_activate(&d.draft_id, &admin).await.unwrap();
-    assert_eq!(std::fs::read_to_string(ws.join("secrets.local")).unwrap(), "do not delete");
-    assert_eq!(std::fs::read_to_string(ws.join("NOTES.txt")).unwrap(), "untracked notes");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("secrets.local")).unwrap(),
+        "do not delete"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("NOTES.txt")).unwrap(),
+        "untracked notes"
+    );
     assert!(ws.join("dashboards/ops.yaml").exists());
     assert!(git_cli::git_tracked_changes(&ws).await.unwrap().is_empty());
 
@@ -201,9 +235,14 @@ async fn activation_keeps_untracked_and_ignored_files_and_refuses_dirty_workspac
     let edited = format!("{original}\n# external edit\n");
     std::fs::write(&dash_file, &edited).unwrap();
     let d2 = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d2.draft_id, &ops_dashboard("Ops 2")).unwrap();
+    mgr.draft_update_dashboard(&d2.draft_id, &ops_dashboard("Ops 2"))
+        .unwrap();
     let head_before = mgr.active_revision().await.unwrap();
-    let err = mgr.draft_activate(&d2.draft_id, &admin).await.unwrap_err().to_string();
+    let err = mgr
+        .draft_activate(&d2.draft_id, &admin)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("uncommitted external modifications"), "{err}");
     assert_eq!(std::fs::read_to_string(&dash_file).unwrap(), edited);
     assert_eq!(mgr.active_revision().await.unwrap(), head_before);
@@ -215,9 +254,16 @@ async fn activation_keeps_untracked_and_ignored_files_and_refuses_dirty_workspac
     let mut doc = ops_dashboard("New");
     doc.id = "new_one".into();
     mgr.draft_update_dashboard(&d3.draft_id, &doc).unwrap();
-    let err = mgr.draft_activate(&d3.draft_id, &admin).await.unwrap_err().to_string();
+    let err = mgr
+        .draft_activate(&d3.draft_id, &admin)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("untracked Workspace files"), "{err}");
-    assert_eq!(std::fs::read_to_string(ws.join("dashboards/new_one.yaml")).unwrap(), "local scratch");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("dashboards/new_one.yaml")).unwrap(),
+        "local scratch"
+    );
 }
 
 #[tokio::test]
@@ -226,7 +272,8 @@ async fn reload_propagates_deletions_and_leaves_a_clean_workspace() {
     let admin = Principal::administrator();
     // Add a second dashboard through a draft, then delete it externally and reload
     let d = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     mgr.draft_activate(&d.draft_id, &admin).await.unwrap();
     assert!(mgr.engine().graph.load().dashboards.contains_key("ops"));
 
@@ -235,7 +282,10 @@ async fn reload_propagates_deletions_and_leaves_a_clean_workspace() {
     assert!(!mgr.engine().graph.load().dashboards.contains_key("ops"));
     assert!(!ws.join("dashboards/ops.yaml").exists());
     let in_head = git_cli::git_show_file(&ws, &act.revision_commit, "dashboards/ops.yaml").await;
-    assert!(in_head.is_none(), "deleted file must not be in the reload commit");
+    assert!(
+        in_head.is_none(),
+        "deleted file must not be in the reload commit"
+    );
     let status = mgr.git_status().await.unwrap();
     assert!(!status.dirty, "{:?}", status.changed_files);
 }
@@ -247,7 +297,12 @@ async fn startup_loads_head_not_uncommitted_edits() {
     // An external uncommitted deletion of a dashboard must not silently change the Generation
     std::fs::remove_file(ws.join("dashboards/engineering.yaml")).unwrap();
     let mgr = reopen(&ws, &data).await;
-    assert!(mgr.engine().graph.load().dashboards.contains_key("engineering"));
+    assert!(mgr
+        .engine()
+        .graph
+        .load()
+        .dashboards
+        .contains_key("engineering"));
     assert!(mgr
         .startup_warnings()
         .iter()
@@ -262,7 +317,8 @@ async fn crash_after_commit_is_reconciled_as_activated() {
     let admin = Principal::administrator();
     let base = mgr.active_revision().await.unwrap();
     let d = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     // Simulate a crash right after HEAD moved: commit + advance by hand, journal still `started`
     let wt = PathBuf::from(&d.worktree_path);
     let tree = git_cli::git_stage_all_tree(&wt).await.unwrap();
@@ -270,7 +326,9 @@ async fn crash_after_commit_is_reconciled_as_activated() {
     let c = git_cli::git_commit_tree(&ws, &tree, &base, &msg, ("admin", "a@x"), ("admin", "a@x"))
         .await
         .unwrap();
-    git_cli::git_update_head(&ws, &c, &base, "test").await.unwrap();
+    git_cli::git_update_head(&ws, &c, &base, "test")
+        .await
+        .unwrap();
     // (working tree switch never happened: index/working tree still at base)
     mgr.store()
         .upsert_activation_journal(&ActivationJournalRecord {
@@ -287,7 +345,11 @@ async fn crash_after_commit_is_reconciled_as_activated() {
     drop(mgr);
 
     let mgr = reopen(&ws, &data).await;
-    assert!(mgr.store().list_incomplete_activation_journals().unwrap().is_empty());
+    assert!(mgr
+        .store()
+        .list_incomplete_activation_journals()
+        .unwrap()
+        .is_empty());
     assert_eq!(mgr.draft_status(&d.draft_id).unwrap().status, "activated");
     assert_eq!(mgr.active_generation_revision(), c);
     assert!(mgr.engine().graph.load().dashboards.contains_key("ops"));
@@ -316,7 +378,11 @@ async fn crash_before_head_moved_is_rolled_back() {
         .unwrap();
     drop(mgr);
     let mgr = reopen(&ws, &data).await;
-    assert!(mgr.store().list_incomplete_activation_journals().unwrap().is_empty());
+    assert!(mgr
+        .store()
+        .list_incomplete_activation_journals()
+        .unwrap()
+        .is_empty());
     assert_eq!(mgr.active_revision().await.unwrap(), base);
     assert_eq!(mgr.draft_status(&d.draft_id).unwrap().status, "open");
 }
@@ -341,10 +407,20 @@ async fn sync_status_is_derived_and_never_falsely_synced() {
     run_git(&ws, &["commit", "-m", "external"]).await.unwrap();
     let st = mgr.git_status().await.unwrap();
     assert_eq!(st.sync_status, "unsynced");
-    assert!(st.head_diverged, "HEAD moved away from the running Generation");
+    assert!(
+        st.head_diverged,
+        "HEAD moved away from the running Generation"
+    );
     drop(mgr);
     let mgr = reopen(&ws, &data).await;
-    assert_eq!(mgr.store().get_git_sync_state().unwrap().unwrap().sync_status, "unsynced");
+    assert_eq!(
+        mgr.store()
+            .get_git_sync_state()
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "unsynced"
+    );
     assert!(!mgr.git_status().await.unwrap().head_diverged);
     assert_eq!(mgr.git_sync(&admin).await.unwrap().sync_status, "synced");
 }
@@ -355,7 +431,8 @@ async fn rebase_never_resurrects_draft_deletions_and_conflicts_leave_draft_untou
     let admin = Principal::administrator();
     // Base has dashboards/ops.yaml and dashboards/extra.yaml
     let seed = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&seed.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&seed.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     let mut extra = ops_dashboard("Extra");
     extra.id = "extra".into();
     mgr.draft_update_dashboard(&seed.draft_id, &extra).unwrap();
@@ -369,7 +446,8 @@ async fn rebase_never_resurrects_draft_deletions_and_conflicts_leave_draft_untou
 
     // Upstream modifies ops.yaml and adds a new file
     let up = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&up.draft_id, &ops_dashboard("Ops v2")).unwrap();
+    mgr.draft_update_dashboard(&up.draft_id, &ops_dashboard("Ops v2"))
+        .unwrap();
     let mut other = ops_dashboard("Other");
     other.id = "other".into();
     mgr.draft_update_dashboard(&up.draft_id, &other).unwrap();
@@ -380,15 +458,25 @@ async fn rebase_never_resurrects_draft_deletions_and_conflicts_leave_draft_untou
     let wt_a = Path::new(&rebased.worktree_path);
     assert!(!wt_a.join("dashboards/extra.yaml").exists());
     assert!(wt_a.join("dashboards/other.yaml").exists());
-    assert!(std::fs::read_to_string(wt_a.join("dashboards/ops.yaml")).unwrap().contains("Ops v2"));
+    assert!(std::fs::read_to_string(wt_a.join("dashboards/ops.yaml"))
+        .unwrap()
+        .contains("Ops v2"));
 
     // B: delete/modify conflict on ops.yaml -> explicit conflict, worktree untouched
-    let before_tree = git_cli::git_stage_all_tree(Path::new(&b.worktree_path)).await.unwrap();
+    let before_tree = git_cli::git_stage_all_tree(Path::new(&b.worktree_path))
+        .await
+        .unwrap();
     let err = mgr.draft_rebase(&b.draft_id).await.unwrap_err();
-    assert!(matches!(err, GitError::MergeConflict(ref f) if f.contains(&"dashboards/ops.yaml".to_string())));
-    let after_tree = git_cli::git_stage_all_tree(Path::new(&b.worktree_path)).await.unwrap();
+    assert!(
+        matches!(err, GitError::MergeConflict(ref f) if f.contains(&"dashboards/ops.yaml".to_string()))
+    );
+    let after_tree = git_cli::git_stage_all_tree(Path::new(&b.worktree_path))
+        .await
+        .unwrap();
     assert_eq!(before_tree, after_tree);
-    assert!(!Path::new(&b.worktree_path).join("dashboards/other.yaml").exists());
+    assert!(!Path::new(&b.worktree_path)
+        .join("dashboards/other.yaml")
+        .exists());
     let _ = ws;
 }
 
@@ -398,13 +486,16 @@ async fn text_conflict_writes_no_markers_into_the_draft() {
     let admin = Principal::administrator();
     let d1 = mgr.draft_begin(&admin).await.unwrap();
     let d2 = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d1.draft_id, &ops_dashboard("One")).unwrap();
+    mgr.draft_update_dashboard(&d1.draft_id, &ops_dashboard("One"))
+        .unwrap();
     mgr.draft_activate(&d1.draft_id, &admin).await.unwrap();
-    mgr.draft_update_dashboard(&d2.draft_id, &ops_dashboard("Two")).unwrap();
+    mgr.draft_update_dashboard(&d2.draft_id, &ops_dashboard("Two"))
+        .unwrap();
     let prior = mgr.draft_preview_and_test(&d2.draft_id).await.unwrap();
     let err = mgr.draft_rebase(&d2.draft_id).await.unwrap_err();
     assert!(matches!(err, GitError::MergeConflict(_)));
-    let content = std::fs::read_to_string(Path::new(&d2.worktree_path).join("dashboards/ops.yaml")).unwrap();
+    let content =
+        std::fs::read_to_string(Path::new(&d2.worktree_path).join("dashboards/ops.yaml")).unwrap();
     assert!(!content.contains("<<<<<<<"), "{content}");
     assert!(content.contains("Two"));
     // Record still describes the (unchanged) files
@@ -419,13 +510,19 @@ async fn draft_begin_accepts_a_specified_base_revision() {
     let admin = Principal::administrator();
     let base = mgr.active_revision().await.unwrap();
     let d = mgr.draft_begin(&admin).await.unwrap();
-    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops")).unwrap();
+    mgr.draft_update_dashboard(&d.draft_id, &ops_dashboard("Ops"))
+        .unwrap();
     mgr.draft_activate(&d.draft_id, &admin).await.unwrap();
 
     let old = mgr.draft_begin_at(&admin, Some(&base)).await.unwrap();
     assert_eq!(old.base_revision, base);
-    assert!(!Path::new(&old.worktree_path).join("dashboards/ops.yaml").exists());
-    assert!(mgr.draft_begin_at(&admin, Some("not-a-revision")).await.is_err());
+    assert!(!Path::new(&old.worktree_path)
+        .join("dashboards/ops.yaml")
+        .exists());
+    assert!(mgr
+        .draft_begin_at(&admin, Some("not-a-revision"))
+        .await
+        .is_err());
     let _ = ws;
 }
 
@@ -445,8 +542,14 @@ async fn startup_never_resolves_dependencies_implicitly() {
     let mgr = DraftManager::initialize(ws.clone(), data, store, ResourceBudget::default())
         .await
         .unwrap();
-    assert!(!ws.join("packages.lock").exists(), "startup must not write packages.lock");
-    assert!(mgr.startup_warnings().iter().any(|w| w.contains("dependency_update")));
+    assert!(
+        !ws.join("packages.lock").exists(),
+        "startup must not write packages.lock"
+    );
+    assert!(mgr
+        .startup_warnings()
+        .iter()
+        .any(|w| w.contains("dependency_update")));
 
     // A draft with the stale lock fails validation with an actionable error
     let d = mgr.draft_begin(&Principal::administrator()).await.unwrap();
@@ -487,10 +590,23 @@ async fn replacement_instances_are_prepared_before_commit() {
         },
     )
     .unwrap();
-    let err = mgr.draft_activate(&d.draft_id, &admin).await.unwrap_err().to_string();
+    let err = mgr
+        .draft_activate(&d.draft_id, &admin)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("could not be prepared"), "{err}");
-    assert_eq!(mgr.active_revision().await.unwrap(), head, "nothing may be committed");
-    assert!(!mgr.engine().graph.load().instances.contains_key("spin_inst"));
+    assert_eq!(
+        mgr.active_revision().await.unwrap(),
+        head,
+        "nothing may be committed"
+    );
+    assert!(!mgr
+        .engine()
+        .graph
+        .load()
+        .instances
+        .contains_key("spin_inst"));
 }
 
 #[tokio::test]
@@ -513,11 +629,23 @@ async fn downstream_dependents_get_fresh_vms_and_stale_recompute() {
     let act = mgr.draft_activate(&d.draft_id, &admin).await.unwrap();
 
     assert!(act.rebuilt_instances.contains(&"linked_prs".to_string()));
-    assert!(act.rebuilt_instances.contains(&"pr_table_adapter".to_string()));
-    assert!(act.stale_instances.contains(&"pr_table_adapter".to_string()));
-    assert!(act.carried_over_instances.contains(&"pr_trend_adapter".to_string()));
+    assert!(act
+        .rebuilt_instances
+        .contains(&"pr_table_adapter".to_string()));
+    assert!(act
+        .stale_instances
+        .contains(&"pr_table_adapter".to_string()));
+    assert!(act
+        .carried_over_instances
+        .contains(&"pr_trend_adapter".to_string()));
     let new_table_vm = mgr.engine().pool.vm_uid("pr_table_adapter");
-    assert!(new_table_vm.is_some(), "replacement VM prepared before the switch");
+    assert!(
+        new_table_vm.is_some(),
+        "replacement VM prepared before the switch"
+    );
     assert_ne!(new_table_vm.unwrap(), table_vm);
-    assert_eq!(mgr.engine().pool.vm_uid("pr_trend_adapter").unwrap(), trend_vm);
+    assert_eq!(
+        mgr.engine().pool.vm_uid("pr_trend_adapter").unwrap(),
+        trend_vm
+    );
 }

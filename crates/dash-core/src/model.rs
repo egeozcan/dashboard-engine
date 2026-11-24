@@ -515,7 +515,8 @@ impl ConfiguredGraph {
         let mut frontier: Vec<String> = changed.iter().cloned().collect();
         while let Some(cur) = frontier.pop() {
             for (inst_id, inst) in &self.instances {
-                if inst.inputs.values().any(|target| target == &cur) && result.insert(inst_id.clone())
+                if inst.inputs.values().any(|target| target == &cur)
+                    && result.insert(inst_id.clone())
                 {
                     frontier.push(inst_id.clone());
                 }
@@ -548,7 +549,10 @@ mod tests {
         let mut g = ConfiguredGraph::default();
         g.definitions.insert(
             "gh.connector".into(),
-            def("gh", r#"local dash = require("dash"); return dash.connector { id = "gh.connector" }"#),
+            def(
+                "gh",
+                r#"local dash = require("dash"); return dash.connector { id = "gh.connector" }"#,
+            ),
         );
         // `aaa.mock` sorts first but lives in another package.
         g.definitions.insert(
@@ -559,7 +563,10 @@ mod tests {
             "gh.mock".into(),
             def("gh", r#"local dash = require("dash"); return dash.mock { id = "gh.mock", ["for"] = "gh.connector" }"#),
         );
-        assert_eq!(g.find_mock_for("gh.connector").unwrap().manifest.id, "gh.mock");
+        assert_eq!(
+            g.find_mock_for("gh.connector").unwrap().manifest.id,
+            "gh.mock"
+        );
         assert!(g.find_mock_for("other.connector").is_none());
     }
 
@@ -570,17 +577,31 @@ mod tests {
             "eng",
             r#"local dash = require("dash"); return dash.widget_provider { id = "eng.badge", asset = "assets/index.html", props = dash.object { count = dash.integer() } }"#,
         );
-        w.widget_assets.insert("assets/index.html".into(), b"<p>hi</p>".to_vec());
+        w.widget_assets
+            .insert("assets/index.html".into(), b"<p>hi</p>".to_vec());
         g.definitions.insert("eng.badge".into(), w);
         g.definitions.insert(
             "eng.data".into(),
-            def("eng", r#"local dash = require("dash"); return dash.data_provider { id = "eng.data" }"#),
+            def(
+                "eng",
+                r#"local dash = require("dash"); return dash.data_provider { id = "eng.data" }"#,
+            ),
         );
-        assert!(g.check_widget_node("eng.badge", &serde_json::json!({ "count": 3 })).is_ok());
-        assert!(g.check_widget_node("eng.badge", &serde_json::json!({ "count": "x" })).is_err());
-        assert!(g.check_widget_node("eng.data", &serde_json::json!({})).is_err());
-        assert!(g.check_widget_node("nope.widget", &serde_json::json!({})).is_err());
-        let digest = g.definitions["eng.badge"].widget_asset_sha256("assets/index.html").unwrap();
+        assert!(g
+            .check_widget_node("eng.badge", &serde_json::json!({ "count": 3 }))
+            .is_ok());
+        assert!(g
+            .check_widget_node("eng.badge", &serde_json::json!({ "count": "x" }))
+            .is_err());
+        assert!(g
+            .check_widget_node("eng.data", &serde_json::json!({}))
+            .is_err());
+        assert!(g
+            .check_widget_node("nope.widget", &serde_json::json!({}))
+            .is_err());
+        let digest = g.definitions["eng.badge"]
+            .widget_asset_sha256("assets/index.html")
+            .unwrap();
         assert!(digest.starts_with("sha256:") && digest.len() == 71);
     }
 }

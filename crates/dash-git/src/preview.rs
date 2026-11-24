@@ -400,7 +400,9 @@ impl HostBridge for MockTestBridge {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let InputRefSpec::Data { definition, .. } = self.input_ref(input_name)? else {
-            return Err(format!("input '{input_name}' is not a data input; use :call or :invoke"));
+            return Err(format!(
+                "input '{input_name}' is not a data input; use :call or :invoke"
+            ));
         };
         let def_id = definition.as_deref().ok_or_else(|| {
             format!("data input '{input_name}' names no Definition; nothing to resolve in a Definition test")
@@ -410,17 +412,28 @@ impl HostBridge for MockTestBridge {
             .graph
             .definitions
             .get(def_id)
-            .ok_or_else(|| format!("data input '{input_name}' references unknown Definition '{def_id}'"))?
+            .ok_or_else(|| {
+                format!("data input '{input_name}' references unknown Definition '{def_id}'")
+            })?
             .clone();
         if target.manifest.category != DefinitionCategory::DataProvider {
-            return Err(format!("data input '{input_name}' references non-data-provider '{def_id}'"));
+            return Err(format!(
+                "data input '{input_name}' references non-data-provider '{def_id}'"
+            ));
         }
         if let Some(ref q) = target.manifest.query {
             q.validate_value(&params)
                 .map_err(|e| format!("invalid query parameters for '{def_id}': {e}"))?;
         }
         let val = self
-            .run_nested(&target, DefinitionCategory::DataProvider, "query", params, None, None)
+            .run_nested(
+                &target,
+                DefinitionCategory::DataProvider,
+                "query",
+                params,
+                None,
+                None,
+            )
             .await?;
         if let Some(ref out) = target.manifest.output {
             out.validate_value(&val)
@@ -443,7 +456,9 @@ impl HostBridge for MockTestBridge {
             return Err(format!("input '{input_name}' is not a connector input"));
         };
         let conn_id = definition.as_deref().ok_or_else(|| {
-            format!("connector input '{input_name}' names no connector Definition; cannot pick a Mock")
+            format!(
+                "connector input '{input_name}' names no connector Definition; cannot pick a Mock"
+            )
         })?;
         if let Some(conn) = self.shared.graph.definitions.get(conn_id) {
             let spec = conn.manifest.operations.get(operation).ok_or_else(|| {
@@ -498,7 +513,9 @@ impl HostBridge for MockTestBridge {
             .graph
             .definitions
             .get(def_id)
-            .ok_or_else(|| format!("action input '{input_name}' references unknown Definition '{def_id}'"))?
+            .ok_or_else(|| {
+                format!("action input '{input_name}' references unknown Definition '{def_id}'")
+            })?
             .clone();
         if let Some(ref a) = target.manifest.args {
             a.validate_value(&args)
@@ -553,7 +570,8 @@ impl HostBridge for MockTestBridge {
         payload: serde_json::Value,
         durable: bool,
     ) -> Result<(), String> {
-        self.emit_event_versioned(event_type, "1", payload, durable).await
+        self.emit_event_versioned(event_type, "1", payload, durable)
+            .await
     }
 
     async fn emit_event_versioned(
@@ -587,7 +605,11 @@ impl HostBridge for MockTestBridge {
             .state
             .lock()
             .unwrap()
-            .get(&(scope.to_string(), self.caller.manifest.id.clone(), key.to_string()))
+            .get(&(
+                scope.to_string(),
+                self.caller.manifest.id.clone(),
+                key.to_string(),
+            ))
             .cloned()
             .unwrap_or(serde_json::Value::Null))
     }
@@ -599,7 +621,11 @@ impl HostBridge for MockTestBridge {
         value: serde_json::Value,
     ) -> Result<(), String> {
         self.shared.state.lock().unwrap().insert(
-            (scope.to_string(), self.caller.manifest.id.clone(), key.to_string()),
+            (
+                scope.to_string(),
+                self.caller.manifest.id.clone(),
+                key.to_string(),
+            ),
             value,
         );
         Ok(())
@@ -771,8 +797,8 @@ pub async fn run_preview_and_scenarios(
     changed_definitions: Option<&[String]>,
 ) -> Result<PreviewTestReport, GitError> {
     let graph = load_workspace_graph(workspace_dir, data_dir, "preview", 1, true).await?;
-    let preview_store = SqliteStore::open_in_memory()
-        .map_err(|e| GitError::Workspace(e.to_string()))?;
+    let preview_store =
+        SqliteStore::open_in_memory().map_err(|e| GitError::Workspace(e.to_string()))?;
 
     let validation = validate_graph_with_contracts(&graph, &preview_store, true);
     let definition_tests =
@@ -792,7 +818,11 @@ pub async fn run_preview_and_scenarios(
         .map_err(|e| GitError::Workspace(e.to_string()))?;
         let admin = Principal::administrator();
         for dash_id in graph.dashboards.keys() {
-            match render_engine.queries.render_dashboard(dash_id, &admin).await {
+            match render_engine
+                .queries
+                .render_dashboard(dash_id, &admin)
+                .await
+            {
                 Ok(rendered) => {
                     preview_renders.insert(dash_id.clone(), rendered);
                 }
@@ -880,10 +910,7 @@ fn check_assertion_fields(
     .filter(|(_, is_set)| *is_set)
     .map(|(name, _)| name)
     .collect();
-    let unsupported: Vec<&str> = set
-        .into_iter()
-        .filter(|f| !supported.contains(f))
-        .collect();
+    let unsupported: Vec<&str> = set.into_iter().filter(|f| !supported.contains(f)).collect();
     if unsupported.is_empty() {
         Ok(())
     } else {
@@ -936,7 +963,10 @@ fn is_succeeded_execution(v: &serde_json::Value) -> bool {
         && v.get("status").and_then(|x| x.as_str()) == Some("succeeded")
 }
 
-fn find_widget_node<'a>(node: &'a serde_json::Value, widget_id: &str) -> Option<&'a serde_json::Value> {
+fn find_widget_node<'a>(
+    node: &'a serde_json::Value,
+    widget_id: &str,
+) -> Option<&'a serde_json::Value> {
     match node {
         serde_json::Value::Object(obj) => {
             if obj.get("widget_id").and_then(|v| v.as_str()) == Some(widget_id) {
@@ -958,8 +988,12 @@ fn check_widget_assertion(
         .get("adapters")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let node = find_widget_node(&adapters, &wa.widget_id)
-        .ok_or_else(|| format!("step {idx}: no rendered Widget node with widget_id '{}'", wa.widget_id))?;
+    let node = find_widget_node(&adapters, &wa.widget_id).ok_or_else(|| {
+        format!(
+            "step {idx}: no rendered Widget node with widget_id '{}'",
+            wa.widget_id
+        )
+    })?;
     if let Some(ref exp_type) = wa.widget_type {
         let actual = node
             .get("widget_type")
@@ -974,7 +1008,10 @@ fn check_widget_assertion(
         }
     }
     if let Some(ref exp_props) = wa.props {
-        let props = node.get("props").cloned().unwrap_or(serde_json::Value::Null);
+        let props = node
+            .get("props")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         if !json_matches_subset(&props, exp_props) {
             return Err(format!(
                 "step {idx}: widget '{}' props {props} do not contain {exp_props}",
@@ -1138,7 +1175,9 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
             }
         } else if let Some(st) = &step.set_dashboard_state {
             if step_assert.is_some() {
-                return Err(format!("step {idx}: 'set_dashboard_state' steps take no assertions"));
+                return Err(format!(
+                    "step {idx}: 'set_dashboard_state' steps take no assertions"
+                ));
             }
             engine
                 .state
@@ -1207,7 +1246,9 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
             }
         } else if let Some(em) = &step.emit_event {
             if step_assert.is_some() {
-                return Err(format!("step {idx}: 'emit_event' steps take no assertions; follow with process_events"));
+                return Err(format!(
+                    "step {idx}: 'emit_event' steps take no assertions; follow with process_events"
+                ));
             }
             if !engine.graph.load().instances.contains_key(&em.source) {
                 return Err(format!(
@@ -1260,7 +1301,9 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
             }
         } else if let Some(inj) = &step.inject_failure {
             if step_assert.is_some() {
-                return Err(format!("step {idx}: 'inject_failure' steps take no assertions"));
+                return Err(format!(
+                    "step {idx}: 'inject_failure' steps take no assertions"
+                ));
             }
             engine.telemetry.inject_failure(FailureInjectionRule {
                 instance_id: inj.instance.clone(),
@@ -1270,7 +1313,9 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
             });
         } else if let Some(clr) = &step.clear_failure {
             if step_assert.is_some() {
-                return Err(format!("step {idx}: 'clear_failure' steps take no assertions"));
+                return Err(format!(
+                    "step {idx}: 'clear_failure' steps take no assertions"
+                ));
             }
             engine.telemetry.clear_failure(&clr.instance);
         } else if let Some(adv) = &step.advance_time {
@@ -1290,9 +1335,11 @@ async fn execute_scenario(engine: &RuntimeEngine, steps: &[ScenarioStep]) -> Res
 
 fn json_matches_subset(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
     match (haystack, needle) {
-        (serde_json::Value::Object(h), serde_json::Value::Object(n)) => n
-            .iter()
-            .all(|(k, nv)| h.get(k).map(|hv| json_matches_subset(hv, nv)).unwrap_or(false)),
+        (serde_json::Value::Object(h), serde_json::Value::Object(n)) => n.iter().all(|(k, nv)| {
+            h.get(k)
+                .map(|hv| json_matches_subset(hv, nv))
+                .unwrap_or(false)
+        }),
         (a, b) => a == b,
     }
 }
@@ -1306,8 +1353,8 @@ mod mock_test_bridge_tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         let data = tmp.path().join("data");
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center");
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
         crate::packages::copy_tree_excluding_git(&src, &ws).unwrap();
         (tmp, ws, data)
     }
@@ -1322,7 +1369,9 @@ mod mock_test_bridge_tests {
     #[tokio::test]
     async fn definition_tests_reach_mocks_through_connector_and_data_inputs() {
         let (_tmp, ws, data) = fixture_ws();
-        let reports = run_workspace_definition_tests(&ws, &data, None).await.unwrap();
+        let reports = run_workspace_definition_tests(&ws, &data, None)
+            .await
+            .unwrap();
         for r in &reports {
             assert_eq!(r.failed, 0, "definition test failed: {r:?}");
         }
@@ -1333,13 +1382,20 @@ mod mock_test_bridge_tests {
         // data inputs -> providers -> Mocks
         assert_eq!(report_for(&reports, "engineering.linked_prs").passed, 2);
         // adapter -> data provider -> providers -> Mocks
-        assert_eq!(report_for(&reports, "engineering.pr_table_adapter").passed, 2);
+        assert_eq!(
+            report_for(&reports, "engineering.pr_table_adapter").passed,
+            2
+        );
     }
 
     #[tokio::test]
     async fn mock_bridge_captures_contract_events_with_declared_version() {
         let (_tmp, ws, data) = fixture_ws();
-        let graph = Arc::new(load_workspace_graph(&ws, &data, "preview", 1, true).await.unwrap());
+        let graph = Arc::new(
+            load_workspace_graph(&ws, &data, "preview", 1, true)
+                .await
+                .unwrap(),
+        );
         let def = graph.definitions.get("github.merge_pr").unwrap().clone();
         let bridge = Arc::new(MockTestBridge::new(Arc::clone(&graph), "github.merge_pr").unwrap());
         let tests = r#"
@@ -1371,13 +1427,19 @@ end)
     #[tokio::test]
     async fn mock_bridge_rejects_missing_mock_undeclared_ops_and_http() {
         let (_tmp, ws, data) = fixture_ws();
-        let mut graph = load_workspace_graph(&ws, &data, "preview", 1, true).await.unwrap();
+        let mut graph = load_workspace_graph(&ws, &data, "preview", 1, true)
+            .await
+            .unwrap();
         // Remove the github Mock: connector inputs can no longer be resolved.
         graph.definitions.remove("github.mock");
         let graph = Arc::new(graph);
         let bridge = MockTestBridge::new(Arc::clone(&graph), "github.pull_requests").unwrap();
         let err = bridge
-            .call_input("github", "list_prs", serde_json::json!({ "repository": "acme/platform" }))
+            .call_input(
+                "github",
+                "list_prs",
+                serde_json::json!({ "repository": "acme/platform" }),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("no Mock declared"), "{err}");
@@ -1396,7 +1458,10 @@ end)
             .await
             .unwrap_err();
         assert!(err.contains("does not declare"), "{err}");
-        let err = bridge.query_input("nope", serde_json::json!({})).await.unwrap_err();
+        let err = bridge
+            .query_input("nope", serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(err.contains("not declared"), "{err}");
         let err = bridge
             .http_request(HttpHostRequest {
@@ -1431,8 +1496,8 @@ mod tests {
     use super::*;
 
     fn fixture_ws(dst: &Path) {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center");
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
         crate::packages::copy_tree_excluding_git(&src, dst).unwrap();
     }
 
@@ -1442,7 +1507,9 @@ mod tests {
     }
 
     async fn preview_engine(ws: &Path, data: &Path) -> RuntimeEngine {
-        let graph = load_workspace_graph(ws, data, "preview", 1, true).await.unwrap();
+        let graph = load_workspace_graph(ws, data, "preview", 1, true)
+            .await
+            .unwrap();
         RuntimeEngine::new(
             graph,
             SqliteStore::open_in_memory().unwrap(),
@@ -1453,10 +1520,8 @@ mod tests {
 
     #[test]
     fn misspelled_assertion_key_is_rejected_at_parse_time() {
-        let err = parse_steps(
-            "- query: { instance: linked_prs }\n  assert: { lenght: 3 }\n",
-        )
-        .unwrap_err();
+        let err = parse_steps("- query: { instance: linked_prs }\n  assert: { lenght: 3 }\n")
+            .unwrap_err();
         assert!(err.contains("lenght"), "{err}");
         let err = parse_steps("- quer: { instance: linked_prs }\n").unwrap_err();
         assert!(err.contains("quer"), "{err}");
@@ -1505,13 +1570,19 @@ mod tests {
             "- render_dashboard: { dashboard: engineering }\n  assert:\n    widget:\n      - widget_id: pr_table_adapter_pr_table\n        widget_type: dash.chart\n",
         )
         .unwrap();
-        assert!(execute_scenario(&engine, &wrong_type).await.unwrap_err().contains("widget_type"));
+        assert!(execute_scenario(&engine, &wrong_type)
+            .await
+            .unwrap_err()
+            .contains("widget_type"));
 
         let missing = parse_steps(
             "- render_dashboard: { dashboard: engineering }\n  assert:\n    widget:\n      - widget_id: does_not_exist\n",
         )
         .unwrap();
-        assert!(execute_scenario(&engine, &missing).await.unwrap_err().contains("no rendered Widget"));
+        assert!(execute_scenario(&engine, &missing)
+            .await
+            .unwrap_err()
+            .contains("no rendered Widget"));
     }
 
     #[tokio::test]
@@ -1528,7 +1599,12 @@ mod tests {
             .filter(|i| i.category == dash_luau::DefinitionCategory::Automation)
             .find_map(|i| {
                 let def = g.definitions.get(&i.definition)?;
-                let t = def.manifest.triggers.iter().find(|t| t.kind == "event")?.clone();
+                let t = def
+                    .manifest
+                    .triggers
+                    .iter()
+                    .find(|t| t.kind == "event")?
+                    .clone();
                 Some((i.clone(), t))
             })
             .expect("fixture automation with an event trigger");
@@ -1543,12 +1619,16 @@ mod tests {
         let yaml = format!(
             "- emit_event: {{ source: {source}, type: {event_type}, payload: {{ repository: acme/platform, number: 44 }} }}\n- process_events: {{ source: {source} }}\n  assert: {{ transitions: 0 }}\n"
         );
-        execute_scenario(&engine, &parse_steps(&yaml).unwrap()).await.unwrap();
+        execute_scenario(&engine, &parse_steps(&yaml).unwrap())
+            .await
+            .unwrap();
 
         let yaml = format!(
             "- emit_event: {{ source: {source}, type: {event_type}, payload: {{ repository: acme/platform, number: 45 }} }}\n- process_events: {{ source: {source} }}\n  assert: {{ transitions: 1 }}\n"
         );
-        let err = execute_scenario(&engine, &parse_steps(&yaml).unwrap()).await.unwrap_err();
+        let err = execute_scenario(&engine, &parse_steps(&yaml).unwrap())
+            .await
+            .unwrap_err();
         assert!(err.contains("got 0"), "{err}");
     }
 
@@ -1581,7 +1661,10 @@ mod tests {
         let report = run_preview_and_scenarios(&ws, &tmp.path().join("data"), Some(&[]))
             .await
             .unwrap();
-        assert!(report.preview_render_errors.contains_key("engineering"), "{report:?}");
+        assert!(
+            report.preview_render_errors.contains_key("engineering"),
+            "{report:?}"
+        );
         assert!(!report.all_passed);
     }
 
@@ -1590,17 +1673,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
         fixture_ws(&ws);
-        let mut graph = crate::workspace::load_workspace_graph(&ws, &tmp.path().join("data"), "x", 1, true).unwrap();
-        assert!(validate_instance_contracts(&graph).is_empty(), "{:?}", validate_instance_contracts(&graph));
+        let mut graph =
+            crate::workspace::load_workspace_graph(&ws, &tmp.path().join("data"), "x", 1, true)
+                .unwrap();
+        assert!(
+            validate_instance_contracts(&graph).is_empty(),
+            "{:?}",
+            validate_instance_contracts(&graph)
+        );
         let (id, inst) = graph
             .instances
             .iter_mut()
             .find(|(_, i)| !i.secrets.is_empty())
             .unwrap();
         let id = id.clone();
-        inst.secrets.insert("not_declared".into(), "plaintext-token".into());
+        inst.secrets
+            .insert("not_declared".into(), "plaintext-token".into());
         let issues = validate_instance_contracts(&graph);
-        assert!(issues.iter().any(|i| i.code == "UNDECLARED_SECRET_SLOT" && i.target == id));
-        assert!(issues.iter().any(|i| i.code == "INVALID_SECRET_REF" && i.target == id));
+        assert!(issues
+            .iter()
+            .any(|i| i.code == "UNDECLARED_SECRET_SLOT" && i.target == id));
+        assert!(issues
+            .iter()
+            .any(|i| i.code == "INVALID_SECRET_REF" && i.target == id));
     }
 }

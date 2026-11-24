@@ -133,7 +133,8 @@ fn graph() -> ConfiguredGraph {
         ),
     ];
     for (def_id, body) in actions {
-        g.definitions.insert(def_id.into(), action_def(def_id, body));
+        g.definitions
+            .insert(def_id.into(), action_def(def_id, body));
         let inst_id = def_id.trim_start_matches("t.");
         g.instances.insert(
             inst_id.into(),
@@ -160,12 +161,18 @@ async fn failures_after_mutating_calls_are_unknown_not_failed() {
             ..Default::default()
         },
     );
-    let engine =
-        RuntimeEngine::new(g, SqliteStore::open_in_memory().unwrap(), ResourceBudget::default())
-            .unwrap();
+    let engine = RuntimeEngine::new(
+        g,
+        SqliteStore::open_in_memory().unwrap(),
+        ResourceBudget::default(),
+    )
+    .unwrap();
     let admin = Principal::administrator();
     assert_eq!(
-        engine.pool.effective_budget("slow_after_merge").wall_timeout,
+        engine
+            .pool
+            .effective_budget("slow_after_merge")
+            .wall_timeout,
         std::time::Duration::from_millis(150)
     );
 
@@ -182,7 +189,10 @@ async fn failures_after_mutating_calls_are_unknown_not_failed() {
         .invoke("after_read", json!({}), &admin, None, None)
         .await
         .unwrap();
-    assert_eq!(rec.status, "failed", "read-only call is not a side effect: {rec:?}");
+    assert_eq!(
+        rec.status, "failed",
+        "read-only call is not a side effect: {rec:?}"
+    );
 
     let rec = engine
         .actions
@@ -256,7 +266,12 @@ timeout_ms = 9000
     let h = res.overrides_for("history").unwrap();
     assert_eq!(h.timeout_ms, Some(9000));
     assert_eq!(h.memory_limit_mib, Some(16));
-    assert_eq!(res.overrides_for("preview_mock:history").unwrap().timeout_ms, Some(9000));
+    assert_eq!(
+        res.overrides_for("preview_mock:history")
+            .unwrap()
+            .timeout_ms,
+        Some(9000)
+    );
     assert_eq!(res.overrides_for("other").unwrap().timeout_ms, Some(2000));
     assert!(WorkspaceResources::default().overrides_for("x").is_none());
 }
@@ -270,7 +285,11 @@ return dash.data_provider { id = "t.uses_libs", libraries = { "t.missing", "t.co
 "#;
     g.definitions.insert(
         "t.uses_libs".into(),
-        load_def("t", decl, "local R = {}\nfunction R.query(ctx) return {} end\nreturn R"),
+        load_def(
+            "t",
+            decl,
+            "local R = {}\nfunction R.query(ctx) return {} end\nreturn R",
+        ),
     );
     let report = validate_configured_graph(&g, &SqliteStore::open_in_memory().unwrap(), false);
     let issues: Vec<_> = report

@@ -195,9 +195,14 @@ async fn handle_ws_socket(
                 if let Some(prev) = dash_subs.remove(&dashboard_id) {
                     prev.abort();
                 }
-                if let Some(handle) =
-                    subscribe_dashboard(&services, &principal, &out_tx, &dashboards, dashboard_id.clone())
-                        .await
+                if let Some(handle) = subscribe_dashboard(
+                    &services,
+                    &principal,
+                    &out_tx,
+                    &dashboards,
+                    dashboard_id.clone(),
+                )
+                .await
                 {
                     dash_subs.insert(dashboard_id, handle);
                 }
@@ -248,7 +253,10 @@ async fn handle_ws_socket(
                 }
             }
             WsClientMsg::WidgetRequest { envelope } => {
-                match services.dispatch_widget_request_outcome(envelope, &principal).await {
+                match services
+                    .dispatch_widget_request_outcome(envelope, &principal)
+                    .await
+                {
                     Ok(exec) => {
                         let _ = out_tx
                             .send(json!({ "type": "request_result", "execution": exec }))
@@ -464,7 +472,9 @@ async fn forward_query_signals(
             };
             let msg = match latest {
                 Ok(env) => cursor.snapshot_msg(&env, true),
-                Err(err) => json!({ "type": "error", "code": "query_failed", "query_key": qk, "message": err }),
+                Err(err) => {
+                    json!({ "type": "error", "code": "query_failed", "query_key": qk, "message": err })
+                }
             };
             if out.send(msg).await.is_err() {
                 return;
@@ -483,9 +493,7 @@ async fn subscribe_dashboard(
     dashboard_id: String,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let graph = services.graph();
-    if let Err(err) =
-        dash_core::state::authorize_dashboard_read(principal, &graph, &dashboard_id)
-    {
+    if let Err(err) = dash_core::state::authorize_dashboard_read(principal, &graph, &dashboard_id) {
         let _ = out
             .send(json!({ "type": "error", "code": err.code(), "dashboard_id": dashboard_id, "message": err.to_string() }))
             .await;
@@ -605,10 +613,12 @@ mod tests {
     #[test]
     fn delivery_cursor_dedups_identical_snapshots_only() {
         let mut c = DeliveryCursor::default();
-        let env = QueryEnvelope::snapshot("i", "q", 1, 3, QueryStatus::Fresh, None, json!([]), None);
+        let env =
+            QueryEnvelope::snapshot("i", "q", 1, 3, QueryStatus::Fresh, None, json!([]), None);
         let _ = c.snapshot_msg(&env, false);
         assert!(c.is_duplicate_snapshot(&env));
-        let stale = QueryEnvelope::snapshot("i", "q", 1, 3, QueryStatus::Stale, None, json!([]), None);
+        let stale =
+            QueryEnvelope::snapshot("i", "q", 1, 3, QueryStatus::Stale, None, json!([]), None);
         assert!(!c.is_duplicate_snapshot(&stale));
         assert_eq!(c.version, Some(3));
     }
@@ -662,7 +672,10 @@ pub(crate) async fn run_dashboard_subscription(
                 }
             }
             last_render = Some(Instant::now());
-            match services.dashboard_get_for_ui(&dashboard_id, &principal).await {
+            match services
+                .dashboard_get_for_ui(&dashboard_id, &principal)
+                .await
+            {
                 Ok(data) => {
                     last_error = None;
                     let data_txt = data.to_string();
@@ -834,7 +847,8 @@ mod dashboard_subscription_tests {
         let mut saw_state = false;
         for _ in 0..6 {
             let msg = next_render(&mut rx).await;
-            if msg["data"]["rendered"]["dashboard_state"]["selected_repository"] == "acme/payments" {
+            if msg["data"]["rendered"]["dashboard_state"]["selected_repository"] == "acme/payments"
+            {
                 saw_state = true;
                 break;
             }
@@ -856,7 +870,10 @@ mod dashboard_subscription_tests {
                 break;
             }
         }
-        assert!(saw_query, "upstream Query Signal did not trigger a pushed render");
+        assert!(
+            saw_query,
+            "upstream Query Signal did not trigger a pushed render"
+        );
         task.abort();
     }
 
@@ -864,7 +881,12 @@ mod dashboard_subscription_tests {
     async fn dashboard_upstream_instances_follow_adapter_bindings_transitively() {
         let (_tmp, services) = boot_services().await;
         let up = services.dashboard_upstream_instances("engineering");
-        for id in ["pr_table_adapter", "pr_trend_adapter", "linked_prs", "open_prs"] {
+        for id in [
+            "pr_table_adapter",
+            "pr_trend_adapter",
+            "linked_prs",
+            "open_prs",
+        ] {
             assert!(up.contains(id), "missing upstream instance {id}: {up:?}");
         }
         assert!(services.dashboard_upstream_instances("nope").is_empty());

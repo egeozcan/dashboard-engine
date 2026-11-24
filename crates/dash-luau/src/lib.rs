@@ -301,7 +301,8 @@ return R
         let loop_bundle = CompiledInstanceBundle {
             instance_id: "infinite_looper".into(),
             manifest: manifest.clone(),
-            runtime_source: "local R = {}\nfunction R.query(ctx) while true do end end\nreturn R".into(),
+            runtime_source: "local R = {}\nfunction R.query(ctx) while true do end end\nreturn R"
+                .into(),
             config_digest: "c1".into(),
             resolved_libraries: BTreeMap::new(),
         };

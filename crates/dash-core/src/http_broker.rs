@@ -57,7 +57,10 @@ impl HttpBrokerError {
     pub fn is_denial(&self) -> bool {
         matches!(
             self,
-            Self::Auth(_) | Self::PolicyDenied(..) | Self::SsrfBlocked(_) | Self::CredentialError(..)
+            Self::Auth(_)
+                | Self::PolicyDenied(..)
+                | Self::SsrfBlocked(_)
+                | Self::CredentialError(..)
         )
     }
 }
@@ -98,7 +101,9 @@ impl EffectiveNetworkPolicy {
             );
         };
         if !self.requested.allows_host(host) {
-            return Some(format!("host '{host}' is not in the Workspace network allowlist"));
+            return Some(format!(
+                "host '{host}' is not in the Workspace network allowlist"
+            ));
         }
         if !ceiling.allows_host(host) {
             return Some(format!(
@@ -120,7 +125,9 @@ impl EffectiveNetworkPolicy {
             );
         };
         if !self.requested.allows_method(method) {
-            return Some(format!("HTTP method '{method}' is not in the Workspace network policy"));
+            return Some(format!(
+                "HTTP method '{method}' is not in the Workspace network policy"
+            ));
         }
         if !ceiling.allows_method(method) {
             return Some(format!(
@@ -287,7 +294,9 @@ impl HttpBroker {
                 {
                     return Err(HttpBrokerError::CredentialError(
                         cred.secret_name.clone(),
-                        format!("secret access policy does not allow attaching it to host '{host}'"),
+                        format!(
+                            "secret access policy does not allow attaching it to host '{host}'"
+                        ),
                     ));
                 }
                 cred_header = apply_credential(cred, &mut request_url);
@@ -299,7 +308,12 @@ impl HttpBroker {
             };
             let mut builder = client.request(method.clone(), request_url);
             for (k, v) in &req.headers {
-                if is_reserved_request_header(k, cred_header.as_ref(), credential.is_some(), body.is_some()) {
+                if is_reserved_request_header(
+                    k,
+                    cred_header.as_ref(),
+                    credential.is_some(),
+                    body.is_some(),
+                ) {
                     continue;
                 }
                 builder = builder.header(k.as_str(), v.as_str());
@@ -338,7 +352,8 @@ impl HttpBroker {
                         credential_active = false;
                     }
                     let status = resp.status().as_u16();
-                    let not_get_or_head = method != reqwest::Method::GET && method != reqwest::Method::HEAD;
+                    let not_get_or_head =
+                        method != reqwest::Method::GET && method != reqwest::Method::HEAD;
                     if (status == 303 && method != reqwest::Method::HEAD)
                         || ((status == 301 || status == 302) && not_get_or_head)
                     {
@@ -410,12 +425,14 @@ impl HttpBroker {
         connector_inst: &InstanceConfig,
         cred_slot: &str,
     ) -> Result<Credential, HttpBrokerError> {
-        let secret_name = connector_inst.resolved_secret_name(cred_slot).ok_or_else(|| {
-            HttpBrokerError::CredentialError(
-                cred_slot.to_string(),
-                "connector instance has no secret binding for this slot".into(),
-            )
-        })?;
+        let secret_name = connector_inst
+            .resolved_secret_name(cred_slot)
+            .ok_or_else(|| {
+                HttpBrokerError::CredentialError(
+                    cred_slot.to_string(),
+                    "connector instance has no secret binding for this slot".into(),
+                )
+            })?;
         // Runtime intersection with the invoking Principal (§5.1.4): Service principals and Agents
         // need the secret in their ceiling; binding-time checks happen in drafts/activation.
         if !principal.ceiling.allows_secret(&secret_name) {
@@ -561,12 +578,18 @@ fn host_for_policy(url: &Url) -> Result<String, HttpBrokerError> {
         Some(Host::Domain(d)) => Ok(d.to_ascii_lowercase()),
         Some(Host::Ipv4(ip)) => Ok(ip.to_string()),
         Some(Host::Ipv6(ip)) => Ok(ip.to_string()),
-        None => Err(HttpBrokerError::InvalidUrl(url.to_string(), "missing host".into())),
+        None => Err(HttpBrokerError::InvalidUrl(
+            url.to_string(),
+            "missing host".into(),
+        )),
     }
 }
 
 /// Validate scheme, host allowlist and every resolved address; return what to pin the connection to.
-async fn vet_destination(url: &Url, policy: &EffectiveNetworkPolicy) -> Result<Pinned, HttpBrokerError> {
+async fn vet_destination(
+    url: &Url,
+    policy: &EffectiveNetworkPolicy,
+) -> Result<Pinned, HttpBrokerError> {
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
         return Err(HttpBrokerError::PolicyDenied(
@@ -576,7 +599,10 @@ async fn vet_destination(url: &Url, policy: &EffectiveNetworkPolicy) -> Result<P
     }
     let host = host_for_policy(url)?;
     if let Some(reason) = policy.host_denial(&host) {
-        return Err(HttpBrokerError::PolicyDenied(audit_destination(url), reason));
+        return Err(HttpBrokerError::PolicyDenied(
+            audit_destination(url),
+            reason,
+        ));
     }
     let allow_loopback = policy.allow_loopback();
     let port = url.port_or_known_default().unwrap_or(443);
@@ -593,7 +619,9 @@ async fn vet_destination(url: &Url, policy: &EffectiveNetworkPolicy) -> Result<P
         _ => {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
                 .await
-                .map_err(|e| HttpBrokerError::Transport(format!("DNS lookup failed for {host}: {e}")))?
+                .map_err(|e| {
+                    HttpBrokerError::Transport(format!("DNS lookup failed for {host}: {e}"))
+                })?
                 .collect();
             if addrs.is_empty() {
                 return Err(HttpBrokerError::Transport(format!(
@@ -622,7 +650,7 @@ fn ipv4_blocked(v4: Ipv4Addr) -> bool {
         || (o[0] == 198 && (o[1] & 0xfe) == 18)        // 198.18/15 benchmarking
         || (o[0] == 198 && o[1] == 51 && o[2] == 100)  // 198.51.100.0/24 TEST-NET-2
         || (o[0] == 203 && o[1] == 0 && o[2] == 113)   // 203.0.113.0/24 TEST-NET-3
-        || o[0] >= 240                                 // 240/4 reserved (+ broadcast)
+        || o[0] >= 240 // 240/4 reserved (+ broadcast)
 }
 
 /// IPv4 address embedded in an IPv6 form that the OS or a translator would route to IPv4.
@@ -633,11 +661,21 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
     if s[0..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && s[7] <= 1) {
         // ::a.b.c.d (deprecated IPv4-compatible); excludes :: and ::1
-        return Some(Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8));
+        return Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            s[6] as u8,
+            (s[7] >> 8) as u8,
+            s[7] as u8,
+        ));
     }
     if s[0] == 0x2002 {
         // 6to4 2002:a.b.c.d::/48
-        return Some(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
+        return Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ));
     }
     None
 }
@@ -653,7 +691,7 @@ fn ipv6_blocked(v6: Ipv6Addr) -> bool {
         || (s[0] == 0x64 && s[1] == 0xff9b)             // 64:ff9b::/96 and 64:ff9b:1::/48 NAT64
         || (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // 100::/64 discard
         || (s[0] == 0x2001 && s[1] == 0)                // 2001::/32 Teredo (embeds obfuscated IPv4)
-        || (s[0] == 0x2001 && s[1] == 0xdb8)            // 2001:db8::/32 documentation
+        || (s[0] == 0x2001 && s[1] == 0xdb8) // 2001:db8::/32 documentation
 }
 
 fn check_ip_allowed(ip: IpAddr, allow_loopback: bool) -> Result<(), HttpBrokerError> {
@@ -696,18 +734,52 @@ mod tests {
     #[test]
     fn ssrf_blocks_every_private_and_reserved_class() {
         for ip in [
-            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0",
-            "0.1.2.3", "100.64.0.1", "192.0.0.8", "192.0.2.1", "198.18.0.1", "198.19.255.1",
-            "198.51.100.7", "203.0.113.9", "224.0.0.1", "240.0.0.1", "255.255.255.255",
-            "::1", "::", "fc00::1", "fd12::1", "fe80::1", "fec0::1", "ff02::1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "100.64.0.1",
+            "192.0.0.8",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.19.255.1",
+            "198.51.100.7",
+            "203.0.113.9",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
             // IPv4-mapped / compatible / NAT64 / 6to4 / Teredo forms of internal targets
-            "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1", "::127.0.0.1",
-            "64:ff9b::a9fe:a9fe", "64:ff9b:1::1", "2002:7f00:1::1", "2002:0a00:0001::1",
-            "2001:0:4136:e378::1", "2001:db8::1", "100::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",
+            "2002:7f00:1::1",
+            "2002:0a00:0001::1",
+            "2001:0:4136:e378::1",
+            "2001:db8::1",
+            "100::1",
         ] {
             assert!(blocked(ip), "{ip} must be blocked");
         }
-        for ip in ["8.8.8.8", "140.82.112.3", "2606:4700::1111", "::ffff:8.8.8.8", "2002:0808:0808::1"] {
+        for ip in [
+            "8.8.8.8",
+            "140.82.112.3",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+            "2002:0808:0808::1",
+        ] {
             assert!(!blocked(ip), "{ip} must be allowed");
         }
         // Loopback opt-in also covers the mapped form, nothing else.
@@ -735,11 +807,20 @@ mod tests {
         };
         let eff = EffectiveNetworkPolicy::new(&requested, Some(ceiling));
         assert!(eff.allows_host("api.github.com"));
-        assert!(!eff.allows_host("evil.example.net"), "Workspace cannot exceed the ceiling");
-        assert!(!eff.allows_host("github.com"), "*.suffix matches subdomains only");
+        assert!(
+            !eff.allows_host("evil.example.net"),
+            "Workspace cannot exceed the ceiling"
+        );
+        assert!(
+            !eff.allows_host("github.com"),
+            "*.suffix matches subdomains only"
+        );
         assert!(eff.allows_method("get"));
         assert!(!eff.allows_method("POST"));
-        assert!(!eff.allow_loopback(), "loopback needs both the request and the ceiling");
+        assert!(
+            !eff.allow_loopback(),
+            "loopback needs both the request and the ceiling"
+        );
 
         // Empty requested lists deny everything even under a wildcard ceiling.
         let wide = NetworkPolicy {
@@ -750,7 +831,10 @@ mod tests {
         let empty = EffectiveNetworkPolicy::new(&NetworkPolicy::default(), Some(wide));
         assert!(!empty.allows_host("api.github.com"));
         assert!(!empty.allows_method("GET"));
-        assert!(!NetworkPolicy::pattern_list_matches(&["*.github.com".into()], "evilgithub.com"));
+        assert!(!NetworkPolicy::pattern_list_matches(
+            &["*.github.com".into()],
+            "evilgithub.com"
+        ));
     }
 
     fn conn_inst(secret: Option<&str>) -> InstanceConfig {
@@ -826,7 +910,13 @@ mod tests {
         let broker = HttpBroker::new(store.clone()).unwrap();
         let admin = Principal::administrator();
         let err = broker
-            .execute(&admin, &conn_inst(None), None, &loopback_graph(), get_req(format!("http://{addr}/x"), None))
+            .execute(
+                &admin,
+                &conn_inst(None),
+                None,
+                &loopback_graph(),
+                get_req(format!("http://{addr}/x"), None),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, HttpBrokerError::PolicyDenied(..)), "{err}");
@@ -834,7 +924,13 @@ mod tests {
 
         grant_loopback_ceiling(&store);
         let ok = broker
-            .execute(&admin, &conn_inst(None), None, &loopback_graph(), get_req(format!("http://{addr}/x?q=1"), None))
+            .execute(
+                &admin,
+                &conn_inst(None),
+                None,
+                &loopback_graph(),
+                get_req(format!("http://{addr}/x?q=1"), None),
+            )
             .await
             .unwrap();
         assert_eq!(ok.status, 200);
@@ -848,8 +944,10 @@ mod tests {
         assert!(ops.contains(&"denied") && ops.contains(&"ok"));
         let ok_rec = audits.iter().find(|a| a.outcome == "ok").unwrap();
         assert_eq!(ok_rec.target, "gh_conn");
-        assert!(!ok_rec.detail["destination"].as_str().unwrap().contains("q=1"));
-
+        assert!(!ok_rec.detail["destination"]
+            .as_str()
+            .unwrap()
+            .contains("q=1"));
     }
 
     #[tokio::test]
@@ -881,11 +979,14 @@ mod tests {
         let mapped = Url::parse("http://[::ffff:169.254.169.254]/latest/meta-data").unwrap();
         let mut req2 = requested.clone();
         req2.allowed_hosts = vec!["*".into()];
-        let pol = EffectiveNetworkPolicy::new(&req2, Some(NetworkPolicy {
-            allowed_hosts: vec!["*".into()],
-            allowed_methods: vec!["*".into()],
-            allow_loopback_for_tests: true,
-        }));
+        let pol = EffectiveNetworkPolicy::new(
+            &req2,
+            Some(NetworkPolicy {
+                allowed_hosts: vec!["*".into()],
+                allowed_methods: vec!["*".into()],
+                allow_loopback_for_tests: true,
+            }),
+        );
         assert!(matches!(
             vet_destination(&mapped, &pol).await,
             Err(HttpBrokerError::SsrfBlocked(_))
@@ -899,13 +1000,15 @@ mod tests {
     #[tokio::test]
     async fn redirect_logic_on_single_host() {
         // Deterministic variant on one loopback origin pair (127.0.0.1 only).
-        let target = serve(Router::new().route(
-            "/land",
-            get(|headers: HeaderMap| async move {
-                Json(json!({ "auth": echo_auth(&headers, "authorization"), "method": "GET" }))
-            })
-            .post(|| async { Json(json!({ "method": "POST" })) }),
-        ))
+        let target = serve(
+            Router::new().route(
+                "/land",
+                get(|headers: HeaderMap| async move {
+                    Json(json!({ "auth": echo_auth(&headers, "authorization"), "method": "GET" }))
+                })
+                .post(|| async { Json(json!({ "method": "POST" })) }),
+            ),
+        )
         .await;
         let t1 = format!("http://127.0.0.1:{}/land", target.port());
         let t2 = t1.clone();
@@ -927,7 +1030,9 @@ mod tests {
                 )
                 .route(
                     "/same",
-                    get(|| async { (StatusCode::TEMPORARY_REDIRECT, [("location", "/local")]).into_response() }),
+                    get(|| async {
+                        (StatusCode::TEMPORARY_REDIRECT, [("location", "/local")]).into_response()
+                    }),
                 )
                 .route(
                     "/local",
@@ -939,23 +1044,47 @@ mod tests {
         .await;
         let store = SqliteStore::open_in_memory().unwrap();
         grant_loopback_ceiling(&store);
-        store.set_secret("gh", "", "ghp_redirect_secret_2", &[]).unwrap();
+        store
+            .set_secret("gh", "", "ghp_redirect_secret_2", &[])
+            .unwrap();
         let broker = HttpBroker::new(store.clone()).unwrap();
         let admin = Principal::administrator();
         let g = loopback_graph();
 
         // Different port = different origin.
-        let mut req = get_req(format!("http://127.0.0.1:{}/go", origin.port()), Some("auth"));
-        req.headers.insert("Authorization".into(), "Bearer luau-supplied".into());
-        let resp = broker.execute(&admin, &conn_inst(Some("gh")), None, &g, req).await.unwrap();
-        assert_eq!(resp.body["auth"], "", "credential must not follow a cross-origin redirect");
+        let mut req = get_req(
+            format!("http://127.0.0.1:{}/go", origin.port()),
+            Some("auth"),
+        );
+        req.headers
+            .insert("Authorization".into(), "Bearer luau-supplied".into());
+        let resp = broker
+            .execute(&admin, &conn_inst(Some("gh")), None, &g, req)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.body["auth"], "",
+            "credential must not follow a cross-origin redirect"
+        );
         let audits = store.list_audits(5).unwrap();
-        let rec = audits.iter().find(|a| a.operation == "http.request").unwrap();
+        let rec = audits
+            .iter()
+            .find(|a| a.operation == "http.request")
+            .unwrap();
         assert_eq!(rec.detail["credential_attached"], false);
 
         // Same-origin redirect keeps the credential (echo is redacted before reaching Luau).
         let resp = broker
-            .execute(&admin, &conn_inst(Some("gh")), None, &g, get_req(format!("http://127.0.0.1:{}/same", origin.port()), Some("auth")))
+            .execute(
+                &admin,
+                &conn_inst(Some("gh")),
+                None,
+                &g,
+                get_req(
+                    format!("http://127.0.0.1:{}/same", origin.port()),
+                    Some("auth"),
+                ),
+            )
             .await
             .unwrap();
         assert_eq!(resp.body["auth"], "Bearer [REDACTED]");
@@ -967,8 +1096,14 @@ mod tests {
             body: Some(json!({ "merge": true })),
             credential: None,
         };
-        let resp = broker.execute(&admin, &conn_inst(None), None, &g, post_req).await.unwrap();
-        assert_eq!(resp.body["method"], "GET", "303 must switch to GET and drop the body");
+        let resp = broker
+            .execute(&admin, &conn_inst(None), None, &g, post_req)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.body["method"], "GET",
+            "303 must switch to GET and drop the body"
+        );
     }
 
     #[tokio::test]
@@ -992,31 +1127,90 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/echo", addr.port());
 
         store
-            .set_secret_with_policy("basic", "", "me@example.com:tok_basic_1", &[], None, Some("basic"))
+            .set_secret_with_policy(
+                "basic",
+                "",
+                "me@example.com:tok_basic_1",
+                &[],
+                None,
+                Some("basic"),
+            )
             .unwrap();
-        let r = broker.execute(&admin, &conn_inst(Some("basic")), None, &g, get_req(url.clone(), Some("auth"))).await.unwrap();
+        let r = broker
+            .execute(
+                &admin,
+                &conn_inst(Some("basic")),
+                None,
+                &g,
+                get_req(url.clone(), Some("auth")),
+            )
+            .await
+            .unwrap();
         assert_eq!(r.body["auth_seen"], "Basic [REDACTED]");
 
         store
-            .set_secret_with_policy("hdr", "", "key_header_123", &[], None, Some("header:X-API-Key"))
+            .set_secret_with_policy(
+                "hdr",
+                "",
+                "key_header_123",
+                &[],
+                None,
+                Some("header:X-API-Key"),
+            )
             .unwrap();
-        let r = broker.execute(&admin, &conn_inst(Some("hdr")), None, &g, get_req(url.clone(), Some("auth"))).await.unwrap();
+        let r = broker
+            .execute(
+                &admin,
+                &conn_inst(Some("hdr")),
+                None,
+                &g,
+                get_req(url.clone(), Some("auth")),
+            )
+            .await
+            .unwrap();
         assert_eq!(r.body["x_api_key"], "[REDACTED]");
         assert_eq!(r.body["auth_seen"], "");
 
         store
             .set_secret_with_policy("qry", "", "key_query_456", &[], None, Some("query:api_key"))
             .unwrap();
-        let r = broker.execute(&admin, &conn_inst(Some("qry")), None, &g, get_req(format!("{url}?a=1"), Some("auth"))).await.unwrap();
+        let r = broker
+            .execute(
+                &admin,
+                &conn_inst(Some("qry")),
+                None,
+                &g,
+                get_req(format!("{url}?a=1"), Some("auth")),
+            )
+            .await
+            .unwrap();
         assert_eq!(r.body["query"], "a=1&api_key=[REDACTED]");
         let audits = store.list_audits(1).unwrap();
-        assert!(!serde_json::to_string(&audits).unwrap().contains("key_query_456"));
+        assert!(!serde_json::to_string(&audits)
+            .unwrap()
+            .contains("key_query_456"));
 
         // Secret destination policy: credential may only be attached to listed hosts.
         store
-            .set_secret_with_policy("pinned", "", "ghp_pinned_789", &[], Some(&["api.github.com".to_string()]), None)
+            .set_secret_with_policy(
+                "pinned",
+                "",
+                "ghp_pinned_789",
+                &[],
+                Some(&["api.github.com".to_string()]),
+                None,
+            )
             .unwrap();
-        let err = broker.execute(&admin, &conn_inst(Some("pinned")), None, &g, get_req(url.clone(), Some("auth"))).await.unwrap_err();
+        let err = broker
+            .execute(
+                &admin,
+                &conn_inst(Some("pinned")),
+                None,
+                &g,
+                get_req(url.clone(), Some("auth")),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, HttpBrokerError::CredentialError(..)), "{err}");
 
         // A Service principal without the secret in its ceiling is denied at runtime.
@@ -1025,7 +1219,16 @@ mod tests {
             kind: PrincipalKind::ServicePrincipal,
             ceiling: CapabilityCeiling::default(),
         };
-        let err = broker.execute(&sp, &conn_inst(Some("hdr")), None, &g, get_req(url, Some("auth"))).await.unwrap_err();
+        let err = broker
+            .execute(
+                &sp,
+                &conn_inst(Some("hdr")),
+                None,
+                &g,
+                get_req(url, Some("auth")),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, HttpBrokerError::CredentialError(..)));
     }
 
@@ -1033,32 +1236,67 @@ mod tests {
     async fn oversized_responses_are_rejected_while_streaming() {
         let big = || async { "x".repeat(MAX_RESPONSE_BYTES + 10) };
         let streamed = || async {
-            let chunks = (0..20).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'y'; 512 * 1024])));
+            let chunks = (0..20)
+                .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'y'; 512 * 1024])));
             axum::body::Body::from_stream(futures_util::stream::iter(chunks))
         };
-        let addr = serve(Router::new().route("/big", get(big)).route("/stream", get(streamed))).await;
+        let addr = serve(
+            Router::new()
+                .route("/big", get(big))
+                .route("/stream", get(streamed)),
+        )
+        .await;
         let store = SqliteStore::open_in_memory().unwrap();
         grant_loopback_ceiling(&store);
         let broker = HttpBroker::new(store).unwrap();
         let admin = Principal::administrator();
         for path in ["big", "stream"] {
             let err = broker
-                .execute(&admin, &conn_inst(None), None, &loopback_graph(), get_req(format!("http://127.0.0.1:{}/{path}", addr.port()), None))
+                .execute(
+                    &admin,
+                    &conn_inst(None),
+                    None,
+                    &loopback_graph(),
+                    get_req(format!("http://127.0.0.1:{}/{path}", addr.port()), None),
+                )
                 .await
                 .unwrap_err();
-            assert!(matches!(err, HttpBrokerError::ResponseTooLarge), "{path}: {err}");
+            assert!(
+                matches!(err, HttpBrokerError::ResponseTooLarge),
+                "{path}: {err}"
+            );
         }
     }
 
     #[test]
     fn https_downgrade_and_reserved_headers() {
         assert!(is_reserved_request_header("Host", None, false, true));
-        assert!(is_reserved_request_header("Authorization", None, true, true));
+        assert!(is_reserved_request_header(
+            "Authorization",
+            None,
+            true,
+            true
+        ));
         assert!(is_reserved_request_header("Cookie", None, true, true));
-        assert!(!is_reserved_request_header("Authorization", None, false, true));
+        assert!(!is_reserved_request_header(
+            "Authorization",
+            None,
+            false,
+            true
+        ));
         let h = ("x-api-key".to_string(), "v".to_string());
-        assert!(is_reserved_request_header("X-API-Key", Some(&h), true, true));
-        assert!(is_reserved_request_header("content-type", None, false, false));
+        assert!(is_reserved_request_header(
+            "X-API-Key",
+            Some(&h),
+            true,
+            true
+        ));
+        assert!(is_reserved_request_header(
+            "content-type",
+            None,
+            false,
+            false
+        ));
         assert!(!is_reserved_request_header("accept", None, true, false));
     }
 }

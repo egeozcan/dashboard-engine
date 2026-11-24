@@ -270,7 +270,10 @@ impl Telemetry {
             }
         }
         if span.name.starts_with("query:") {
-            let mut lat = self.refresh_latencies.lock().expect("latency mutex poisoned");
+            let mut lat = self
+                .refresh_latencies
+                .lock()
+                .expect("latency mutex poisoned");
             if lat.len() >= MAX_REFRESH_SAMPLES {
                 lat.pop_front();
             }
@@ -293,7 +296,10 @@ impl Telemetry {
 
     /// `(p50, p95)` provider refresh latency in milliseconds over the recent window.
     pub fn refresh_latency_percentiles(&self) -> (Option<i64>, Option<i64>) {
-        let lat = self.refresh_latencies.lock().expect("latency mutex poisoned");
+        let lat = self
+            .refresh_latencies
+            .lock()
+            .expect("latency mutex poisoned");
         if lat.is_empty() {
             return (None, None);
         }
@@ -421,7 +427,8 @@ impl Telemetry {
     }
 
     pub fn inject_failure(&self, rule: FailureInjectionRule) {
-        self.injected_failures.insert(rule.instance_id.clone(), rule);
+        self.injected_failures
+            .insert(rule.instance_id.clone(), rule);
     }
 
     pub fn clear_failure(&self, instance_id: &str) {
@@ -462,8 +469,24 @@ mod tests {
         let trace = Telemetry::new_trace_id();
         let root = t.start_span(&trace, None, "http:POST /mcp", "agt_1");
         let root_id = root.span_id.clone();
-        t.record_span(&trace, Some(&root_id), "query:open_prs", "agt_1", json!({}), "ok", 12);
-        t.record_span(&trace, Some(&root_id), "query:open_prs", "agt_1", json!({}), "ok", 40);
+        t.record_span(
+            &trace,
+            Some(&root_id),
+            "query:open_prs",
+            "agt_1",
+            json!({}),
+            "ok",
+            12,
+        );
+        t.record_span(
+            &trace,
+            Some(&root_id),
+            "query:open_prs",
+            "agt_1",
+            json!({}),
+            "ok",
+            40,
+        );
         root.finish("ok", json!({"principal_kind": "agent"}));
         assert!(t.flush_spans(std::time::Duration::from_secs(5)));
         let stored = store.list_trace_spans(10).unwrap();
@@ -491,7 +514,15 @@ mod tests {
         REQUEST_TRACE
             .scope(ctx.clone(), async move {
                 note_request_principal("agt_9", "agent");
-                t2.record_span("tr_engine_local", None, "query:open_prs", "agt_9", json!({}), "ok", 3);
+                t2.record_span(
+                    "tr_engine_local",
+                    None,
+                    "query:open_prs",
+                    "agt_9",
+                    json!({}),
+                    "ok",
+                    3,
+                );
             })
             .await;
         assert_eq!(ctx.principal(), Some(("agt_9".into(), "agent".into())));

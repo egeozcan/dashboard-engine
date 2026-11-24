@@ -22,11 +22,11 @@ use crate::http_broker::HttpBroker;
 use crate::model::{
     ConfiguredGraph, DashboardAdapterPlacement, DashboardDoc, InstanceConfig, LoadedDefinition,
 };
-use crate::signal::{compute_keyed_delta_inferred, QueryEnvelope, QueryStatus, RetryInfo, SignalHub};
-use crate::state::StateManager;
-use crate::telemetry::{
-    ExecutionGraphEdge, ExecutionGraphNode, ExecutionGraphSnapshot, Telemetry,
+use crate::signal::{
+    compute_keyed_delta_inferred, QueryEnvelope, QueryStatus, RetryInfo, SignalHub,
 };
+use crate::state::StateManager;
+use crate::telemetry::{ExecutionGraphEdge, ExecutionGraphNode, ExecutionGraphSnapshot, Telemetry};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -112,7 +112,9 @@ enum Admission {
     /// Half-open trial execution; closes the breaker on success, reopens it on failure.
     Probe,
     /// Rejected without executing and without counting as a failure.
-    Rejected { until: Option<Instant> },
+    Rejected {
+        until: Option<Instant>,
+    },
 }
 
 /// Cooperative cancellation shared between the engine and a Luau execution (§6.3, ADR-0003).
@@ -462,7 +464,10 @@ impl QueryEngine {
     }
 
     /// Snapshot of cached query entries for one Instance (used by scheduled polling, §6.2).
-    pub fn cached_entries_for_instance(&self, instance_id: &str) -> Vec<(String, CachedQueryEntry)> {
+    pub fn cached_entries_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> Vec<(String, CachedQueryEntry)> {
         let cache = self.cache.lock().unwrap();
         cache
             .iter()
@@ -505,7 +510,12 @@ impl QueryEngine {
         principal: &Principal,
     ) -> Option<String> {
         if inst.definition == "dash.history_series" {
-            return Some(self.compute_query_key(&inst.id, HISTORY_BUILTIN_DIGEST, params, principal));
+            return Some(self.compute_query_key(
+                &inst.id,
+                HISTORY_BUILTIN_DIGEST,
+                params,
+                principal,
+            ));
         }
         graph.definitions.get(&inst.definition).map(|def| {
             self.compute_query_key(&inst.id, &def.manifest.identity_version, params, principal)
@@ -568,8 +578,15 @@ impl QueryEngine {
         principal: &Principal,
         force_refresh: bool,
     ) -> Result<QueryEnvelope, String> {
-        self.query_with_trace(instance_id, params, principal, force_refresh, Vec::new(), None)
-            .await
+        self.query_with_trace(
+            instance_id,
+            params,
+            principal,
+            force_refresh,
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -622,8 +639,13 @@ impl QueryEngine {
             ));
         }
 
-        audited(&self.store, principal, "provider.query", check_provider_access(principal, &inst))
-            .map_err(|e| e.to_string())?;
+        audited(
+            &self.store,
+            principal,
+            "provider.query",
+            check_provider_access(principal, &inst),
+        )
+        .map_err(|e| e.to_string())?;
 
         // Built-in history_series provider (§7.4)
         if inst.definition == "dash.history_series" {
@@ -767,7 +789,9 @@ impl QueryEngine {
                 Ok(Err(_)) => continue,
             }
         }
-        Err(format!("computation for '{instance_id}' aborted repeatedly"))
+        Err(format!(
+            "computation for '{instance_id}' aborted repeatedly"
+        ))
     }
 
     fn next_tick(&self) -> u64 {
@@ -791,7 +815,12 @@ impl QueryEngine {
             .unwrap_or(0)
     }
 
-    fn cache_hit(&self, instance_id: &str, query_key: &str, generation_id: i64) -> Option<QueryEnvelope> {
+    fn cache_hit(
+        &self,
+        instance_id: &str,
+        query_key: &str,
+        generation_id: i64,
+    ) -> Option<QueryEnvelope> {
         let mut cache = self.cache.lock().unwrap();
         let entry = cache.get_mut(query_key)?;
         let age = Utc::now()
@@ -818,7 +847,11 @@ impl QueryEngine {
     }
 
     fn cached_version(&self, query_key: &str) -> Option<u64> {
-        self.cache.lock().unwrap().peek(query_key).map(|e| e.version)
+        self.cache
+            .lock()
+            .unwrap()
+            .peek(query_key)
+            .map(|e| e.version)
     }
 
     /// Built-in history provider: serves only the Instance's configured series, under the
@@ -835,7 +868,10 @@ impl QueryEngine {
             .get("series_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                format!("history_series Instance '{}' has no configured 'series_id'", inst.id)
+                format!(
+                    "history_series Instance '{}' has no configured 'series_id'",
+                    inst.id
+                )
             })?;
         let empty = serde_json::Map::new();
         let obj = match params {
@@ -869,15 +905,18 @@ impl QueryEngine {
         };
         let limit = match obj.get("limit") {
             None | Some(serde_json::Value::Null) => HISTORY_DEFAULT_LIMIT,
-            Some(v) => v
-                .as_u64()
-                .ok_or_else(|| "history_series 'limit' must be a non-negative integer".to_string())?
-                as usize,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                "history_series 'limit' must be a non-negative integer".to_string()
+            })? as usize,
         }
         .min(HISTORY_MAX_LIMIT);
 
         // Reading a series exposes aggregates of its source provider: require authority over it.
-        let source = g.workspace.history.iter().find(|h| h.series_id == series_id);
+        let source = g
+            .workspace
+            .history
+            .iter()
+            .find(|h| h.series_id == series_id);
         match source.and_then(|cfg| g.instances.get(&cfg.instance_id)) {
             Some(src_inst) => audited(
                 &self.store,
@@ -940,7 +979,8 @@ impl QueryEngine {
             path.join(" -> ")
         );
         let trace_id = format!("tr_{}", Uuid::now_v7().simple());
-        self.telemetry.log("error", "query_engine", &principal.id, &trace_id, &msg);
+        self.telemetry
+            .log("error", "query_engine", &principal.id, &trace_id, &msg);
         self.telemetry.record_span(
             &trace_id,
             None,
@@ -1245,7 +1285,10 @@ impl QueryEngine {
         let prev = cache.peek(query_key).cloned();
         // Outdated when a later-started run already committed, the Instance was invalidated
         // (e.g. by an action) after this run started, or an upstream it read has changed since.
-        let outdated = prev.as_ref().map(|p| p.start_tick > start_tick).unwrap_or(false)
+        let outdated = prev
+            .as_ref()
+            .map(|p| p.start_tick > start_tick)
+            .unwrap_or(false)
             || self.instance_invalidation_tick(instance_id) > start_tick
             || upstreams_moved(&cache, observed);
         let version = self.next_version();
@@ -1303,7 +1346,8 @@ impl QueryEngine {
                 self.on_node_evicted(&evicted_key);
             }
         }
-        self.key_invalidated.remove_if(query_key, |_, t| *t < start_tick);
+        self.key_invalidated
+            .remove_if(query_key, |_, t| *t < start_tick);
 
         // Order-preserving keyed delta against the version subscribers hold (the previous
         // entry's version); the row key is inferred (preferring `id`) and carried as `row_key`.
@@ -1496,7 +1540,10 @@ impl QueryEngine {
         .map_err(|e| e.to_string())?;
 
         if let Some(rule) = self.telemetry.take_injected_failure(connector_id) {
-            return Err(format!("injected failure ({}): {}", rule.mode, rule.message));
+            return Err(format!(
+                "injected failure ({}): {}",
+                rule.mode, rule.message
+            ));
         }
 
         // In Preview mode, substitute matching Mock Definition (§10.3)
@@ -1509,10 +1556,9 @@ impl QueryEngine {
             })?;
             (mock_def.clone(), DefinitionCategory::Mock)
         } else {
-            let real_def = g
-                .definitions
-                .get(&conn_inst.definition)
-                .ok_or_else(|| format!("connector definition '{}' missing", conn_inst.definition))?;
+            let real_def = g.definitions.get(&conn_inst.definition).ok_or_else(|| {
+                format!("connector definition '{}' missing", conn_inst.definition)
+            })?;
             (real_def.clone(), DefinitionCategory::Connector)
         };
 
@@ -1532,7 +1578,9 @@ impl QueryEngine {
         let breaker_key = bundle.instance_id.clone();
         let admission = self.breaker_admit(&breaker_key);
         if let Admission::Rejected { .. } = admission {
-            return Err(format!("circuit breaker open for connector '{connector_id}'"));
+            return Err(format!(
+                "circuit breaker open for connector '{connector_id}'"
+            ));
         }
 
         // A signal handed in by a read context is owned by this call: dropping the call cancels
@@ -1652,8 +1700,12 @@ impl QueryEngine {
             .definitions
             .get(&inst.definition)
             .ok_or_else(|| format!("definition '{}' missing", inst.definition))?;
-        let query_key =
-            self.compute_query_key(instance_id, &def.manifest.identity_version, params, principal);
+        let query_key = self.compute_query_key(
+            instance_id,
+            &def.manifest.identity_version,
+            params,
+            principal,
+        );
 
         let start_tick = self.next_tick();
         let commit = self.commit_query_value(
@@ -1886,7 +1938,8 @@ impl QueryEngine {
             self.instance_invalidated.insert(inst_id.clone(), tick);
             // A rebuilt Instance starts with a closed breaker (ADR-0003).
             self.circuit_breakers.remove(inst_id);
-            self.circuit_breakers.remove(&format!("preview_mock:{inst_id}"));
+            self.circuit_breakers
+                .remove(&format!("preview_mock:{inst_id}"));
         }
         {
             let mut cache = self.cache.lock().unwrap();
@@ -2124,7 +2177,10 @@ impl QueryEngine {
     ) -> Option<RetryInfo> {
         let handle = tokio::runtime::Handle::try_current().ok()?;
         let attempt = if bump_attempt {
-            let mut a = self.retry_attempts.entry(job.query_key.clone()).or_insert(0);
+            let mut a = self
+                .retry_attempts
+                .entry(job.query_key.clone())
+                .or_insert(0);
             *a += 1;
             *a
         } else {
@@ -2262,7 +2318,8 @@ impl QueryEngine {
             }));
         }
         for d in diagnostics {
-            self.telemetry.log("warn", "query_engine", &principal.id, "", &d);
+            self.telemetry
+                .log("warn", "query_engine", &principal.id, "", &d);
         }
         self.rendered_widgets
             .insert(dashboard_id.to_string(), (g.generation_id, owners));
@@ -2355,7 +2412,12 @@ impl QueryEngine {
         let inst = g
             .instances
             .get(&placement.adapter_instance)
-            .ok_or_else(|| format!("adapter instance '{}' not found", placement.adapter_instance))?
+            .ok_or_else(|| {
+                format!(
+                    "adapter instance '{}' not found",
+                    placement.adapter_instance
+                )
+            })?
             .clone();
         let def = g
             .definitions
@@ -2363,8 +2425,13 @@ impl QueryEngine {
             .ok_or_else(|| format!("adapter definition '{}' missing", inst.definition))?
             .clone();
 
-        audited(&self.store, principal, "provider.query", check_provider_access(principal, &inst))
-            .map_err(|e| e.to_string())?;
+        audited(
+            &self.store,
+            principal,
+            "provider.query",
+            check_provider_access(principal, &inst),
+        )
+        .map_err(|e| e.to_string())?;
 
         let render_key =
             self.render_key(g, &dash.id, &inst, &def, &placement.query_params, principal);
@@ -2571,25 +2638,27 @@ impl QueryEngine {
             if outdated {
                 None
             } else {
-                Some(renders.push(
-                    job.render_key.clone(),
-                    CachedRender {
-                        dashboard_id: job.dashboard.id.clone(),
-                        adapter_instance: adapter_id.clone(),
-                        query_params: job.query_params.clone(),
-                        principal: job.principal.clone(),
-                        generation_id: job.graph.generation_id,
-                        outcome: outcome.clone(),
-                        computed_at: Utc::now(),
-                        start_tick,
-                        stale: false,
-                        state_reads,
-                        upstreams: upstreams
-                            .iter()
-                            .map(|u| (u.query_key.clone(), u.cached_version))
-                            .collect(),
-                    },
-                ))
+                Some(
+                    renders.push(
+                        job.render_key.clone(),
+                        CachedRender {
+                            dashboard_id: job.dashboard.id.clone(),
+                            adapter_instance: adapter_id.clone(),
+                            query_params: job.query_params.clone(),
+                            principal: job.principal.clone(),
+                            generation_id: job.graph.generation_id,
+                            outcome: outcome.clone(),
+                            computed_at: Utc::now(),
+                            start_tick,
+                            stale: false,
+                            state_reads,
+                            upstreams: upstreams
+                                .iter()
+                                .map(|u| (u.query_key.clone(), u.cached_version))
+                                .collect(),
+                        },
+                    ),
+                )
             }
         };
         let was_written = written.is_some();
@@ -2690,7 +2759,11 @@ fn jittered(d: Duration) -> Duration {
 
 fn retry_delay(attempt: u32) -> Duration {
     let exp = attempt.saturating_sub(1).min(16);
-    jittered(RETRY_BASE_DELAY.saturating_mul(1u32 << exp).min(RETRY_MAX_DELAY))
+    jittered(
+        RETRY_BASE_DELAY
+            .saturating_mul(1u32 << exp)
+            .min(RETRY_MAX_DELAY),
+    )
 }
 
 fn instant_to_utc(at: Instant) -> DateTime<Utc> {
@@ -2747,7 +2820,10 @@ fn annotate_node(
         ));
     }
     owners.insert(widget_id.clone(), adapter_instance.to_string());
-    obj.insert("widget_id".into(), serde_json::Value::String(widget_id.clone()));
+    obj.insert(
+        "widget_id".into(),
+        serde_json::Value::String(widget_id.clone()),
+    );
     obj.remove("layout_override");
     if let Some(ov) = overrides.get(&widget_id) {
         obj.insert(
@@ -2836,11 +2912,12 @@ impl HostBridge for EngineHostBridge {
         input_name: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let target_id = self
-            .caller_inst
-            .inputs
-            .get(input_name)
-            .ok_or_else(|| format!("input '{input_name}' not bound on '{}'", self.caller_inst.id))?;
+        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
+            format!(
+                "input '{input_name}' not bound on '{}'",
+                self.caller_inst.id
+            )
+        })?;
 
         let result = self
             .engine
@@ -2882,10 +2959,12 @@ impl HostBridge for EngineHostBridge {
             Err(e) => {
                 // A failed dependency is still a dependency of this run (§6.1).
                 if let Some(target_inst) = self.graph.instances.get(target_id) {
-                    if let Some(child_qk) =
-                        self.engine
-                            .query_key_for(&self.graph, target_inst, &params, &self.principal)
-                    {
+                    if let Some(child_qk) = self.engine.query_key_for(
+                        &self.graph,
+                        target_inst,
+                        &params,
+                        &self.principal,
+                    ) {
                         self.recorded_deps.lock().unwrap().insert(child_qk);
                     }
                 }
@@ -2900,25 +2979,34 @@ impl HostBridge for EngineHostBridge {
         operation: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let target_id = self
-            .caller_inst
-            .inputs
-            .get(input_name)
-            .ok_or_else(|| format!("input '{input_name}' not bound on '{}'", self.caller_inst.id))?;
+        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
+            format!(
+                "input '{input_name}' not bound on '{}'",
+                self.caller_inst.id
+            )
+        })?;
         let target_inst = self
             .graph
             .instances
             .get(target_id)
             .ok_or_else(|| format!("target instance '{target_id}' not found"))?;
         if target_inst.category != DefinitionCategory::Connector {
-            return Err(format!("call_input expects connector, got '{}'", target_inst.category.as_str()));
+            return Err(format!(
+                "call_input expects connector, got '{}'",
+                target_inst.category.as_str()
+            ));
         }
         // Reads have no side effects (§20): data providers may only call read operations.
         audited(
             &self.engine.store,
             &self.principal,
             "connector.invoke",
-            check_connector_operation_read_only(&self.principal, target_inst, operation, &self.graph),
+            check_connector_operation_read_only(
+                &self.principal,
+                target_inst,
+                operation,
+                &self.graph,
+            ),
         )
         .map_err(|e| e.to_string())?;
         // Read-context connector call: bounded by this execution's deadline, and stopped when
@@ -3036,7 +3124,8 @@ impl HostBridge for EngineHostBridge {
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), String> {
-        if scope == "dashboard" && self.caller_def.manifest.category == DefinitionCategory::Adapter {
+        if scope == "dashboard" && self.caller_def.manifest.category == DefinitionCategory::Adapter
+        {
             return Err("adapters hold no writable state (ADR-0001)".into());
         }
         let owner = self.caller_inst.id.clone();
@@ -3144,7 +3233,13 @@ mod tests {
             .insert(def_id.into(), load_def(&decl, runtime));
         graph.instances.insert(
             inst_id.into(),
-            instance(inst_id, DefinitionCategory::DataProvider, def_id, inputs, json!({})),
+            instance(
+                inst_id,
+                DefinitionCategory::DataProvider,
+                def_id,
+                inputs,
+                json!({}),
+            ),
         );
     }
 
@@ -3177,7 +3272,13 @@ return R
             ..Default::default()
         };
         provider(&mut g, "inst_list", "test.list", &[], LIST_RT);
-        provider(&mut g, "inst_count", "test.count", &[("list", "inst_list")], COUNT_RT);
+        provider(
+            &mut g,
+            "inst_count",
+            "test.count",
+            &[("list", "inst_list")],
+            COUNT_RT,
+        );
         g
     }
 
@@ -3188,7 +3289,9 @@ return R
         let deadline = tokio::time::Instant::now() + within;
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Ok(env)) if env.kind == crate::signal::EnvelopeKind::Snapshot => return Some(env),
+                Ok(Ok(env)) if env.kind == crate::signal::EnvelopeKind::Snapshot => {
+                    return Some(env)
+                }
                 Ok(Ok(_)) => continue,
                 _ => return None,
             }
@@ -3223,12 +3326,23 @@ return R
 
         let second = tokio::time::timeout(
             Duration::from_secs(3),
-            q.join_or_lead(&map, "k", "inst", 0, &WaitCtx::default(), lead(Arc::clone(&runs))),
+            q.join_or_lead(
+                &map,
+                "k",
+                "inst",
+                0,
+                &WaitCtx::default(),
+                lead(Arc::clone(&runs)),
+            ),
         )
         .await
         .expect("follow-up query must not hang after the leader caller was dropped");
         assert_eq!(second.unwrap(), 7);
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "follower joined the running flight");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "follower joined the running flight"
+        );
         assert!(map.is_empty(), "flight entry removed after completion");
     }
 
@@ -3241,24 +3355,34 @@ return R
         let seen = Arc::clone(&observed_cancel);
         let (q1, m1) = (q.clone(), Arc::clone(&map));
         let caller = tokio::spawn(async move {
-            q1.join_or_lead(&m1, "k", "inst", 0, &WaitCtx::default(), move |_t, cancel: CancelSignal| {
-                let seen = Arc::clone(&seen);
-                async move {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => Ok(1u32),
-                        _ = cancel.cancelled() => {
-                            seen.store(true, Ordering::SeqCst);
-                            Err("cancelled".to_string())
+            q1.join_or_lead(
+                &m1,
+                "k",
+                "inst",
+                0,
+                &WaitCtx::default(),
+                move |_t, cancel: CancelSignal| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(10)) => Ok(1u32),
+                            _ = cancel.cancelled() => {
+                                seen.store(true, Ordering::SeqCst);
+                                Err("cancelled".to_string())
+                            }
                         }
                     }
-                }
-            })
+                },
+            )
             .await
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         caller.abort();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(observed_cancel.load(Ordering::SeqCst), "unused computation cancelled after grace");
+        assert!(
+            observed_cancel.load(Ordering::SeqCst),
+            "unused computation cancelled after grace"
+        );
         assert!(map.is_empty());
     }
 
@@ -3279,12 +3403,20 @@ return R
         tokio::time::sleep(Duration::from_millis(20)).await;
         let invalidated_at = q.next_tick();
         let fresh = q
-            .join_or_lead(&map, "k", "inst", invalidated_at, &WaitCtx::default(), |_t, _c| async {
-                Ok::<u32, String>(2)
-            })
+            .join_or_lead(
+                &map,
+                "k",
+                "inst",
+                invalidated_at,
+                &WaitCtx::default(),
+                |_t, _c| async { Ok::<u32, String>(2) },
+            )
             .await
             .unwrap();
-        assert_eq!(fresh, 2, "post-invalidation caller starts a new computation");
+        assert_eq!(
+            fresh, 2,
+            "post-invalidation caller starts a new computation"
+        );
         assert_eq!(old.await.unwrap().unwrap(), 1);
         assert!(map.is_empty());
     }
@@ -3293,7 +3425,10 @@ return R
     async fn outdated_leader_result_is_not_cached_as_fresh() {
         let (_e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let first = q.query("inst_list", json!({}), &admin, false).await.unwrap();
+        let first = q
+            .query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
         let qk = first.query_key.clone();
 
         // A run that started before an invalidation finishes afterwards.
@@ -3320,7 +3455,10 @@ return R
         assert!(!commit.written);
         assert_eq!(commit.snapshot.status, QueryStatus::Stale);
         let after = q.cache.lock().unwrap().peek(&qk).cloned().unwrap();
-        assert_eq!(after.value, current.value, "pre-invalidation data must not overwrite the cache");
+        assert_eq!(
+            after.value, current.value,
+            "pre-invalidation data must not overwrite the cache"
+        );
         assert_eq!(after.version, current.version);
     }
 
@@ -3330,7 +3468,9 @@ return R
     async fn open_breaker_rejections_do_not_extend_window_and_probe_closes_it() {
         let (e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        q.query("inst_list", json!({}), &admin, false).await.unwrap();
+        q.query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
         e.telemetry.inject_failure(FailureInjectionRule {
             instance_id: "inst_list".into(),
             mode: "error".into(),
@@ -3342,7 +3482,12 @@ return R
             assert_eq!(env.status, QueryStatus::Stale);
         }
         assert!(q.circuit_open("inst_list"));
-        let opened_until = q.circuit_breakers.get("inst_list").unwrap().open_until.unwrap();
+        let opened_until = q
+            .circuit_breakers
+            .get("inst_list")
+            .unwrap()
+            .open_until
+            .unwrap();
 
         for _ in 0..10 {
             let env = q.query("inst_list", json!({}), &admin, true).await.unwrap();
@@ -3351,8 +3496,15 @@ return R
         }
         {
             let st = q.circuit_breakers.get("inst_list").unwrap();
-            assert_eq!(st.open_until, Some(opened_until), "rejections must not push the window");
-            assert_eq!(st.consecutive_failures, BREAKER_THRESHOLD, "rejections are not failures");
+            assert_eq!(
+                st.open_until,
+                Some(opened_until),
+                "rejections must not push the window"
+            );
+            assert_eq!(
+                st.consecutive_failures, BREAKER_THRESHOLD,
+                "rejections are not failures"
+            );
         }
 
         // Window elapsed: exactly one probe runs; success closes the breaker.
@@ -3370,7 +3522,10 @@ return R
         for _ in 0..BREAKER_THRESHOLD {
             q.breaker_failure("x");
         }
-        assert!(matches!(q.breaker_admit("x"), Admission::Rejected { until: Some(_) }));
+        assert!(matches!(
+            q.breaker_admit("x"),
+            Admission::Rejected { until: Some(_) }
+        ));
         q.circuit_breakers.get_mut("x").unwrap().open_until = Some(Instant::now());
         assert_eq!(q.breaker_admit("x"), Admission::Probe);
         assert_eq!(q.breaker_admit("x"), Admission::Rejected { until: None });
@@ -3402,7 +3557,10 @@ return R
     async fn upstream_push_recomputes_subscribed_dependent() {
         let (_e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let count = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let count = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         assert_eq!(count.value.as_ref().unwrap()["count"], 1);
         let mut rx = q.signals().subscribe_stream(&count.query_key);
 
@@ -3424,11 +3582,22 @@ return R
     async fn unsubscribed_dependent_is_marked_stale_on_upstream_change() {
         let (_e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let count = q.query("inst_count", json!({}), &admin, false).await.unwrap();
-        q.push_query_value("inst_list", &json!({}), &admin, json!([{"id": "1"}, {"id": "2"}]))
+        let count = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
             .unwrap();
+        q.push_query_value(
+            "inst_list",
+            &json!({}),
+            &admin,
+            json!([{"id": "1"}, {"id": "2"}]),
+        )
+        .unwrap();
         // Not subscribed: no background recompute, but the next read must not serve the old value.
-        let again = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let again = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         assert_eq!(again.value.unwrap()["count"], 2);
         assert!(again.version > count.version);
     }
@@ -3446,8 +3615,20 @@ return R
             &[],
             r#"local R = {}; function R.query(ctx) return ctx.state:get("target") or "a" end; return R"#,
         );
-        provider(&mut g, "inst_a", "test.a", &[], r#"local R = {}; function R.query(ctx) return { 1, 2 } end; return R"#);
-        provider(&mut g, "inst_b", "test.b", &[], r#"local R = {}; function R.query(ctx) return { 10, 20, 30 } end; return R"#);
+        provider(
+            &mut g,
+            "inst_a",
+            "test.a",
+            &[],
+            r#"local R = {}; function R.query(ctx) return { 1, 2 } end; return R"#,
+        );
+        provider(
+            &mut g,
+            "inst_b",
+            "test.b",
+            &[],
+            r#"local R = {}; function R.query(ctx) return { 10, 20, 30 } end; return R"#,
+        );
         provider(
             &mut g,
             "inst_router",
@@ -3465,7 +3646,10 @@ return R
         );
         let (e, q) = engine_for(g, ResourceBudget::default());
         let admin = Principal::administrator();
-        let r = q.query("inst_router", json!({}), &admin, false).await.unwrap();
+        let r = q
+            .query("inst_router", json!({}), &admin, false)
+            .await
+            .unwrap();
         assert_eq!(r.value.as_ref().unwrap().as_array().unwrap().len(), 2);
         let mut rx = q.signals().subscribe_stream(&r.query_key);
 
@@ -3474,7 +3658,9 @@ return R
             .set_state("instance", "inst_sw", "target", 1, 1, json!("b"), None)
             .unwrap();
         q.query("inst_sw", json!({}), &admin, true).await.unwrap();
-        let switched = next_snapshot(&mut rx, Duration::from_secs(3)).await.unwrap();
+        let switched = next_snapshot(&mut rx, Duration::from_secs(3))
+            .await
+            .unwrap();
         assert_eq!(switched.value.unwrap().as_array().unwrap().len(), 3);
 
         let qk_a = key_of(&q, "inst_a", &json!({}), &admin);
@@ -3482,14 +3668,19 @@ return R
         // Updates of the old upstream no longer trigger the router.
         q.push_query_value("inst_a", &json!({}), &admin, json!([1, 2, 3, 4]))
             .unwrap();
-        assert!(next_snapshot(&mut rx, Duration::from_millis(300)).await.is_none());
+        assert!(next_snapshot(&mut rx, Duration::from_millis(300))
+            .await
+            .is_none());
     }
 
     #[tokio::test]
     async fn upstream_change_observed_during_dependent_run_does_not_invalidate_it() {
         let (_e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let first = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let first = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         // The upstream must recompute inside the dependent's run (e.g. its TTL lapsed) and
         // returns a changed value there.
         let qk_list = key_of(&q, "inst_list", &json!({}), &admin);
@@ -3499,9 +3690,19 @@ return R
             e.stale = true;
             e.value = json!([]);
         }
-        let second = q.query("inst_count", json!({}), &admin, true).await.unwrap();
-        assert_eq!(second.status, QueryStatus::Fresh, "dependent read the new upstream value");
-        let hit = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let second = q
+            .query("inst_count", json!({}), &admin, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status,
+            QueryStatus::Fresh,
+            "dependent read the new upstream value"
+        );
+        let hit = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         assert_eq!(hit.version, second.version, "result was cached");
         assert!(second.version > first.version);
     }
@@ -3510,7 +3711,10 @@ return R
     async fn dependent_result_is_not_cached_when_its_upstream_moved_meanwhile() {
         let (_e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let list = q.query("inst_list", json!({}), &admin, false).await.unwrap();
+        let list = q
+            .query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
         let observed = vec![UpstreamObservation {
             query_key: list.query_key.clone(),
             status: QueryStatus::Fresh,
@@ -3518,7 +3722,8 @@ return R
             cached_version: Some(list.version),
         }];
         let start = q.next_tick();
-        q.push_query_value("inst_list", &json!({}), &admin, json!([])).unwrap();
+        q.push_query_value("inst_list", &json!({}), &admin, json!([]))
+            .unwrap();
         let g = q.graph();
         let def = g.definitions["test.count"].clone();
         let qk_count = key_of(&q, "inst_count", &json!({}), &admin);
@@ -3536,7 +3741,10 @@ return R
             &observed,
             true,
         );
-        assert!(!commit.written, "a value computed over a superseded upstream is not cached");
+        assert!(
+            !commit.written,
+            "a value computed over a superseded upstream is not cached"
+        );
     }
 
     // ---- query-8: staleness flows through ctx:await ----
@@ -3545,7 +3753,10 @@ return R
     async fn dependent_over_stale_upstream_reports_stale_with_last_success_time() {
         let (e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let list = q.query("inst_list", json!({}), &admin, false).await.unwrap();
+        let list = q
+            .query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
         e.telemetry.inject_failure(FailureInjectionRule {
             instance_id: "inst_list".into(),
             mode: "error".into(),
@@ -3554,13 +3765,22 @@ return R
         });
         let stale_list = q.query("inst_list", json!({}), &admin, true).await.unwrap();
         assert_eq!(stale_list.status, QueryStatus::Stale);
-        assert_eq!(stale_list.updated_at, list.updated_at, "stale value keeps its last success time");
+        assert_eq!(
+            stale_list.updated_at, list.updated_at,
+            "stale value keeps its last success time"
+        );
 
-        let count = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let count = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         assert_eq!(count.status, QueryStatus::Stale);
         assert_eq!(count.updated_at, list.updated_at);
         // Cache hits keep the derived status.
-        let hit = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let hit = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         assert_eq!(hit.status, QueryStatus::Stale);
     }
 
@@ -3570,7 +3790,10 @@ return R
     async fn versions_stay_monotonic_across_stale_transition_and_eviction() {
         let (e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let v1 = q.query("inst_list", json!({}), &admin, false).await.unwrap();
+        let v1 = q
+            .query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
         e.telemetry.inject_failure(FailureInjectionRule {
             instance_id: "inst_list".into(),
             mode: "error".into(),
@@ -3578,10 +3801,19 @@ return R
             remaining: Some(1),
         });
         let stale = q.query("inst_list", json!({}), &admin, true).await.unwrap();
-        assert!(stale.version > v1.version, "fresh -> stale transition gets a new version");
+        assert!(
+            stale.version > v1.version,
+            "fresh -> stale transition gets a new version"
+        );
         q.cache.lock().unwrap().pop(&v1.query_key); // simulate LRU eviction
-        let again = q.query("inst_list", json!({}), &admin, false).await.unwrap();
-        assert!(again.version > stale.version, "no version reset after eviction");
+        let again = q
+            .query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
+        assert!(
+            again.version > stale.version,
+            "no version reset after eviction"
+        );
     }
 
     #[test]
@@ -3597,7 +3829,10 @@ return R
         hub.publish_query(QueryEnvelope::delta("i", "k", 1, 4, 5, None, vec![]));
         assert_eq!(watch.borrow().as_ref().unwrap().version, 5);
         assert_eq!(rx.try_recv().unwrap().version, 5);
-        assert!(rx.try_recv().is_err(), "older snapshot and stale delta were dropped");
+        assert!(
+            rx.try_recv().is_err(),
+            "older snapshot and stale delta were dropped"
+        );
         assert_eq!(hub.subscriber_count("k"), 2);
         assert_eq!(hub.subscriber_count("other"), 0);
     }
@@ -3608,7 +3843,10 @@ return R
     async fn failing_subscribed_query_is_retried_in_background() {
         let (e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let first = q.query("inst_list", json!({}), &admin, false).await.unwrap();
+        let first = q
+            .query("inst_list", json!({}), &admin, false)
+            .await
+            .unwrap();
         let mut rx = q.signals().subscribe_stream(&first.query_key);
         e.telemetry.inject_failure(FailureInjectionRule {
             instance_id: "inst_list".into(),
@@ -3617,7 +3855,10 @@ return R
             remaining: Some(1),
         });
         let stale = q.query("inst_list", json!({}), &admin, true).await.unwrap();
-        let retry = stale.retry.clone().expect("retry metadata on stale envelope");
+        let retry = stale
+            .retry
+            .clone()
+            .expect("retry metadata on stale envelope");
         assert_eq!(retry.attempt, 1);
         assert!(retry.next_retry_at.is_some());
         assert!(!retry.circuit_open);
@@ -3656,7 +3897,10 @@ return R
         provider(&mut g, "inst_y", "test.y", &[("x", "inst_x")], &rt("x"));
         let (e, q) = engine_for(g, ResourceBudget::default());
         let admin = Principal::administrator();
-        let err = q.query("inst_x", json!({}), &admin, false).await.unwrap_err();
+        let err = q
+            .query("inst_x", json!({}), &admin, false)
+            .await
+            .unwrap_err();
         assert!(err.contains("inst_x -> inst_y -> inst_x"), "{err}");
         let spans = e.telemetry.recent_spans(50);
         assert!(spans
@@ -3664,17 +3908,29 @@ return R
             .any(|s| s.attributes.get("cycle_path").is_some() && s.status == "error"));
         let qk_x = key_of(&q, "inst_x", &json!({}), &admin);
         let qk_y = key_of(&q, "inst_y", &json!({}), &admin);
-        assert!(q.recorded_dependencies(&qk_x).contains(&qk_y), "failed run's edges are recorded");
+        assert!(
+            q.recorded_dependencies(&qk_x).contains(&qk_y),
+            "failed run's edges are recorded"
+        );
     }
 
     #[tokio::test]
     async fn execution_graph_reports_per_node_subscribers() {
         let (_e, q) = engine_for(list_and_count_graph(), ResourceBudget::default());
         let admin = Principal::administrator();
-        let count = q.query("inst_count", json!({}), &admin, false).await.unwrap();
+        let count = q
+            .query("inst_count", json!({}), &admin, false)
+            .await
+            .unwrap();
         let _rx = q.signals().subscribe_stream(&count.query_key);
         let snap = q.execution_graph_snapshot();
-        let node = |k: &str| snap.nodes.iter().find(|n| n.query_key == k).unwrap().clone();
+        let node = |k: &str| {
+            snap.nodes
+                .iter()
+                .find(|n| n.query_key == k)
+                .unwrap()
+                .clone()
+        };
         assert_eq!(node(&count.query_key).subscribers, 1);
         let qk_list = key_of(&q, "inst_list", &json!({}), &admin);
         assert_eq!(node(&qk_list).subscribers, 0);
@@ -3742,7 +3998,10 @@ return R
         tokio::time::sleep(Duration::from_millis(100)).await;
         caller.abort();
         while !q.in_flight.is_empty() {
-            assert!(started.elapsed() < Duration::from_secs(10), "VM was not cancelled");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "VM was not cancelled"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(e
@@ -3750,7 +4009,10 @@ return R
             .recent_spans(20)
             .iter()
             .any(|s| s.name == "query:inst_spin" && s.status == "cancelled"));
-        assert!(q.circuit_breakers.get("inst_spin").is_none(), "cancellation is not a failure");
+        assert!(
+            q.circuit_breakers.get("inst_spin").is_none(),
+            "cancellation is not a failure"
+        );
     }
 
     // ---- hist-1: history series authority and budget ----
@@ -3794,7 +4056,10 @@ return R
             },
         };
         let denied = q.query("hist", json!({}), &agent(&["hist"]), false).await;
-        assert!(denied.is_err(), "reading a series requires authority over its source provider");
+        assert!(
+            denied.is_err(),
+            "reading a series requires authority over its source provider"
+        );
         let ok = q
             .query(
                 "hist",
@@ -3843,7 +4108,10 @@ return R
         let mut got = Vec::new();
         ids(&out, &mut got);
         assert_eq!(got, vec!["a_root", "a_t", "a_root/1", "a_root/2"]);
-        assert!(out.get("layout_override").is_none(), "adapter cannot inject layout overrides");
+        assert!(
+            out.get("layout_override").is_none(),
+            "adapter cannot inject layout overrides"
+        );
         assert_eq!(diags.len(), 2, "keyless nodes are reported");
         assert!(owners.values().all(|o| o == "a"));
     }
@@ -3858,8 +4126,14 @@ return R
 
         // Ambiguous `_` joins across Adapters of one dashboard are detected, not merged.
         let mut owners = HashMap::new();
-        annotate_widget_ids(json!({ "key": "b_c" }), "a", &overrides, &mut owners, &mut Vec::new())
-            .unwrap();
+        annotate_widget_ids(
+            json!({ "key": "b_c" }),
+            "a",
+            &overrides,
+            &mut owners,
+            &mut Vec::new(),
+        )
+        .unwrap();
         let err = annotate_widget_ids(
             json!({ "key": "c" }),
             "a_b",
@@ -3876,12 +4150,18 @@ return R
         let overrides = BTreeMap::new();
         let a = json!({ "key": "root", "children": [{ "key": "x" }, { "key": "y" }] });
         let b = json!({ "key": "root", "children": [{ "key": "y" }, { "key": "x" }] });
-        let ta = annotate_widget_ids(a, "ad", &overrides, &mut HashMap::new(), &mut Vec::new())
-            .unwrap();
-        let tb = annotate_widget_ids(b, "ad", &overrides, &mut HashMap::new(), &mut Vec::new())
-            .unwrap();
-        assert_eq!(ta["children"][0]["widget_id"], tb["children"][1]["widget_id"]);
-        assert_eq!(ta["children"][1]["widget_id"], tb["children"][0]["widget_id"]);
+        let ta =
+            annotate_widget_ids(a, "ad", &overrides, &mut HashMap::new(), &mut Vec::new()).unwrap();
+        let tb =
+            annotate_widget_ids(b, "ad", &overrides, &mut HashMap::new(), &mut Vec::new()).unwrap();
+        assert_eq!(
+            ta["children"][0]["widget_id"],
+            tb["children"][1]["widget_id"]
+        );
+        assert_eq!(
+            ta["children"][1]["widget_id"],
+            tb["children"][0]["widget_id"]
+        );
     }
 
     // ---- state-1 / state-8 / query-m1: Adapter renders ----
@@ -3912,7 +4192,8 @@ end
 return R
 "#
         );
-        g.definitions.insert("test.adapter".into(), load_def(&decl, &rt));
+        g.definitions
+            .insert("test.adapter".into(), load_def(&decl, &rt));
         g.instances.insert(
             "adp".into(),
             instance(
@@ -3997,14 +4278,27 @@ return R
         assert_eq!(calls(&cached), 1, "second render served from cache");
 
         e.state
-            .set("dashboard", "alpha", "selected_repository", 1, 1, json!("acme/new"), None)
+            .set(
+                "dashboard",
+                "alpha",
+                "selected_repository",
+                1,
+                1,
+                json!("acme/new"),
+                None,
+            )
             .unwrap();
         let after_state = q.render_dashboard("alpha", &admin).await.unwrap();
         assert_eq!(calls(&after_state), 2);
         assert_eq!(props(&after_state)["repo"], "acme/new");
 
-        q.push_query_value("inst_list", &json!({}), &admin, json!([{"id": "1"}, {"id": "2"}]))
-            .unwrap();
+        q.push_query_value(
+            "inst_list",
+            &json!({}),
+            &admin,
+            json!([{"id": "1"}, {"id": "2"}]),
+        )
+        .unwrap();
         let after_push = q.render_dashboard("alpha", &admin).await.unwrap();
         assert_eq!(calls(&after_push), 3);
         assert_eq!(props(&after_push)["rows"], 2);
@@ -4038,7 +4332,10 @@ return R
                 .as_deref(),
             Some("adp")
         );
-        assert_eq!(q.widget_owner("alpha", "adp_table", &admin).await.unwrap(), None);
+        assert_eq!(
+            q.widget_owner("alpha", "adp_table", &admin).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -4056,7 +4353,13 @@ return R
         );
         g.instances.insert(
             "spin".into(),
-            instance("spin", DefinitionCategory::Adapter, "test.spin_adapter", &[], json!({})),
+            instance(
+                "spin",
+                DefinitionCategory::Adapter,
+                "test.spin_adapter",
+                &[],
+                json!({}),
+            ),
         );
         g.dashboards.insert(
             "d".into(),
@@ -4085,8 +4388,14 @@ return R
             assert!(err.contains("timed out"), "{err}");
         }
         let err = q.render_dashboard("d", &admin).await.unwrap_err();
-        assert!(err.contains("circuit breaker open for adapter 'spin'"), "{err}");
+        assert!(
+            err.contains("circuit breaker open for adapter 'spin'"),
+            "{err}"
+        );
         q.mark_generation_stale(&BTreeSet::from(["spin".to_string()]), 2);
-        assert!(!q.circuit_open("spin"), "rebuilt Instance starts with a closed breaker");
+        assert!(
+            !q.circuit_open("spin"),
+            "rebuilt Instance starts with a closed breaker"
+        );
     }
 }

@@ -150,7 +150,11 @@ impl WidgetRequestOutcome {
 
     /// Legacy record shape for callers of [`ActionManager::dispatch_widget_request`]. A refresh is
     /// not persisted as an execution; its `execution_id` is prefixed `req_` and is not inspectable.
-    pub fn into_legacy_record(self, principal: &Principal, payload: serde_json::Value) -> ActionExecutionRecord {
+    pub fn into_legacy_record(
+        self,
+        principal: &Principal,
+        payload: serde_json::Value,
+    ) -> ActionExecutionRecord {
         match self {
             Self::Action(rec) => rec,
             Self::Refreshed {
@@ -233,7 +237,8 @@ struct SideEffectTracker {
 
 impl SideEffectTracker {
     fn side_effects_started(&self) -> bool {
-        self.writes_started.load(Ordering::SeqCst) > 0 || self.nested_started.load(Ordering::SeqCst) > 0
+        self.writes_started.load(Ordering::SeqCst) > 0
+            || self.nested_started.load(Ordering::SeqCst) > 0
     }
 
     fn uncertain(&self) -> Option<String> {
@@ -355,8 +360,9 @@ impl ActionManager {
         action_instance: &'a str,
         args: serde_json::Value,
         principal: &'a Principal,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<DryRunReport, String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<DryRunReport, String>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let g = self.graph.load_full();
             let inst = g
@@ -365,7 +371,9 @@ impl ActionManager {
                 .ok_or_else(|| format!("action instance '{action_instance}' not found"))?
                 .clone();
             if inst.category != DefinitionCategory::ActionProvider {
-                return Err(format!("instance '{action_instance}' is not an action_provider"));
+                return Err(format!(
+                    "instance '{action_instance}' is not an action_provider"
+                ));
             }
             audited(
                 &self.store,
@@ -406,7 +414,14 @@ impl ActionManager {
                     supported: false,
                     trace_id: Some(trace_id.clone()),
                 };
-                self.record_dry_run_span(&trace_id, action_instance, principal, &report, "ok", started);
+                self.record_dry_run_span(
+                    &trace_id,
+                    action_instance,
+                    principal,
+                    &report,
+                    "ok",
+                    started,
+                );
                 return Ok(report);
             };
 
@@ -493,7 +508,14 @@ impl ActionManager {
                 supported: true,
                 trace_id: Some(trace_id.clone()),
             };
-            self.record_dry_run_span(&trace_id, action_instance, principal, &report, "ok", started);
+            self.record_dry_run_span(
+                &trace_id,
+                action_instance,
+                principal,
+                &report,
+                "ok",
+                started,
+            );
             Ok(report)
         })
     }
@@ -566,7 +588,9 @@ impl ActionManager {
                 .ok_or_else(|| format!("action instance '{action_instance}' not found"))?
                 .clone();
             if inst.category != DefinitionCategory::ActionProvider {
-                return Err(format!("instance '{action_instance}' is not an action_provider"));
+                return Err(format!(
+                    "instance '{action_instance}' is not an action_provider"
+                ));
             }
 
             // 1. Validate authority (auditing denials, including nested ones, §9.2)
@@ -816,21 +840,19 @@ impl ActionManager {
         let duration_ms = started_instant.elapsed().as_millis() as i64;
         let finished_at = Utc::now().to_rfc3339();
 
-        let applied = self
-            .store
-            .transition_action_execution(
-                &execution_id,
-                &["running"],
-                ActionTransition {
-                    status: classified.status,
-                    result: classified.result.clone(),
-                    reason: classified.reason.as_deref(),
-                    retry_safe: classified.retry_safe,
-                    reconcile_attempts: 0,
-                    finished_at: Some(&finished_at),
-                    duration_ms: Some(duration_ms),
-                },
-            );
+        let applied = self.store.transition_action_execution(
+            &execution_id,
+            &["running"],
+            ActionTransition {
+                status: classified.status,
+                result: classified.result.clone(),
+                reason: classified.reason.as_deref(),
+                retry_safe: classified.retry_safe,
+                reconcile_attempts: 0,
+                finished_at: Some(&finished_at),
+                duration_ms: Some(duration_ms),
+            },
+        );
         self.cancel_flags.remove(&execution_id);
         if !applied.map_err(|e| e.to_string())? {
             // Another actor (e.g. shutdown recovery) already moved the record; keep its outcome.
@@ -866,7 +888,11 @@ impl ActionManager {
                 "parent_execution_id": ctx.parent_execution_id,
                 "children": children,
             }),
-            if classified.status == "succeeded" { "ok" } else { "error" },
+            if classified.status == "succeeded" {
+                "ok"
+            } else {
+                "error"
+            },
             duration_ms,
         );
 
@@ -876,7 +902,10 @@ impl ActionManager {
             "unknown" if def.manifest.reconcile_handler.is_some() => {
                 // Immediate read-only reconcile attempt under the (original) invoking Principal;
                 // further attempts are scheduled with backoff.
-                return match self.reconcile_with(&execution_id, Some(principal.clone())).await {
+                return match self
+                    .reconcile_with(&execution_id, Some(principal.clone()))
+                    .await
+                {
                     Ok(r) => Ok(r),
                     Err(_) => fetch(&execution_id),
                 };
@@ -951,7 +980,9 @@ impl ActionManager {
             }
             Err(RunError::Runtime(RuntimeError::Timeout(d))) => {
                 if tracker.side_effects_started() {
-                    unknown(format!("deadline_exceeded_after_side_effect_started ({d:?})"))
+                    unknown(format!(
+                        "deadline_exceeded_after_side_effect_started ({d:?})"
+                    ))
                 } else {
                     Classified {
                         status: "failed",
@@ -1116,7 +1147,9 @@ impl ActionManager {
                     ceiling,
                 })
             }
-            other => Err(format!("unknown principal kind '{other}' on execution record")),
+            other => Err(format!(
+                "unknown principal kind '{other}' on execution record"
+            )),
         }
     }
 
@@ -1295,12 +1328,20 @@ impl ActionManager {
                 &["unknown"],
                 ActionTransition {
                     status: next_status,
-                    result: if terminal { val.as_ref().ok().cloned() } else { rec.result.clone() },
+                    result: if terminal {
+                        val.as_ref().ok().cloned()
+                    } else {
+                        rec.result.clone()
+                    },
                     reason: reason.as_deref(),
                     // A reconciled `failed` is verified not to have happened upstream.
                     retry_safe: next_status == "failed",
                     reconcile_attempts: attempts,
-                    finished_at: if terminal { Some(&now) } else { rec.finished_at.as_deref() },
+                    finished_at: if terminal {
+                        Some(&now)
+                    } else {
+                        rec.finished_at.as_deref()
+                    },
                     duration_ms: rec.duration_ms,
                 },
             )
@@ -1334,14 +1375,19 @@ impl ActionManager {
                 "outcome": next_status,
                 "error": attempt_error,
             }),
-            if attempt_error.is_some() { "error" } else { "ok" },
+            if attempt_error.is_some() {
+                "error"
+            } else {
+                "ok"
+            },
             started.elapsed().as_millis() as i64,
         );
 
         let updated = fetch()?;
         if terminal {
             let _ = self.store.clear_action_reconcile(execution_id);
-            self.finalize_terminal(&updated, &g, "reconcile", &principal).await;
+            self.finalize_terminal(&updated, &g, "reconcile", &principal)
+                .await;
         } else if attempts >= RECONCILE_MAX_ATTEMPTS {
             let _ = self.store.clear_action_reconcile(execution_id);
             let _ = self.store.append_audit(
@@ -1359,7 +1405,9 @@ impl ActionManager {
             let next = Utc::now()
                 + chrono::Duration::from_std(reconcile_backoff(attempts))
                     .unwrap_or_else(|_| chrono::Duration::seconds(RECONCILE_MAX_DELAY_SECS));
-            let _ = self.store.schedule_action_reconcile(execution_id, &ts(next));
+            let _ = self
+                .store
+                .schedule_action_reconcile(execution_id, &ts(next));
         }
         Ok(updated)
     }
@@ -1408,7 +1456,12 @@ impl ActionManager {
                 .and_then(|i| g.definitions.get(&i.definition))
                 .map(|d| d.manifest.reconcile_handler.is_some())
                 .unwrap_or(false);
-            if has_reconcile && self.store.schedule_action_reconcile(&rec.execution_id, &now).is_ok() {
+            if has_reconcile
+                && self
+                    .store
+                    .schedule_action_reconcile(&rec.execution_id, &now)
+                    .is_ok()
+            {
                 n += 1;
             }
         }
@@ -1416,7 +1469,10 @@ impl ActionManager {
     }
 
     fn recover_inflight(&self, reason: &str) -> InflightRecovery {
-        let recovery = self.store.recover_inflight_actions(reason).unwrap_or_default();
+        let recovery = self
+            .store
+            .recover_inflight_actions(reason)
+            .unwrap_or_default();
         for id in recovery
             .marked_unknown
             .iter()
@@ -1484,7 +1540,10 @@ impl ActionManager {
             && !principal.ceiling.can_resolve_executions
             && !principal.ceiling.unrestricted
         {
-            return deny("only the initiating Principal or one allowed to resolve executions may cancel".into());
+            return deny(
+                "only the initiating Principal or one allowed to resolve executions may cancel"
+                    .into(),
+            );
         }
         if let Err(e) = self.check_authority_over_execution(principal, &rec) {
             return deny(e);
@@ -1561,7 +1620,9 @@ impl ActionManager {
     ) -> Result<(), String> {
         let g = self.graph.load_full();
         match g.instances.get(&rec.action_instance) {
-            Some(inst) => check_action_authority(principal, inst, &g, &self.store).map_err(|e| e.to_string()),
+            Some(inst) => {
+                check_action_authority(principal, inst, &g, &self.store).map_err(|e| e.to_string())
+            }
             None if principal.ceiling.allows_action(&rec.action_instance) => Ok(()),
             None => Err(format!(
                 "principal ceiling does not grant authority over action '{}'",
@@ -1592,11 +1653,16 @@ impl ActionManager {
         if !principal.ceiling.can_resolve_executions && !principal.ceiling.unrestricted {
             return deny("principal lacks authority to resolve unknown executions".into());
         }
-        if resolved_status != "succeeded" && resolved_status != "failed" && resolved_status != "cancelled" {
+        if resolved_status != "succeeded"
+            && resolved_status != "failed"
+            && resolved_status != "cancelled"
+        {
             return Err("resolved_status must be 'succeeded', 'failed', or 'cancelled'".into());
         }
         if reason.trim().is_empty() {
-            return Err("a non-empty resolution reason is required (manual resolution is audited)".into());
+            return Err(
+                "a non-empty resolution reason is required (manual resolution is audited)".into(),
+            );
         }
 
         let rec = self
@@ -1608,7 +1674,10 @@ impl ActionManager {
             return deny(e);
         }
         if rec.status != "unknown" {
-            return Err(format!("execution '{execution_id}' is '{}', not 'unknown'", rec.status));
+            return Err(format!(
+                "execution '{execution_id}' is '{}', not 'unknown'",
+                rec.status
+            ));
         }
 
         let finished_at = Utc::now().to_rfc3339();
@@ -1776,7 +1845,10 @@ impl ActionManager {
             ));
         }
         if req.kind != "request" {
-            return Err(format!("unsupported widget message kind '{}' (expected 'request')", req.kind));
+            return Err(format!(
+                "unsupported widget message kind '{}' (expected 'request')",
+                req.kind
+            ));
         }
         let g = self.graph.load_full();
         if req.generation != g.generation_id {
@@ -1854,15 +1926,25 @@ impl ActionManager {
         req: WidgetRequestEnvelope,
         principal: &Principal,
     ) -> Result<WidgetRequestOutcome, String> {
-        let (g, adapter_inst, adapter_def) =
-            self.validate_widget_request_binding(&req, principal).await?;
+        let (g, adapter_inst, adapter_def) = self
+            .validate_widget_request_binding(&req, principal)
+            .await?;
 
         let trace_id = format!("tr_{}", Uuid::now_v7().simple());
         let span_id = format!("spn_{}", Uuid::now_v7().simple());
         let started = Instant::now();
         let derived_key = widget_request_idempotency_key(&req);
         let res = self
-            .dispatch_validated(&req, principal, &g, &adapter_inst, &adapter_def, &trace_id, &span_id, derived_key)
+            .dispatch_validated(
+                &req,
+                principal,
+                &g,
+                &adapter_inst,
+                &adapter_def,
+                &trace_id,
+                &span_id,
+                derived_key,
+            )
             .await;
         self.telemetry.record_span_with_id(
             &span_id,
@@ -1909,14 +1991,21 @@ impl ActionManager {
             } else {
                 "action".to_string()
             };
-            let target = resolve_bound_action(adapter_inst, adapter_def, g, &slot).map_err(|_| {
-                format!(
-                    "adapter '{}' has no action binding for request '{}'",
-                    adapter_inst.id, req.request
-                )
-            })?;
+            let target =
+                resolve_bound_action(adapter_inst, adapter_def, g, &slot).map_err(|_| {
+                    format!(
+                        "adapter '{}' has no action binding for request '{}'",
+                        adapter_inst.id, req.request
+                    )
+                })?;
             let rec = self
-                .invoke_with_context(&target, req.payload.clone(), principal, Some(derived_key), child_ctx())
+                .invoke_with_context(
+                    &target,
+                    req.payload.clone(),
+                    principal,
+                    Some(derived_key),
+                    child_ctx(),
+                )
                 .await?;
             return Ok(WidgetRequestOutcome::Action(rec));
         };
@@ -1988,7 +2077,10 @@ impl ActionManager {
         }
         if let Some(action_slot) = val.get("action").and_then(|v| v.as_str()) {
             let target = resolve_bound_action(adapter_inst, adapter_def, g, action_slot)?;
-            let args = val.get("args").cloned().unwrap_or_else(|| req.payload.clone());
+            let args = val
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| req.payload.clone());
             let ikey = val
                 .get("idempotency_key")
                 .and_then(|v| v.as_str())
@@ -1999,17 +2091,24 @@ impl ActionManager {
                 .await?;
             return Ok(WidgetRequestOutcome::Action(rec));
         }
-        if val.get("refresh").and_then(|v| v.as_bool()) == Some(true) || val.get("invalidate").is_some() {
+        if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
+            || val.get("invalidate").is_some()
+        {
             let mut targets: Vec<String> = Vec::new();
             if let Some(inv) = val.get("invalidate") {
-                let arr = inv
-                    .as_array()
-                    .ok_or_else(|| "on_request 'invalidate' must be a list of bound input slots".to_string())?;
+                let arr = inv.as_array().ok_or_else(|| {
+                    "on_request 'invalidate' must be a list of bound input slots".to_string()
+                })?;
                 for item in arr {
-                    let slot = item
-                        .as_str()
-                        .ok_or_else(|| "on_request 'invalidate' entries must be strings".to_string())?;
-                    targets.push(resolve_bound_data_provider(adapter_inst, adapter_def, g, slot)?);
+                    let slot = item.as_str().ok_or_else(|| {
+                        "on_request 'invalidate' entries must be strings".to_string()
+                    })?;
+                    targets.push(resolve_bound_data_provider(
+                        adapter_inst,
+                        adapter_def,
+                        g,
+                        slot,
+                    )?);
                 }
             } else {
                 for target_id in adapter_inst.inputs.values() {
@@ -2112,7 +2211,9 @@ fn resolve_bound_data_provider(
     })?;
     if let Some(spec) = adapter_def.manifest.inputs.get(slot) {
         if !matches!(spec, InputRefSpec::Data { .. }) {
-            return Err(format!("adapter input '{slot}' is not declared as a data_ref"));
+            return Err(format!(
+                "adapter input '{slot}' is not declared as a data_ref"
+            ));
         }
     }
     let inst = g
@@ -2140,7 +2241,10 @@ fn canonical_json(v: &serde_json::Value) -> String {
             format!("{{{}}}", parts.join(","))
         }
         serde_json::Value::Array(arr) => {
-            format!("[{}]", arr.iter().map(canonical_json).collect::<Vec<_>>().join(","))
+            format!(
+                "[{}]",
+                arr.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+            )
         }
         other => other.to_string(),
     }
@@ -2154,13 +2258,22 @@ fn widget_request_idempotency_key(req: &WidgetRequestEnvelope) -> String {
     let digest = hex::encode(&h.finalize()[..8]);
     format!(
         "widget:{}:{}:{}:{}:{}:{}:{digest}",
-        req.dashboard_id, req.adapter_instance, req.widget_id, req.generation, req.sequence, req.request
+        req.dashboard_id,
+        req.adapter_instance,
+        req.widget_id,
+        req.generation,
+        req.sequence,
+        req.request
     )
 }
 
 /// Whether `operation` of connector Instance `conn` is a read (`read_only = true`, `mode = "read"`,
 /// or read-only capabilities) per its Definition; undeclared operations are mutating.
-fn connector_operation_is_read_only(g: &ConfiguredGraph, conn: &InstanceConfig, operation: &str) -> bool {
+fn connector_operation_is_read_only(
+    g: &ConfiguredGraph,
+    conn: &InstanceConfig,
+    operation: &str,
+) -> bool {
     g.definitions
         .get(&conn.definition)
         .and_then(|d| d.manifest.operations.get(operation))
@@ -2204,8 +2317,9 @@ impl ActionManager {
         req: WidgetRequestEnvelope,
         principal: &Principal,
     ) -> Result<WidgetRequestDryRun, String> {
-        let (g, adapter_inst, adapter_def) =
-            self.validate_widget_request_binding(&req, principal).await?;
+        let (g, adapter_inst, adapter_def) = self
+            .validate_widget_request_binding(&req, principal)
+            .await?;
 
         let mut out = WidgetRequestDryRun {
             protocol: WIDGET_PROTOCOL.into(),
@@ -2281,13 +2395,14 @@ impl ActionManager {
             };
             if let Some(action_slot) = val.get("action").and_then(|v| v.as_str()) {
                 // Same resolution as dispatch: only the Adapter's own bound action inputs.
-                let target = match resolve_bound_action(&adapter_inst, &adapter_def, &g, action_slot) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        out.dry_run_error = Some(e);
-                        return Ok(out);
-                    }
-                };
+                let target =
+                    match resolve_bound_action(&adapter_inst, &adapter_def, &g, action_slot) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            out.dry_run_error = Some(e);
+                            return Ok(out);
+                        }
+                    };
                 let args = val.get("args").cloned().unwrap_or(req.payload.clone());
                 (target, args)
             } else if val.get("refresh").and_then(|v| v.as_bool()) == Some(true)
@@ -2307,12 +2422,13 @@ impl ActionManager {
             } else {
                 "action".to_string()
             };
-            let target = resolve_bound_action(&adapter_inst, &adapter_def, &g, &slot).map_err(|_| {
-                format!(
-                    "adapter '{}' has no action binding for request '{}'",
-                    adapter_inst.id, req.request
-                )
-            })?;
+            let target =
+                resolve_bound_action(&adapter_inst, &adapter_def, &g, &slot).map_err(|_| {
+                    format!(
+                        "adapter '{}' has no action binding for request '{}'",
+                        adapter_inst.id, req.request
+                    )
+                })?;
             (target, req.payload.clone())
         };
 
@@ -2416,11 +2532,12 @@ impl HostBridge for ActionHostBridge {
         input_name: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let target_id = self
-            .caller_inst
-            .inputs
-            .get(input_name)
-            .ok_or_else(|| format!("input '{input_name}' not bound on '{}'", self.caller_inst.id))?;
+        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
+            format!(
+                "input '{input_name}' not bound on '{}'",
+                self.caller_inst.id
+            )
+        })?;
         let env = self
             .manager
             .queries
@@ -2435,11 +2552,12 @@ impl HostBridge for ActionHostBridge {
         operation: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let target_id = self
-            .caller_inst
-            .inputs
-            .get(input_name)
-            .ok_or_else(|| format!("input '{input_name}' not bound on '{}'", self.caller_inst.id))?;
+        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
+            format!(
+                "input '{input_name}' not bound on '{}'",
+                self.caller_inst.id
+            )
+        })?;
         let target = self
             .graph
             .instances
@@ -2518,11 +2636,12 @@ impl HostBridge for ActionHostBridge {
         if self.is_read_only {
             return Err("nested action invocation is forbidden during dry_run/reconcile".into());
         }
-        let target_id = self
-            .caller_inst
-            .inputs
-            .get(input_name)
-            .ok_or_else(|| format!("action input '{input_name}' not bound on '{}'", self.caller_inst.id))?;
+        let target_id = self.caller_inst.inputs.get(input_name).ok_or_else(|| {
+            format!(
+                "action input '{input_name}' not bound on '{}'",
+                self.caller_inst.id
+            )
+        })?;
         let target = self
             .graph
             .instances
@@ -2630,7 +2749,10 @@ impl HostBridge for ActionHostBridge {
         let rec = if self.is_adapter() {
             // ADR-0001: Adapters hold no State of their own; they read declared Dashboard State only.
             if scope != "dashboard" {
-                return Err("adapters hold no state of their own (ADR-0001); use ctx.dashboard_state".into());
+                return Err(
+                    "adapters hold no state of their own (ADR-0001); use ctx.dashboard_state"
+                        .into(),
+                );
             }
             let dashboard_id = self
                 .dashboard_id
@@ -2677,7 +2799,9 @@ impl HostBridge for ActionHostBridge {
             return Err("adapters hold no writable state (ADR-0001)".into());
         }
         if scope != "instance" {
-            return Err(format!("scope '{scope}' state is not writable from actions"));
+            return Err(format!(
+                "scope '{scope}' state is not writable from actions"
+            ));
         }
         if self.is_read_only {
             return Ok(());
@@ -2712,8 +2836,8 @@ mod tests {
     use crate::model::{DashboardAdapterPlacement, DashboardDoc};
     use crate::RuntimeEngine;
     use dash_luau::{evaluate_declaration, ResourceBudget};
-    use std::collections::BTreeSet;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     fn load_def(pkg: &str, decl: &str, runtime: &str) -> LoadedDefinition {
         let mut sources = BTreeMap::new();
@@ -2976,9 +3100,24 @@ return R
         }
         for inst in [
             instance("conn", DefinitionCategory::Connector, "t.conn", &[]),
-            instance("write", DefinitionCategory::ActionProvider, "t.write", &[("c", "conn")]),
-            instance("other_write", DefinitionCategory::ActionProvider, "t.write", &[("c", "conn")]),
-            instance("nested", DefinitionCategory::ActionProvider, "t.nested", &[("child", "write")]),
+            instance(
+                "write",
+                DefinitionCategory::ActionProvider,
+                "t.write",
+                &[("c", "conn")],
+            ),
+            instance(
+                "other_write",
+                DefinitionCategory::ActionProvider,
+                "t.write",
+                &[("c", "conn")],
+            ),
+            instance(
+                "nested",
+                DefinitionCategory::ActionProvider,
+                "t.nested",
+                &[("child", "write")],
+            ),
             instance("nodry", DefinitionCategory::ActionProvider, "t.nodry", &[]),
             instance("data_inst", DefinitionCategory::DataProvider, "t.data", &[]),
             instance(
@@ -3014,10 +3153,20 @@ return R
             wall_timeout: Duration::from_secs(20),
             ..ResourceBudget::default()
         };
-        RuntimeEngine::new(build_graph(), SqliteStore::open_in_memory().unwrap(), budget).unwrap()
+        RuntimeEngine::new(
+            build_graph(),
+            SqliteStore::open_in_memory().unwrap(),
+            budget,
+        )
+        .unwrap()
     }
 
-    fn req(request: &str, widget_id: &str, sequence: u64, payload: serde_json::Value) -> WidgetRequestEnvelope {
+    fn req(
+        request: &str,
+        widget_id: &str,
+        sequence: u64,
+        payload: serde_json::Value,
+    ) -> WidgetRequestEnvelope {
         WidgetRequestEnvelope {
             protocol: WIDGET_PROTOCOL.into(),
             dashboard_id: "main".into(),
@@ -3043,7 +3192,13 @@ return R
     async fn connector_writes(e: &RuntimeEngine) -> i64 {
         let admin = Principal::administrator();
         e.queries
-            .invoke_connector("conn", "get_item", json!({"id": "probe"}), &admin, "tr_probe")
+            .invoke_connector(
+                "conn",
+                "get_item",
+                json!({"id": "probe"}),
+                &admin,
+                "tr_probe",
+            )
             .await
             .unwrap()["writes"]
             .as_i64()
@@ -3061,7 +3216,10 @@ return R
             .await
             .unwrap();
         assert_eq!(rec.status, "failed");
-        assert!(rec.reason.unwrap().contains("call_input expects a connector"));
+        assert!(rec
+            .reason
+            .unwrap()
+            .contains("call_input expects a connector"));
         let dry = e
             .actions
             .dry_run("nested", json!({}), &admin)
@@ -3093,7 +3251,11 @@ return R
             .await
             .unwrap_err();
         assert!(err.contains("not declared read_only"), "{err}");
-        assert_eq!(connector_writes(&e).await, before, "dry run performed no write");
+        assert_eq!(
+            connector_writes(&e).await,
+            before,
+            "dry run performed no write"
+        );
 
         // reconcile with a mutating op stays unknown and performs no write
         let rec = e
@@ -3108,11 +3270,16 @@ return R
             .await
             .unwrap();
         assert_eq!(rec.status, "unknown");
-        assert_eq!(connector_writes(&e).await, before, "reconcile performed no write");
+        assert_eq!(
+            connector_writes(&e).await,
+            before,
+            "reconcile performed no write"
+        );
         let rec_audit = audits(&e, "action.reconcile");
-        assert!(rec_audit
-            .iter()
-            .any(|a| a.detail["error"].as_str().unwrap_or("").contains("not declared read_only")));
+        assert!(rec_audit.iter().any(|a| a.detail["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not declared read_only")));
 
         // A read_only operation is allowed and reports preconditions (act-17)
         let ok = e
@@ -3152,7 +3319,13 @@ return R
 
         let lost = e
             .actions
-            .invoke("write", json!({"id": "l1", "op": "lost_write"}), &admin, None, None)
+            .invoke(
+                "write",
+                json!({"id": "l1", "op": "lost_write"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         // Classified unknown, then the inline reconcile found the write landed.
@@ -3164,19 +3337,37 @@ return R
             .find(|a| a.detail["execution_id"] == lost.execution_id.as_str())
             .unwrap();
         assert_eq!(first.outcome, "unknown");
-        assert!(first.detail["reason"].as_str().unwrap().contains("upstream_outcome_unknown"));
+        assert!(first.detail["reason"]
+            .as_str()
+            .unwrap()
+            .contains("upstream_outcome_unknown"));
 
         let rejected = e
             .actions
-            .invoke("write", json!({"id": "r1", "op": "reject_write"}), &admin, None, None)
+            .invoke(
+                "write",
+                json!({"id": "r1", "op": "reject_write"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(rejected.status, "failed");
-        assert!(rejected.retry_safe, "a definitive rejection had no external effect");
+        assert!(
+            rejected.retry_safe,
+            "a definitive rejection had no external effect"
+        );
 
         let explicit = e
             .actions
-            .invoke("other_write", json!({"id": "never", "op": "unknown_sentinel"}), &admin, None, None)
+            .invoke(
+                "other_write",
+                json!({"id": "never", "op": "unknown_sentinel"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(explicit.status, "unknown");
@@ -3185,7 +3376,13 @@ return R
 
         let plain = e
             .actions
-            .invoke("write", json!({"id": "p", "op": "plain_error"}), &admin, None, None)
+            .invoke(
+                "write",
+                json!({"id": "p", "op": "plain_error"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(plain.status, "failed");
@@ -3202,7 +3399,9 @@ return R
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
                 drop(sock); // request received, connection closed without a response
@@ -3241,24 +3440,48 @@ return R
         };
 
         let lost = broker
-            .execute(&admin, &conn, None, &graph, mk(format!("http://{addr}/merge")))
+            .execute(
+                &admin,
+                &conn,
+                None,
+                &graph,
+                mk(format!("http://{addr}/merge")),
+            )
             .await
             .unwrap_err();
-        assert!(matches!(lost, HttpBrokerError::OutcomeUnknown(_)), "{lost:?}");
+        assert!(
+            matches!(lost, HttpBrokerError::OutcomeUnknown(_)),
+            "{lost:?}"
+        );
         assert!(is_unknown_outcome_error(&lost.to_string()));
 
         // A safe method has no side effect: a lost response is a plain transport failure.
         let mut get = mk(format!("http://{addr}/pulls"));
         get.method = "GET".into();
         get.body = None;
-        let read_err = broker.execute(&admin, &conn, None, &graph, get).await.unwrap_err();
-        assert!(matches!(read_err, HttpBrokerError::Transport(_)), "{read_err:?}");
-
-        let not_sent = broker
-            .execute(&admin, &conn, None, &graph, mk(format!("http://{refused}/merge")))
+        let read_err = broker
+            .execute(&admin, &conn, None, &graph, get)
             .await
             .unwrap_err();
-        assert!(matches!(not_sent, HttpBrokerError::Transport(_)), "{not_sent:?}");
+        assert!(
+            matches!(read_err, HttpBrokerError::Transport(_)),
+            "{read_err:?}"
+        );
+
+        let not_sent = broker
+            .execute(
+                &admin,
+                &conn,
+                None,
+                &graph,
+                mk(format!("http://{refused}/merge")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(not_sent, HttpBrokerError::Transport(_)),
+            "{not_sent:?}"
+        );
         assert!(!is_unknown_outcome_error(&not_sent.to_string()));
     }
 
@@ -3269,7 +3492,13 @@ return R
         let admin = Principal::administrator();
         let rec = e
             .actions
-            .invoke("write", json!({"id": "b1", "op": "unknown_sentinel"}), &admin, None, None)
+            .invoke(
+                "write",
+                json!({"id": "b1", "op": "unknown_sentinel"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(rec.status, "unknown");
@@ -3279,7 +3508,10 @@ return R
             .get_action_reconcile_schedule(&rec.execution_id)
             .unwrap()
             .expect("next attempt scheduled");
-        assert!(next > ts(Utc::now()), "next attempt is in the future (backoff)");
+        assert!(
+            next > ts(Utc::now()),
+            "next attempt is in the future (backoff)"
+        );
         assert_eq!(e.actions.run_due_reconciles(10).await, 0, "nothing due yet");
 
         // The external effect lands later (e.g. a slow upstream); make the attempt due.
@@ -3288,13 +3520,24 @@ return R
             .await
             .unwrap();
         e.store
-            .schedule_action_reconcile(&rec.execution_id, &ts(Utc::now() - chrono::Duration::seconds(1)))
+            .schedule_action_reconcile(
+                &rec.execution_id,
+                &ts(Utc::now() - chrono::Duration::seconds(1)),
+            )
             .unwrap();
         assert_eq!(e.actions.run_due_reconciles(10).await, 1);
-        let done = e.store.get_action_execution(&rec.execution_id).unwrap().unwrap();
+        let done = e
+            .store
+            .get_action_execution(&rec.execution_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(done.status, "succeeded");
         assert_eq!(done.reconcile_attempts, 2);
-        assert!(e.store.get_action_reconcile_schedule(&rec.execution_id).unwrap().is_none());
+        assert!(e
+            .store
+            .get_action_reconcile_schedule(&rec.execution_id)
+            .unwrap()
+            .is_none());
 
         let completed: Vec<_> = e
             .events
@@ -3308,7 +3551,13 @@ return R
             .any(|ev| ev.payload["execution_id"] == rec.execution_id.as_str()
                 && ev.payload["resolved_by"] == "reconcile"));
         let rec_audits = audits(&e, "action.reconcile");
-        assert!(rec_audits.iter().filter(|a| a.target == rec.execution_id).count() >= 2);
+        assert!(
+            rec_audits
+                .iter()
+                .filter(|a| a.target == rec.execution_id)
+                .count()
+                >= 2
+        );
         assert!(e
             .telemetry
             .recent_spans(500)
@@ -3317,7 +3566,10 @@ return R
 
         // Backoff grows and is capped.
         assert!(reconcile_backoff(1) <= reconcile_backoff(4));
-        assert!(reconcile_backoff(1000) <= Duration::from_secs((RECONCILE_MAX_DELAY_SECS * 5 / 4 + 1) as u64));
+        assert!(
+            reconcile_backoff(1000)
+                <= Duration::from_secs((RECONCILE_MAX_DELAY_SECS * 5 / 4 + 1) as u64)
+        );
     }
 
     // act-4: reconcile never runs under a Principal other than the original one.
@@ -3327,7 +3579,13 @@ return R
         let admin = Principal::administrator();
         let rec = e
             .actions
-            .invoke("write", json!({"id": "o1", "op": "unknown_sentinel"}), &admin, None, None)
+            .invoke(
+                "write",
+                json!({"id": "o1", "op": "unknown_sentinel"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let agent = Principal {
@@ -3335,7 +3593,11 @@ return R
             kind: PrincipalKind::Agent,
             ceiling: CapabilityCeiling::administrator(),
         };
-        let err = e.actions.reconcile_execution(&rec.execution_id, &agent).await.unwrap_err();
+        let err = e
+            .actions
+            .reconcile_execution(&rec.execution_id, &agent)
+            .await
+            .unwrap_err();
         assert!(err.contains("original Principal"), "{err}");
         // A record whose Agent principal no longer exists is left unknown, not run as someone else.
         let mut orphan = rec.clone();
@@ -3350,9 +3612,16 @@ return R
             .await
             .unwrap_err();
         assert!(err.contains("no longer exists"), "{err}");
-        let still = e.store.get_action_execution("act_agent_gone").unwrap().unwrap();
+        let still = e
+            .store
+            .get_action_execution("act_agent_gone")
+            .unwrap()
+            .unwrap();
         assert_eq!(still.status, "unknown");
-        assert_eq!(still.reconcile_attempts, 0, "nothing ran under another authority");
+        assert_eq!(
+            still.reconcile_attempts, 0,
+            "nothing ran under another authority"
+        );
     }
 
     // act-5: concurrent invocations with one idempotency key run the side effect once.
@@ -3374,8 +3643,16 @@ return R
         for h in handles {
             ids.insert(h.await.unwrap().unwrap().execution_id);
         }
-        assert_eq!(ids.len(), 1, "all concurrent callers got the same execution");
-        assert_eq!(connector_writes(&e).await, before + 1, "the side effect ran exactly once");
+        assert_eq!(
+            ids.len(),
+            1,
+            "all concurrent callers got the same execution"
+        );
+        assert_eq!(
+            connector_writes(&e).await,
+            before + 1,
+            "the side effect ran exactly once"
+        );
         let ra = e
             .store
             .lookup_action_idempotency("write", "key-1")
@@ -3392,7 +3669,13 @@ return R
 
         let mismatch = e
             .actions
-            .invoke("write", json!({"id": "other"}), &admin, Some("key-1".into()), None)
+            .invoke(
+                "write",
+                json!({"id": "other"}),
+                &admin,
+                Some("key-1".into()),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(mismatch.contains("different arguments"), "{mismatch}");
@@ -3400,20 +3683,38 @@ return R
         // A retry-safe failure releases its key for a fresh attempt; a success never does.
         let f1 = e
             .actions
-            .invoke("write", json!({"id": "k2", "op": "reject_write"}), &admin, Some("key-2".into()), None)
+            .invoke(
+                "write",
+                json!({"id": "k2", "op": "reject_write"}),
+                &admin,
+                Some("key-2".into()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(f1.status, "failed");
         assert!(f1.retry_safe);
         let f2 = e
             .actions
-            .invoke("write", json!({"id": "k2", "op": "reject_write"}), &admin, Some("key-2".into()), None)
+            .invoke(
+                "write",
+                json!({"id": "k2", "op": "reject_write"}),
+                &admin,
+                Some("key-2".into()),
+                None,
+            )
             .await
             .unwrap();
         assert_ne!(f1.execution_id, f2.execution_id);
         let again = e
             .actions
-            .invoke("write", json!({"id": "k1"}), &admin, Some("key-1".into()), None)
+            .invoke(
+                "write",
+                json!({"id": "k1"}),
+                &admin,
+                Some("key-1".into()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(again.execution_id, ra.execution_id);
@@ -3421,12 +3722,24 @@ return R
         // An unknown outcome pins its key: no silent repeat of an uncertain external action.
         let u1 = e
             .actions
-            .invoke("other_write", json!({"id": "k3", "op": "unknown_sentinel"}), &admin, Some("key-3".into()), None)
+            .invoke(
+                "other_write",
+                json!({"id": "k3", "op": "unknown_sentinel"}),
+                &admin,
+                Some("key-3".into()),
+                None,
+            )
             .await
             .unwrap();
         let u2 = e
             .actions
-            .invoke("other_write", json!({"id": "k3", "op": "unknown_sentinel"}), &admin, Some("key-3".into()), None)
+            .invoke(
+                "other_write",
+                json!({"id": "k3", "op": "unknown_sentinel"}),
+                &admin,
+                Some("key-3".into()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(u1.execution_id, u2.execution_id);
@@ -3455,14 +3768,26 @@ return R
             finished_at: None,
             duration_ms: None,
         };
-        e.store.claim_idempotency_and_insert(&mk("act_running", "running")).unwrap();
-        e.store.claim_idempotency_and_insert(&mk("act_queued", "queued")).unwrap();
+        e.store
+            .claim_idempotency_and_insert(&mk("act_running", "running"))
+            .unwrap();
+        e.store
+            .claim_idempotency_and_insert(&mk("act_queued", "queued"))
+            .unwrap();
         let rec = e.actions.recover_after_restart();
         assert_eq!(rec.marked_unknown, vec!["act_running".to_string()]);
         assert_eq!(rec.marked_not_started, vec!["act_queued".to_string()]);
-        let r = e.store.get_action_execution("act_running").unwrap().unwrap();
+        let r = e
+            .store
+            .get_action_execution("act_running")
+            .unwrap()
+            .unwrap();
         assert_eq!(r.status, "unknown");
-        assert!(e.store.get_action_reconcile_schedule("act_running").unwrap().is_some());
+        assert!(e
+            .store
+            .get_action_reconcile_schedule("act_running")
+            .unwrap()
+            .is_some());
         let q = e.store.get_action_execution("act_queued").unwrap().unwrap();
         assert_eq!(q.status, "failed");
         assert!(q.retry_safe);
@@ -3476,19 +3801,30 @@ return R
         assert_eq!(resolved.status, "failed");
 
         // A caller that gives up (dropped future) does not leave the execution running.
-        let fut = e
-            .actions
-            .invoke("write", json!({"id": "spin", "op": "spin"}), &admin, None, None);
+        let fut = e.actions.invoke(
+            "write",
+            json!({"id": "spin", "op": "spin"}),
+            &admin,
+            None,
+            None,
+        );
         let _ = tokio::time::timeout(Duration::from_millis(5), fut).await;
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let recs = e.store.list_action_executions(50).unwrap();
-            let spin = recs.iter().find(|r| r.args["op"] == "spin").expect("record exists");
+            let spin = recs
+                .iter()
+                .find(|r| r.args["op"] == "spin")
+                .expect("record exists");
             if spin.status != "running" && spin.status != "queued" {
                 assert_eq!(spin.status, "succeeded");
                 break;
             }
-            assert!(Instant::now() < deadline, "execution orphaned in '{}'", spin.status);
+            assert!(
+                Instant::now() < deadline,
+                "execution orphaned in '{}'",
+                spin.status
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -3502,12 +3838,21 @@ return R
         let a2 = admin.clone();
         let h = tokio::spawn(async move {
             actions
-                .invoke("write", json!({"id": "c", "op": "spin_forever"}), &a2, None, None)
+                .invoke(
+                    "write",
+                    json!({"id": "c", "op": "spin_forever"}),
+                    &a2,
+                    None,
+                    None,
+                )
                 .await
         });
         let exec_id = loop {
             let recs = e.store.list_action_executions(10).unwrap();
-            if let Some(r) = recs.iter().find(|r| r.args["op"] == "spin_forever" && r.status == "running") {
+            if let Some(r) = recs
+                .iter()
+                .find(|r| r.args["op"] == "spin_forever" && r.status == "running")
+            {
                 break r.execution_id.clone();
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -3518,14 +3863,27 @@ return R
             kind: PrincipalKind::Agent,
             ceiling: CapabilityCeiling::read_only_agent(),
         };
-        assert!(e.actions.cancel_execution(&exec_id, "nope", &agent).await.is_err());
-        e.actions.cancel_execution(&exec_id, "operator abort", &admin).await.unwrap();
+        assert!(e
+            .actions
+            .cancel_execution(&exec_id, "nope", &agent)
+            .await
+            .is_err());
+        e.actions
+            .cancel_execution(&exec_id, "operator abort", &admin)
+            .await
+            .unwrap();
         let fin = h.await.unwrap().unwrap();
         assert_eq!(fin.status, "cancelled");
         assert!(fin.retry_safe);
-        assert!(audits(&e, "action.cancel").iter().any(|a| a.outcome == "requested"));
+        assert!(audits(&e, "action.cancel")
+            .iter()
+            .any(|a| a.outcome == "requested"));
         // Terminal executions cannot be cancelled.
-        assert!(e.actions.cancel_execution(&exec_id, "late", &admin).await.is_err());
+        assert!(e
+            .actions
+            .cancel_execution(&exec_id, "late", &admin)
+            .await
+            .is_err());
     }
 
     // act-10: nested executions share the parent's trace and hang under its span.
@@ -3553,7 +3911,10 @@ return R
             .iter()
             .find(|s| s.name == "action:write" && s.trace_id == parent.trace_id)
             .unwrap();
-        assert_eq!(cspan.parent_span_id.as_deref(), Some(pspan.span_id.as_str()));
+        assert_eq!(
+            cspan.parent_span_id.as_deref(),
+            Some(pspan.span_id.as_str())
+        );
         assert_eq!(pspan.attributes["children"]["total"], 1);
     }
 
@@ -3564,7 +3925,13 @@ return R
         let admin = Principal::administrator();
         let rec = e
             .actions
-            .invoke("other_write", json!({"id": "z", "op": "unknown_sentinel"}), &admin, None, None)
+            .invoke(
+                "other_write",
+                json!({"id": "z", "op": "unknown_sentinel"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(rec.status, "unknown");
@@ -3600,7 +3967,11 @@ return R
             .await
             .unwrap();
         assert_eq!(ok.status, "succeeded");
-        assert!(e.store.get_action_reconcile_schedule(&rec.execution_id).unwrap().is_none());
+        assert!(e
+            .store
+            .get_action_reconcile_schedule(&rec.execution_id)
+            .unwrap()
+            .is_none());
         let audit = audits(&e, "action.resolve")
             .into_iter()
             .find(|a| a.outcome == "succeeded")
@@ -3615,7 +3986,11 @@ return R
                 && ev.payload["resolved_by"] == "manual_resolution"));
 
         // A late reconcile can no longer overwrite the audited resolution.
-        let after = e.actions.reconcile_execution_as_original(&rec.execution_id).await.unwrap();
+        let after = e
+            .actions
+            .reconcile_execution_as_original(&rec.execution_id)
+            .await
+            .unwrap();
         assert_eq!(after.status, "succeeded");
         assert!(e
             .actions
@@ -3649,7 +4024,13 @@ return R
         let admin = Principal::administrator();
         let after_write = e
             .actions
-            .invoke("other_write", json!({"id": "rc1", "op": "bad_result_after_write"}), &admin, None, None)
+            .invoke(
+                "other_write",
+                json!({"id": "rc1", "op": "bad_result_after_write"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let audit = audits(&e, "action.invoke")
@@ -3664,11 +4045,20 @@ return R
 
         let no_write = e
             .actions
-            .invoke("write", json!({"id": "rc2", "op": "bad_result_no_write"}), &admin, None, None)
+            .invoke(
+                "write",
+                json!({"id": "rc2", "op": "bad_result_no_write"}),
+                &admin,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(no_write.status, "failed");
-        assert!(no_write.reason.unwrap().starts_with("invalid_result_contract"));
+        assert!(no_write
+            .reason
+            .unwrap()
+            .starts_with("invalid_result_contract"));
     }
 
     // act-7 / widget-3: Requests resolve only through the Adapter's own bound inputs.
@@ -3704,7 +4094,12 @@ return R
         let steal = e
             .actions
             .dispatch_widget_request_outcome(
-                req("exec_steal", "adapter_btn", 3, json!({"execution_id": other.execution_id})),
+                req(
+                    "exec_steal",
+                    "adapter_btn",
+                    3,
+                    json!({"execution_id": other.execution_id}),
+                ),
                 &admin,
             )
             .await
@@ -3721,17 +4116,32 @@ return R
 
         let mut bad = req("go", "adapter_btn", 1, json!({"id": "w1"}));
         bad.protocol = "dash.widget/0".into();
-        assert!(a.dispatch_widget_request_outcome(bad, &admin).await.unwrap_err().contains("protocol"));
+        assert!(a
+            .dispatch_widget_request_outcome(bad, &admin)
+            .await
+            .unwrap_err()
+            .contains("protocol"));
         let mut bad = req("go", "adapter_btn", 1, json!({"id": "w1"}));
         bad.kind = "event".into();
-        assert!(a.dispatch_widget_request_outcome(bad, &admin).await.unwrap_err().contains("kind"));
+        assert!(a
+            .dispatch_widget_request_outcome(bad, &admin)
+            .await
+            .unwrap_err()
+            .contains("kind"));
         let mut stale = req("go", "adapter_btn", 1, json!({"id": "w1"}));
         stale.generation = 6;
-        assert!(a.dispatch_widget_request_outcome(stale, &admin).await.unwrap_err().contains("stale"));
+        assert!(a
+            .dispatch_widget_request_outcome(stale, &admin)
+            .await
+            .unwrap_err()
+            .contains("stale"));
 
         // A made-up widget_id with the Adapter's prefix is not currently bound.
         let ghost = a
-            .dispatch_widget_request_outcome(req("go", "adapter_ghost", 1, json!({"id": "w1"})), &admin)
+            .dispatch_widget_request_outcome(
+                req("go", "adapter_ghost", 1, json!({"id": "w1"})),
+                &admin,
+            )
             .await
             .unwrap_err();
         assert!(ghost.contains("not currently bound"), "{ghost}");
@@ -3740,7 +4150,10 @@ return R
             .dispatch_widget_request_outcome(req("explode", "adapter_btn", 1, json!({})), &admin)
             .await
             .unwrap_err();
-        assert!(undeclared.contains("does not accept request"), "{undeclared}");
+        assert!(
+            undeclared.contains("does not accept request"),
+            "{undeclared}"
+        );
 
         let schema = a
             .dispatch_widget_request_outcome(req("go", "adapter_btn", 1, json!({"id": 5})), &admin)
@@ -3749,15 +4162,23 @@ return R
         assert!(schema.contains("invalid payload"), "{schema}");
 
         let ok = a
-            .dispatch_widget_request_outcome(req("go", "adapter_btn", 1, json!({"id": "w1"})), &admin)
+            .dispatch_widget_request_outcome(
+                req("go", "adapter_btn", 1, json!({"id": "w1"})),
+                &admin,
+            )
             .await
             .unwrap();
-        let WidgetRequestOutcome::Action(rec) = ok else { panic!("expected action outcome") };
+        let WidgetRequestOutcome::Action(rec) = ok else {
+            panic!("expected action outcome")
+        };
         assert_eq!(rec.status, "succeeded");
         assert_eq!(rec.action_instance, "write");
         // A retransmission of the same Request does not run the action twice.
         let WidgetRequestOutcome::Action(rec2) = a
-            .dispatch_widget_request_outcome(req("go", "adapter_btn", 1, json!({"id": "w1"})), &admin)
+            .dispatch_widget_request_outcome(
+                req("go", "adapter_btn", 1, json!({"id": "w1"})),
+                &admin,
+            )
             .await
             .unwrap()
         else {
@@ -3774,7 +4195,10 @@ return R
             .iter()
             .find(|s| s.name == "action:write" && s.trace_id == rec.trace_id)
             .unwrap();
-        assert_eq!(act_span.parent_span_id.as_deref(), Some(req_span.span_id.as_str()));
+        assert_eq!(
+            act_span.parent_span_id.as_deref(),
+            Some(req_span.span_id.as_str())
+        );
 
         // A refresh is reported as a refresh, not as a fabricated execution record.
         let refreshed = a
@@ -3796,10 +4220,26 @@ return R
         let e = engine();
         let admin = Principal::administrator();
         e.store
-            .set_state("dashboard", "main", "sel", 1, 7, json!("from-dashboard"), None)
+            .set_state(
+                "dashboard",
+                "main",
+                "sel",
+                1,
+                7,
+                json!("from-dashboard"),
+                None,
+            )
             .unwrap();
         e.store
-            .set_state("instance", "adapter", "sel", 1, 7, json!("from-instance"), None)
+            .set_state(
+                "instance",
+                "adapter",
+                "sel",
+                1,
+                7,
+                json!("from-instance"),
+                None,
+            )
             .unwrap();
         let WidgetRequestOutcome::Action(rec) = e
             .actions
@@ -3813,7 +4253,10 @@ return R
 
         let err = e
             .actions
-            .dispatch_widget_request_outcome(req("undeclared_state", "adapter_btn", 2, json!({})), &admin)
+            .dispatch_widget_request_outcome(
+                req("undeclared_state", "adapter_btn", 2, json!({})),
+                &admin,
+            )
             .await
             .unwrap_err();
         assert!(err.contains("dashboard_state_reads"), "{err}");
@@ -3825,7 +4268,10 @@ return R
         let mut g = build_graph();
         let inst = g.instances["write"].clone();
         let def = g.definitions["t.write"].clone();
-        assert_eq!(resolve_invalidations(&inst, &def, &g), vec!["data_inst".to_string()]);
+        assert_eq!(
+            resolve_invalidations(&inst, &def, &g),
+            vec!["data_inst".to_string()]
+        );
         assert!(unresolved_invalidations(&g).is_empty());
         g.instances.remove("data_inst");
         let missing = unresolved_invalidations(&g);
@@ -3839,9 +4285,20 @@ return R
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/engineering-command-center/packages/github");
         let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
-        let merge = load_def("github", &read("merge_pr/definition.luau"), &read("merge_pr/runtime.luau"));
-        assert_eq!(merge.manifest.invalidates, vec!["github.pull_requests".to_string()]);
-        let conn = load_def("github", &read("connector/definition.luau"), &read("connector/runtime.luau"));
+        let merge = load_def(
+            "github",
+            &read("merge_pr/definition.luau"),
+            &read("merge_pr/runtime.luau"),
+        );
+        assert_eq!(
+            merge.manifest.invalidates,
+            vec!["github.pull_requests".to_string()]
+        );
+        let conn = load_def(
+            "github",
+            &read("connector/definition.luau"),
+            &read("connector/runtime.luau"),
+        );
         assert!(conn.manifest.operations["get_pr"].read_only);
         assert!(conn.manifest.operations["list_prs"].read_only);
         assert!(!conn.manifest.operations["merge_pr"].read_only);
@@ -3864,7 +4321,11 @@ return R
             .iter()
             .filter(|c| !c.error.as_deref().unwrap_or("").contains("not bound"))
             .collect();
-        assert!(self_contained.iter().all(|c| c.passed), "{:?}", report.cases);
+        assert!(
+            self_contained.iter().all(|c| c.passed),
+            "{:?}",
+            report.cases
+        );
         assert_eq!(self_contained.len(), 6, "{:?}", report.cases);
     }
 }

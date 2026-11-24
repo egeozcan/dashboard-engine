@@ -15,7 +15,8 @@ use tempfile::TempDir;
 async fn boot_preview(tmp: &TempDir) -> AppServices {
     let ws = tmp.path().join("ws");
     let data = tmp.path().join("data");
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
     dash_git::packages::copy_tree_excluding_git(&src, &ws).unwrap();
     let store = SqliteStore::open(&data).unwrap();
     let mgr = DraftManager::initialize(ws, data, store, ResourceBudget::default())
@@ -123,8 +124,14 @@ async fn dashboard_merge_and_polling_detection_transition_the_issue_once() {
     assert_eq!(merged_events(&services, "open_prs").len(), 1);
 
     services.drain_durable_events().await;
-    assert_eq!(transition_runs(&services), 1, "one logical merge -> one Jira transition");
-    let runs = services.automation_executions(Some("complete_work"), 10).unwrap();
+    assert_eq!(
+        transition_runs(&services),
+        1,
+        "one logical merge -> one Jira transition"
+    );
+    let runs = services
+        .automation_executions(Some("complete_work"), 10)
+        .unwrap();
     assert_eq!(runs.len(), 2);
     assert!(runs.iter().all(|r| r.status == "succeeded"));
     // Both automation runs point at the same (idempotent) action execution.
@@ -142,7 +149,12 @@ async fn polling_refreshes_subscribed_queries_in_the_subscribers_partition() {
         .await
         .unwrap();
     let unsubscribed = services
-        .provider_query("open_prs", json!({"repository": "acme/payments", "state": "open"}), &admin, false)
+        .provider_query(
+            "open_prs",
+            json!({"repository": "acme/payments", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
     let mut rx = services.engine().signals.subscribe_stream(&env.query_key);
@@ -154,8 +166,15 @@ async fn polling_refreshes_subscribed_queries_in_the_subscribers_partition() {
         .unwrap();
     assert_eq!(next.query_key, env.query_key);
     assert!(next.version > env.version);
-    let cached = services.engine().queries.cached_entry(&unsubscribed.query_key).unwrap();
-    assert_eq!(cached.version, unsubscribed.version, "inactive queries are not polled");
+    let cached = services
+        .engine()
+        .queries
+        .cached_entry(&unsubscribed.query_key)
+        .unwrap();
+    assert_eq!(
+        cached.version, unsubscribed.version,
+        "inactive queries are not polled"
+    );
 }
 
 #[tokio::test]

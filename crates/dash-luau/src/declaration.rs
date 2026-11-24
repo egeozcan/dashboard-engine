@@ -76,7 +76,9 @@ fn is_address_valued(v: &Value) -> bool {
     }
 }
 
-fn evaluate_declaration_once(definition_source: &str) -> Result<DefinitionManifest, DeclarationError> {
+fn evaluate_declaration_once(
+    definition_source: &str,
+) -> Result<DefinitionManifest, DeclarationError> {
     let libs = StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::BIT | StdLib::MATH;
     let lua = Lua::new_with(libs, LuaOptions::default())?;
     lua.set_memory_limit(8 * 1024 * 1024)?; // 8 MiB max for declaration phase
@@ -510,7 +512,8 @@ pub fn is_safe_relative_path(p: &str) -> bool {
     if p.len() >= 2 && p.as_bytes()[1] == b':' {
         return false;
     }
-    p.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    p.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
@@ -585,22 +588,20 @@ fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
         }
     }
     match m.category {
-        DefinitionCategory::Mock => {
-            match m.target_connector.as_deref() {
-                Some(t) if is_valid_definition_id(t) => {}
-                Some(t) if !t.is_empty() => {
-                    return Err(DeclarationError::InvalidContract(format!(
-                        "mock '{}': target '{t}' is not a valid connector Definition ID",
-                        m.id
-                    )))
-                }
-                _ => {
-                    return Err(DeclarationError::InvalidContract(
-                        "mock definition requires 'for = \"<connector_id>\"'".into(),
-                    ))
-                }
+        DefinitionCategory::Mock => match m.target_connector.as_deref() {
+            Some(t) if is_valid_definition_id(t) => {}
+            Some(t) if !t.is_empty() => {
+                return Err(DeclarationError::InvalidContract(format!(
+                    "mock '{}': target '{t}' is not a valid connector Definition ID",
+                    m.id
+                )))
             }
-        }
+            _ => {
+                return Err(DeclarationError::InvalidContract(
+                    "mock definition requires 'for = \"<connector_id>\"'".into(),
+                ))
+            }
+        },
         DefinitionCategory::DataProvider => {
             for (input_name, spec) in &m.inputs {
                 if matches!(spec, InputRefSpec::Action { .. }) {
@@ -653,17 +654,25 @@ fn validate_trigger_shape(
     };
     let missing = |v: &Option<String>| v.as_deref().map(str::trim).unwrap_or("").is_empty();
     match t.kind.as_str() {
-        "event" if missing(&t.event_type) => return bad("event trigger requires 'event_type'".into()),
+        "event" if missing(&t.event_type) => {
+            return bad("event trigger requires 'event_type'".into())
+        }
         "cron" if missing(&t.schedule) => return bad("cron trigger requires 'schedule'".into()),
         "signal" if missing(&t.source_input) && missing(&t.state_key) => {
             return bad("signal trigger requires 'source_input' or 'state_key'".into())
         }
         "event" | "cron" | "signal" => {}
-        other => return bad(format!("unknown trigger kind '{other}' (expected event | cron | signal)")),
+        other => {
+            return bad(format!(
+                "unknown trigger kind '{other}' (expected event | cron | signal)"
+            ))
+        }
     }
     if let Some(cu) = t.catch_up.as_deref() {
         if cu != "skip" && cu != "catch_up" {
-            return bad(format!("unknown catch_up policy '{cu}' (expected skip | catch_up)"));
+            return bad(format!(
+                "unknown catch_up policy '{cu}' (expected skip | catch_up)"
+            ));
         }
     }
     if let Some(slot) = t.source_input.as_deref() {
@@ -685,33 +694,98 @@ fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static 
     use DefinitionCategory as C;
     match category {
         C::Connector => &[
-            "id", "description", "runtime", "handler", "libraries", "config", "credentials",
-            "capabilities", "operations", "emits",
+            "id",
+            "description",
+            "runtime",
+            "handler",
+            "libraries",
+            "config",
+            "credentials",
+            "capabilities",
+            "operations",
+            "emits",
         ],
         C::Mock => &[
-            "id", "description", "runtime", "handler", "libraries", "config", "for", "fixtures",
-            "credentials", "capabilities", "operations", "emits",
+            "id",
+            "description",
+            "runtime",
+            "handler",
+            "libraries",
+            "config",
+            "for",
+            "fixtures",
+            "credentials",
+            "capabilities",
+            "operations",
+            "emits",
         ],
         C::DataProvider => &[
-            "id", "description", "runtime", "handler", "libraries", "config", "inputs", "query",
-            "output", "updates", "emits", "required_capabilities", "optional_capabilities",
+            "id",
+            "description",
+            "runtime",
+            "handler",
+            "libraries",
+            "config",
+            "inputs",
+            "query",
+            "output",
+            "updates",
+            "emits",
+            "required_capabilities",
+            "optional_capabilities",
         ],
         C::ActionProvider => &[
-            "id", "description", "runtime", "handler", "libraries", "config", "inputs", "args",
-            "result", "dry_run", "reconcile", "emits", "invalidates", "required_capabilities",
+            "id",
+            "description",
+            "runtime",
+            "handler",
+            "libraries",
+            "config",
+            "inputs",
+            "args",
+            "result",
+            "dry_run",
+            "reconcile",
+            "emits",
+            "invalidates",
+            "required_capabilities",
             "optional_capabilities",
         ],
         C::Adapter => &[
-            "id", "description", "runtime", "handler", "libraries", "config", "inputs", "output",
-            "dashboard_state_reads", "accepts_requests", "requests", "on_request",
+            "id",
+            "description",
+            "runtime",
+            "handler",
+            "libraries",
+            "config",
+            "inputs",
+            "output",
+            "dashboard_state_reads",
+            "accepts_requests",
+            "requests",
+            "on_request",
         ],
         C::WidgetProvider => &[
-            "id", "description", "asset", "props", "accepts_requests", "requests",
+            "id",
+            "description",
+            "asset",
+            "props",
+            "accepts_requests",
+            "requests",
         ],
         C::Library => &["id", "description", "runtime", "libraries"],
         C::Automation => &[
-            "id", "description", "runtime", "handler", "libraries", "config", "inputs",
-            "triggers", "emits", "required_capabilities", "optional_capabilities",
+            "id",
+            "description",
+            "runtime",
+            "handler",
+            "libraries",
+            "config",
+            "inputs",
+            "triggers",
+            "emits",
+            "required_capabilities",
+            "optional_capabilities",
         ],
     }
 }
@@ -779,7 +853,8 @@ fn get_opt_u64(tbl: &Table, key: &str) -> Result<Option<u64>, DeclarationError> 
 }
 
 fn parse_string_vec(tbl: &Table, key: &str) -> Result<Vec<String>, DeclarationError> {
-    let bad = || DeclarationError::InvalidContract(format!("field '{key}' must be an array of strings"));
+    let bad =
+        || DeclarationError::InvalidContract(format!("field '{key}' must be an array of strings"));
     match tbl.get::<Value>(key)? {
         Value::Nil => Ok(Vec::new()),
         Value::Table(t) => {
@@ -801,7 +876,8 @@ fn parse_string_vec(tbl: &Table, key: &str) -> Result<Vec<String>, DeclarationEr
 }
 
 fn parse_string_map(tbl: &Table, key: &str) -> Result<BTreeMap<String, String>, DeclarationError> {
-    let bad = || DeclarationError::InvalidContract(format!("field '{key}' must be a map of strings"));
+    let bad =
+        || DeclarationError::InvalidContract(format!("field '{key}' must be a map of strings"));
     match tbl.get::<Value>(key)? {
         Value::Nil => Ok(BTreeMap::new()),
         Value::Table(t) => {
@@ -962,7 +1038,14 @@ fn parse_operations(
         let (op_name, op_tbl) = pair?;
         check_known_keys(
             &op_tbl,
-            &["description", "required_capabilities", "args", "result", "mode", "read_only"],
+            &[
+                "description",
+                "required_capabilities",
+                "args",
+                "result",
+                "mode",
+                "read_only",
+            ],
             &format!("operation '{op_name}'"),
         )?;
         let description: String = get_opt_string(&op_tbl, "description")?.unwrap_or_default();
@@ -1109,8 +1192,15 @@ fn parse_triggers(tbl: &Table) -> Result<Vec<TriggerDeclSpec>, DeclarationError>
         check_known_keys(
             &t,
             &[
-                "kind", "schedule", "event_type", "source_input", "catch_up", "params",
-                "state_key", "predicate", "max_attempts",
+                "kind",
+                "schedule",
+                "event_type",
+                "source_input",
+                "catch_up",
+                "params",
+                "state_key",
+                "predicate",
+                "max_attempts",
             ],
             "trigger",
         )?;
@@ -1210,8 +1300,10 @@ fn source_mentions_identifier(src: &str, ident: &str) -> bool {
         while let Some(pos) = code[start..].find(ident) {
             let i = start + pos;
             let j = i + ident.len();
-            let before_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-            let after_ok = j >= bytes.len() || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_');
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok =
+                j >= bytes.len() || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_');
             if before_ok && after_ok {
                 return true;
             }
@@ -1261,7 +1353,9 @@ mod tests {
     }
 
     fn dp(body: &str) -> String {
-        format!("local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"p.d\", {body} }}")
+        format!(
+            "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"p.d\", {body} }}"
+        )
     }
 
     #[test]
@@ -1284,7 +1378,10 @@ mod tests {
             );
         }
         // Scalars still stringify deterministically.
-        let ok = eval(&dp("description = tostring(42) .. string.format(\"%d\", 7)")).unwrap();
+        let ok = eval(&dp(
+            "description = tostring(42) .. string.format(\"%d\", 7)",
+        ))
+        .unwrap();
         assert_eq!(ok.description, "427");
     }
 
@@ -1308,15 +1405,22 @@ mod tests {
         }
         let conn = r#"local dash = require("dash")
 return dash.connector { id = "p.c", capabilities = { "a" }, operations = { op = { required_capabilities = { "a" }, descripton = "typo" } } }"#;
-        assert!(matches!(eval(conn), Err(DeclarationError::InvalidContract(_))));
-        let ok = eval(&dp("updates = { on_demand = true, poll_interval_secs = 60 }")).unwrap();
+        assert!(matches!(
+            eval(conn),
+            Err(DeclarationError::InvalidContract(_))
+        ));
+        let ok = eval(&dp(
+            "updates = { on_demand = true, poll_interval_secs = 60 }",
+        ))
+        .unwrap();
         assert_eq!(ok.updates.poll_interval_secs, Some(60));
     }
 
     #[test]
     fn ids_paths_and_semantic_names_are_validated() {
         for id in [".", "a.", ".b", "x.y.z", "A.b", "a-b.c", "nodot"] {
-            let src = format!("local dash = require(\"dash\")\nreturn dash.library {{ id = \"{id}\" }}");
+            let src =
+                format!("local dash = require(\"dash\")\nreturn dash.library {{ id = \"{id}\" }}");
             assert!(eval(&src).is_err(), "id {id:?} must be rejected");
         }
         for body in [
@@ -1339,7 +1443,10 @@ return dash.mock { id = "p.m", ["for"] = "p.c", fixtures = { x = "../secret.json
     fn operation_capabilities_must_be_declared() {
         let bad = r#"local dash = require("dash")
 return dash.connector { id = "p.c", capabilities = { "read" }, operations = { merge = { required_capabilities = { "merge" } } } }"#;
-        assert!(matches!(eval(bad), Err(DeclarationError::InvalidContract(_))));
+        assert!(matches!(
+            eval(bad),
+            Err(DeclarationError::InvalidContract(_))
+        ));
     }
 
     #[test]
@@ -1348,8 +1455,14 @@ return dash.connector { id = "p.c", capabilities = { "read" }, operations = { me
             "local dash = require(\"dash\")\nreturn dash.action_provider { id = \"p.a\", dry_run = \"preview\" }",
         )
         .unwrap();
-        assert!(check_runtime_source(&m, "local R = {}; function R.execute() end; function R.preview() end; return R").is_ok());
-        assert!(check_runtime_source(&m, "local R = {}; function R.execute() end; return R").is_err());
+        assert!(check_runtime_source(
+            &m,
+            "local R = {}; function R.execute() end; function R.preview() end; return R"
+        )
+        .is_ok());
+        assert!(
+            check_runtime_source(&m, "local R = {}; function R.execute() end; return R").is_err()
+        );
         assert!(check_runtime_source(&m, "-- execute preview\nreturn {}").is_err());
         assert!(check_runtime_source(&m, "local R = {; function R.execute() end").is_err());
     }
@@ -1357,6 +1470,9 @@ return dash.connector { id = "p.c", capabilities = { "read" }, operations = { me
     #[test]
     fn require_scanner_finds_module_names() {
         let src = "local a = require(\"eng.utils\")\nlocal b = require 'eng.more'\nlocal c = myrequire(\"no\")\nlocal d = require( \"x.y\" )";
-        assert_eq!(scan_required_modules(src), vec!["eng.utils", "eng.more", "x.y"]);
+        assert_eq!(
+            scan_required_modules(src),
+            vec!["eng.utils", "eng.more", "x.y"]
+        );
     }
 }

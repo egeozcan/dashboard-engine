@@ -163,7 +163,8 @@ impl HistoryManager {
         let ts = sampled_at_override
             .map(|s| s.to_string())
             .unwrap_or_else(|| Utc::now().to_rfc3339());
-        self.backend.append_sample(&cfg.series_id, &ts, aggregated, None)?;
+        self.backend
+            .append_sample(&cfg.series_id, &ts, aggregated, None)?;
         self.backend.compact(&cfg.series_id, cfg.retention_days)?;
         Ok(aggregated)
     }
@@ -182,7 +183,10 @@ impl HistoryManager {
 /// Graph validation for configured history series (§7.4, ADR-0002): the series must name a
 /// declared Service principal and a data-provider Instance; a missing grant or a granted ceiling
 /// that excludes the Instance is reported as a warning (sampling would be denied).
-pub fn validate_history_series(graph: &ConfiguredGraph, store: &SqliteStore) -> Vec<ValidationIssue> {
+pub fn validate_history_series(
+    graph: &ConfiguredGraph,
+    store: &SqliteStore,
+) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     let mut push = |severity: &str, code: &str, target: &str, message: String| {
         issues.push(ValidationIssue {
@@ -199,7 +203,10 @@ pub fn validate_history_series(graph: &ConfiguredGraph, store: &SqliteStore) -> 
                 "error",
                 "HISTORY_UNKNOWN_INSTANCE",
                 &target,
-                format!("history series references unknown instance '{}'", series.instance_id),
+                format!(
+                    "history series references unknown instance '{}'",
+                    series.instance_id
+                ),
             ),
             Some(inst) if inst.category != DefinitionCategory::DataProvider => push(
                 "error",
@@ -339,7 +346,10 @@ mod tests {
     #[test]
     fn count_of_null_is_an_error_not_zero() {
         assert!(aggregate_value(&serde_json::Value::Null, "count", None).is_err());
-        assert_eq!(aggregate_value(&json!([1, 2, 3]), "count", None).unwrap(), 3.0);
+        assert_eq!(
+            aggregate_value(&json!([1, 2, 3]), "count", None).unwrap(),
+            3.0
+        );
     }
 
     #[test]
@@ -361,7 +371,9 @@ mod tests {
             .unwrap();
         let old = (Utc::now() - chrono::Duration::days(3)).to_rfc3339();
         backend.append_sample("s", &old, 1.0, None).unwrap();
-        backend.append_sample("s", &Utc::now().to_rfc3339(), 2.0, None).unwrap();
+        backend
+            .append_sample("s", &Utc::now().to_rfc3339(), 2.0, None)
+            .unwrap();
         assert_eq!(backend.compact("s", 1).unwrap(), 1);
         let rows = backend.query("s", None, usize::MAX).unwrap();
         assert_eq!(rows.len(), 1);

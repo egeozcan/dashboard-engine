@@ -354,14 +354,30 @@ dash.test("three", function() burn() end)
 local dash = require("dash")
 dash.test("one", function() local x = 0; for i = 1, 60000 do x = x + i end end)
 "#;
-        let r = run_definition_tests_with_budget(&m, RT, single, &BTreeMap::new(), Arc::new(ProbeBridge::default()), serde_json::json!({}), &probe)
-            .await
-            .unwrap();
+        let r = run_definition_tests_with_budget(
+            &m,
+            RT,
+            single,
+            &BTreeMap::new(),
+            Arc::new(ProbeBridge::default()),
+            serde_json::json!({}),
+            &probe,
+        )
+        .await
+        .unwrap();
         assert_eq!(r.failed, 1, "probe budget should be exceeded: {r:?}");
 
-        let r = run_definition_tests_with_budget(&m, RT, tests, &BTreeMap::new(), Arc::new(ProbeBridge::default()), serde_json::json!({}), &budget)
-            .await
-            .unwrap();
+        let r = run_definition_tests_with_budget(
+            &m,
+            RT,
+            tests,
+            &BTreeMap::new(),
+            Arc::new(ProbeBridge::default()),
+            serde_json::json!({}),
+            &budget,
+        )
+        .await
+        .unwrap();
         assert_eq!((r.passed, r.failed), (3, 0), "{r:?}");
     }
 
@@ -378,12 +394,27 @@ dash.test("fine", function() dash.assert(true) end)
             ..ResourceBudget::default()
         };
         let t0 = Instant::now();
-        let r = run_definition_tests_with_budget(&manifest(DECL), RT, tests, &BTreeMap::new(), Arc::new(ProbeBridge::default()), serde_json::json!({}), &budget)
-            .await
-            .unwrap();
+        let r = run_definition_tests_with_budget(
+            &manifest(DECL),
+            RT,
+            tests,
+            &BTreeMap::new(),
+            Arc::new(ProbeBridge::default()),
+            serde_json::json!({}),
+            &budget,
+        )
+        .await
+        .unwrap();
         assert!(t0.elapsed() < std::time::Duration::from_secs(3));
         assert_eq!((r.passed, r.failed), (1, 1), "{r:?}");
-        assert!(r.cases[0].error.as_deref().unwrap_or("").contains("timed out"), "{r:?}");
+        assert!(
+            r.cases[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out"),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]
@@ -404,20 +435,42 @@ dash.test("slow input", function(make_ctx) Runtime.query(make_ctx({})) end)
             ..Default::default()
         });
         let t0 = Instant::now();
-        let r = run_definition_tests_with_budget(&manifest(decl), rt, tests, &BTreeMap::new(), bridge, serde_json::json!({}), &budget)
-            .await
-            .unwrap();
+        let r = run_definition_tests_with_budget(
+            &manifest(decl),
+            rt,
+            tests,
+            &BTreeMap::new(),
+            bridge,
+            serde_json::json!({}),
+            &budget,
+        )
+        .await
+        .unwrap();
         assert!(t0.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(r.failed, 1);
         // Either the host-await deadline or the interrupt (on resumption) reports the timeout.
-        assert!(r.cases[0].error.as_deref().unwrap_or("").contains("timed out"), "{r:?}");
+        assert!(
+            r.cases[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out"),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]
     async fn zero_tests_is_a_failure_and_require_is_restricted() {
-        let r = run_definition_tests(&manifest(DECL), RT, "local dash = require(\"dash\")", &BTreeMap::new(), Arc::new(ProbeBridge::default()), serde_json::json!({}))
-            .await
-            .unwrap();
+        let r = run_definition_tests(
+            &manifest(DECL),
+            RT,
+            "local dash = require(\"dash\")",
+            &BTreeMap::new(),
+            Arc::new(ProbeBridge::default()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         assert_eq!((r.passed, r.failed), (0, 1));
         assert_eq!(r.cases[0].name, NO_TESTS_CASE);
 
@@ -429,10 +482,21 @@ local dash = require("dash")
 dash.test("declared", function() dash.assert_eq(require("pkg.ok").v, 1) end)
 dash.test("undeclared", function() require("pkg.other") end)
 "#;
-        let r = run_definition_tests(&manifest(DECL), RT, tests, &libs, Arc::new(ProbeBridge::default()), serde_json::json!({}))
-            .await
-            .unwrap();
+        let r = run_definition_tests(
+            &manifest(DECL),
+            RT,
+            tests,
+            &libs,
+            Arc::new(ProbeBridge::default()),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         assert_eq!((r.passed, r.failed), (1, 1), "{r:?}");
-        assert!(r.cases[1].error.as_deref().unwrap().contains("SANDBOX_DENIED"));
+        assert!(r.cases[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("SANDBOX_DENIED"));
     }
 }

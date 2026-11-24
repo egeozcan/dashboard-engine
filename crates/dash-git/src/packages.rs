@@ -119,7 +119,6 @@ pub fn write_packages_lock(workspace_dir: &Path, lock: &PackagesLock) -> Result<
     Ok(())
 }
 
-
 /// Package name reserved for the engine's built-in Definitions (`dash.table`, ...).
 pub const RESERVED_PACKAGE_NAME: &str = "dash";
 
@@ -219,7 +218,9 @@ pub fn validate_dependency_spec(
         || r.starts_with('-')
         || r.contains("..")
         || r.chars().any(|c| {
-            c.is_whitespace() || c.is_control() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
         })
     {
         return Err(GitError::Package(format!(
@@ -269,21 +270,32 @@ async fn clone_checkout(url: &str, rev: &str, dest: &Path) -> Result<String, Git
         std::fs::remove_dir_all(dest)?;
     }
     let dest_s = dest.to_string_lossy().to_string();
-    run_pkg_git(None, &["clone", "--no-checkout", "--quiet", "--", url, &dest_s]).await?;
+    run_pkg_git(
+        None,
+        &["clone", "--no-checkout", "--quiet", "--", url, &dest_s],
+    )
+    .await?;
     // Resolve the revision to a commit: the name itself (tags, SHAs, the default branch), then the
     // remote-tracking branch of the same name.
     let mut commit = None;
-    for candidate in [format!("{rev}^{{commit}}"), format!("origin/{rev}^{{commit}}")] {
-        if let Ok(c) = run_pkg_git(Some(dest), &["rev-parse", "--verify", "--quiet", &candidate]).await {
+    for candidate in [
+        format!("{rev}^{{commit}}"),
+        format!("origin/{rev}^{{commit}}"),
+    ] {
+        if let Ok(c) = run_pkg_git(
+            Some(dest),
+            &["rev-parse", "--verify", "--quiet", &candidate],
+        )
+        .await
+        {
             if !c.is_empty() {
                 commit = Some(c);
                 break;
             }
         }
     }
-    let commit = commit.ok_or_else(|| {
-        GitError::Package(format!("revision '{rev}' not found in '{url}'"))
-    })?;
+    let commit = commit
+        .ok_or_else(|| GitError::Package(format!("revision '{rev}' not found in '{url}'")))?;
     run_pkg_git(Some(dest), &["checkout", "--quiet", "--detach", &commit]).await?;
     Ok(commit)
 }
@@ -455,7 +467,11 @@ fn resolve_recursive<'a>(
 }
 
 /// Resolve `subdir` inside a fresh clone, refusing anything that escapes the clone root.
-fn package_source_root(name: &str, clone_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, GitError> {
+fn package_source_root(
+    name: &str,
+    clone_dir: &Path,
+    subdir: Option<&str>,
+) -> Result<PathBuf, GitError> {
     let root = match subdir {
         Some(sub) => {
             if !dash_luau::declaration::is_safe_relative_path(sub) {
@@ -520,9 +536,15 @@ fn valid_tree_digest(d: &str) -> bool {
 /// Copy `src_root` into the content-addressed cache atomically: the tree is written to a
 /// temporary sibling directory, its digest re-verified, then renamed into place. An existing
 /// cache entry is reused only if it still verifies; a corrupt one is replaced.
-fn install_into_cache(data_dir: &Path, src_root: &Path, tree_digest: &str) -> Result<PathBuf, GitError> {
+fn install_into_cache(
+    data_dir: &Path,
+    src_root: &Path,
+    tree_digest: &str,
+) -> Result<PathBuf, GitError> {
     if !valid_tree_digest(tree_digest) {
-        return Err(GitError::Package(format!("invalid tree digest '{tree_digest}'")));
+        return Err(GitError::Package(format!(
+            "invalid tree digest '{tree_digest}'"
+        )));
     }
     let final_dir = package_cache_dir(data_dir, tree_digest);
     if final_dir.exists() {
@@ -593,7 +615,10 @@ fn validate_locked_entry(pkg: &LockedPackage) -> Result<(), GitError> {
 
 /// Make sure a locked Package is present (and verified) in the cache, fetching it at its pinned
 /// commit — never at its moving ref — when absent or corrupt.
-async fn ensure_locked_package_cached(data_dir: &Path, pkg: &LockedPackage) -> Result<PathBuf, GitError> {
+async fn ensure_locked_package_cached(
+    data_dir: &Path,
+    pkg: &LockedPackage,
+) -> Result<PathBuf, GitError> {
     validate_locked_entry(pkg)?;
     let dir = package_cache_dir(data_dir, &pkg.tree_digest);
     if dir.exists() && verify_cached_package(&dir, &pkg.tree_digest).is_ok() {
@@ -621,7 +646,10 @@ async fn ensure_locked_package_cached(data_dir: &Path, pkg: &LockedPackage) -> R
 
 /// Locked packages whose cache entry is missing (cheap existence check; integrity is verified
 /// by [`cached_package_roots`] and [`fetch_locked_packages`]).
-pub fn missing_locked_packages<'a>(data_dir: &Path, lock: &'a PackagesLock) -> Vec<&'a LockedPackage> {
+pub fn missing_locked_packages<'a>(
+    data_dir: &Path,
+    lock: &'a PackagesLock,
+) -> Vec<&'a LockedPackage> {
     lock.packages
         .iter()
         .filter(|p| !package_cache_dir(data_dir, &p.tree_digest).exists())
@@ -631,7 +659,10 @@ pub fn missing_locked_packages<'a>(data_dir: &Path, lock: &'a PackagesLock) -> V
 /// Materialize every locked Package into `<data_dir>/package_cache` at its pinned commit,
 /// verifying each fetched tree against the locked digest. The lockfile is never modified.
 /// Returns the names of the Packages that had to be fetched.
-pub async fn fetch_locked_packages(data_dir: &Path, lock: &PackagesLock) -> Result<Vec<String>, GitError> {
+pub async fn fetch_locked_packages(
+    data_dir: &Path,
+    lock: &PackagesLock,
+) -> Result<Vec<String>, GitError> {
     let mut fetched = Vec::new();
     for pkg in &lock.packages {
         validate_locked_entry(pkg)?;
@@ -793,7 +824,9 @@ mod tests {
     fn write_marker(dir: &Path, marker: &str) {
         std::fs::write(
             dir.join("hello/runtime.luau"),
-            format!("local R = {{}}; function R.query(ctx) return {{ v = \"{marker}\" }} end; return R"),
+            format!(
+                "local R = {{}}; function R.query(ctx) return {{ v = \"{marker}\" }} end; return R"
+            ),
         )
         .unwrap();
     }
@@ -812,28 +845,91 @@ mod tests {
 
     #[test]
     fn dependency_specs_are_validated() {
-        assert!(validate_dependency_spec("ext", &spec("https://example.com/r.git", "v1.2.0", None), false).is_ok());
-        assert!(validate_dependency_spec("ext", &spec("git@github.com:org/repo.git", "main", None), false).is_ok());
-        assert!(validate_dependency_spec("ext", &spec("ssh://git@host/r.git", "main", Some("pkgs/ext")), false).is_ok());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("https://example.com/r.git", "v1.2.0", None),
+            false
+        )
+        .is_ok());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("git@github.com:org/repo.git", "main", None),
+            false
+        )
+        .is_ok());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("ssh://git@host/r.git", "main", Some("pkgs/ext")),
+            false
+        )
+        .is_ok());
         // Local repositories only for Administrator-authored configuration.
-        assert!(validate_dependency_spec("ext", &spec("/home/u/private-repo", "main", None), false).is_err());
-        assert!(validate_dependency_spec("ext", &spec("file:///home/u/private-repo", "main", None), false).is_err());
-        assert!(validate_dependency_spec("ext", &spec("/home/u/private-repo", "main", None), true).is_ok());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("/home/u/private-repo", "main", None),
+            false
+        )
+        .is_err());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("file:///home/u/private-repo", "main", None),
+            false
+        )
+        .is_err());
+        assert!(
+            validate_dependency_spec("ext", &spec("/home/u/private-repo", "main", None), true)
+                .is_ok()
+        );
         // Option injection, remote helpers and insecure transports.
-        assert!(validate_dependency_spec("ext", &spec("--upload-pack=touch /tmp/x", "main", None), true).is_err());
-        assert!(validate_dependency_spec("ext", &spec("ext::sh -c touch% /tmp/x", "main", None), true).is_err());
-        assert!(validate_dependency_spec("ext", &spec("http://example.com/r.git", "main", None), true).is_err());
-        assert!(validate_dependency_spec("ext", &spec("https://example.com/r.git", "--orphan", None), true).is_err());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("--upload-pack=touch /tmp/x", "main", None),
+            true
+        )
+        .is_err());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("ext::sh -c touch% /tmp/x", "main", None),
+            true
+        )
+        .is_err());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("http://example.com/r.git", "main", None),
+            true
+        )
+        .is_err());
+        assert!(validate_dependency_spec(
+            "ext",
+            &spec("https://example.com/r.git", "--orphan", None),
+            true
+        )
+        .is_err());
         // Subdirectories must stay inside the clone.
         for sub in ["../..", "/etc", "a/../../b", "a\\b", ""] {
             assert!(
-                validate_dependency_spec("ext", &spec("https://example.com/r.git", "main", Some(sub)), true).is_err(),
+                validate_dependency_spec(
+                    "ext",
+                    &spec("https://example.com/r.git", "main", Some(sub)),
+                    true
+                )
+                .is_err(),
                 "subdir {sub:?}"
             );
         }
         // Package names.
-        assert!(validate_dependency_spec("dash", &spec("https://example.com/r.git", "main", None), true).is_err());
-        assert!(validate_dependency_spec("../x", &spec("https://example.com/r.git", "main", None), true).is_err());
+        assert!(validate_dependency_spec(
+            "dash",
+            &spec("https://example.com/r.git", "main", None),
+            true
+        )
+        .is_err());
+        assert!(validate_dependency_spec(
+            "../x",
+            &spec("https://example.com/r.git", "main", None),
+            true
+        )
+        .is_err());
     }
 
     #[cfg(unix)]
@@ -846,12 +942,17 @@ mod tests {
         std::fs::write(&secret, b"secret").unwrap();
         std::fs::create_dir_all(repo.join("hello/assets")).unwrap();
         std::os::unix::fs::symlink(&secret, repo.join("hello/assets/k.txt")).unwrap();
-        git_commit_all(&repo, "add link", "dev", None).await.unwrap();
+        git_commit_all(&repo, "add link", "dev", None)
+            .await
+            .unwrap();
 
         let ws = tmp.path().join("ws");
         let data = tmp.path().join("data");
         write_ws_deps(&ws, &[("ext", &repo)]);
-        let err = resolve_and_lock_packages(&ws, &data).await.unwrap_err().to_string();
+        let err = resolve_and_lock_packages(&ws, &data)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("symbolic links"), "{err}");
         let cache = data.join("package_cache");
         if cache.exists() {
@@ -885,10 +986,19 @@ mod tests {
         assert_eq!(fetched, vec!["ext".to_string()]);
         let roots = cached_package_roots(&data, &lock).unwrap();
         let rt = std::fs::read_to_string(roots[0].1.join("hello/runtime.luau")).unwrap();
-        assert!(rt.contains("pinned"), "must materialize the pinned commit, got {rt}");
-        assert_eq!(std::fs::read_to_string(ws.join("packages.lock")).unwrap(), lock_raw);
+        assert!(
+            rt.contains("pinned"),
+            "must materialize the pinned commit, got {rt}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("packages.lock")).unwrap(),
+            lock_raw
+        );
         // Nothing left to fetch.
-        assert!(fetch_locked_packages(&data, &lock).await.unwrap().is_empty());
+        assert!(fetch_locked_packages(&data, &lock)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -910,13 +1020,19 @@ mod tests {
         std::fs::remove_dir_all(data.join("package_cache")).unwrap();
 
         let store = dash_store::SqliteStore::open(&data).unwrap();
-        let mgr = crate::DraftManager::initialize(ws, data, store, dash_luau::ResourceBudget::default())
-            .await
-            .unwrap();
+        let mgr =
+            crate::DraftManager::initialize(ws, data, store, dash_luau::ResourceBudget::default())
+                .await
+                .unwrap();
         let res = mgr
             .engine()
             .queries
-            .query("hello_inst", serde_json::json!({}), &Principal::administrator(), false)
+            .query(
+                "hello_inst",
+                serde_json::json!({}),
+                &Principal::administrator(),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(res.value.unwrap()["v"], "pinned");
@@ -963,7 +1079,14 @@ mod tests {
         git_commit_all(&repo_b, "b2", "dev", None).await.unwrap();
 
         let lock = update_package_lock(&ws, &data, "alpha").await.unwrap();
-        let commit_of = |n: &str| lock.packages.iter().find(|p| p.name == n).unwrap().commit.clone();
+        let commit_of = |n: &str| {
+            lock.packages
+                .iter()
+                .find(|p| p.name == n)
+                .unwrap()
+                .commit
+                .clone()
+        };
         assert_eq!(commit_of("alpha"), a2);
         assert_ne!(commit_of("alpha"), a1);
         assert_eq!(commit_of("beta"), b1, "beta must stay pinned");
@@ -977,7 +1100,10 @@ mod tests {
         let ws = tmp.path().join("ws");
         let data = tmp.path().join("data");
         write_ws_deps(&ws, &[("ext", &repo)]);
-        let err = resolve_and_lock_packages(&ws, &data).await.unwrap_err().to_string();
+        let err = resolve_and_lock_packages(&ws, &data)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("differs from the dependency name"), "{err}");
     }
 
@@ -1018,7 +1144,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let err = resolve_and_lock_packages(&ws, &data).await.unwrap_err().to_string();
+        let err = resolve_and_lock_packages(&ws, &data)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("conflicting dependency requirements"), "{err}");
     }
 }

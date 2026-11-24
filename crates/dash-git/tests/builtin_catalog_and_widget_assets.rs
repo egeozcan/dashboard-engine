@@ -52,7 +52,10 @@ fn builtin_definitions_are_loaded_from_catalog_json() {
 fn widget_assets_come_only_from_assets_dir_of_widget_providers() {
     let tmp = TempDir::new().unwrap();
     let ws = tmp.path().join("ws");
-    write(&ws.join("packages/demo/package.toml"), "name = \"demo\"\nversion = \"0.1.0\"\n");
+    write(
+        &ws.join("packages/demo/package.toml"),
+        "name = \"demo\"\nversion = \"0.1.0\"\n",
+    );
     write(
         &ws.join("packages/demo/badge/definition.luau"),
         "local dash = require(\"dash\")\nreturn dash.widget_provider { id = \"demo.badge\", asset = \"assets/app.html\", props = dash.object { label = dash.string() } }\n",
@@ -67,7 +70,10 @@ fn widget_assets_come_only_from_assets_dir_of_widget_providers() {
         &ws.join("packages/demo/metric/runtime.luau"),
         "local R = {}\nfunction R.query(ctx) return {} end\nreturn R\n",
     );
-    write(&ws.join("packages/demo/metric/assets/leak.html"), "<p>no</p>");
+    write(
+        &ws.join("packages/demo/metric/assets/leak.html"),
+        "<p>no</p>",
+    );
 
     let g = load_workspace_graph(&ws, &tmp.path().join("data"), "test", 0, false).unwrap();
     let badge = &g.definitions["demo.badge"];
@@ -87,7 +93,10 @@ fn widget_assets_come_only_from_assets_dir_of_widget_providers() {
         .unwrap_err()
         .to_string();
     // Escaping the Definition directory is already rejected by the declaration path check.
-    assert!(err.contains("stay inside the Definition directory"), "{err}");
+    assert!(
+        err.contains("stay inside the Definition directory"),
+        "{err}"
+    );
 
     // Inside the Definition directory but outside assets/: rejected by the asset rule.
     write(

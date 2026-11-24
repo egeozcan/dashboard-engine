@@ -157,8 +157,20 @@ impl QueryEnvelope {
         env
     }
 
-    pub fn loading(instance: &str, query_key: &str, generation: i64, schema: Option<String>) -> Self {
-        Self::status_only(instance, query_key, generation, QueryStatus::Loading, schema, None)
+    pub fn loading(
+        instance: &str,
+        query_key: &str,
+        generation: i64,
+        schema: Option<String>,
+    ) -> Self {
+        Self::status_only(
+            instance,
+            query_key,
+            generation,
+            QueryStatus::Loading,
+            schema,
+            None,
+        )
     }
 
     pub fn error(
@@ -242,7 +254,11 @@ pub fn extract_row_key(row: &serde_json::Value, key_field: &str) -> Option<Strin
             other => other.to_string(),
         });
     }
-    if let Some(id) = row.get("id").or_else(|| row.get("key")).or_else(|| row.get("number")) {
+    if let Some(id) = row
+        .get("id")
+        .or_else(|| row.get("key"))
+        .or_else(|| row.get("number"))
+    {
         return Some(match id {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
@@ -320,8 +336,14 @@ pub fn compute_keyed_delta(
     }
 
     // Retained rows must keep their relative order.
-    let retained_old: Vec<&String> = old_order.iter().filter(|k| new_map.contains_key(*k)).collect();
-    let retained_new: Vec<&String> = new_order.iter().filter(|k| old_map.contains_key(*k)).collect();
+    let retained_old: Vec<&String> = old_order
+        .iter()
+        .filter(|k| new_map.contains_key(*k))
+        .collect();
+    let retained_new: Vec<&String> = new_order
+        .iter()
+        .filter(|k| old_map.contains_key(*k))
+        .collect();
     if retained_old != retained_new {
         return None;
     }
@@ -548,7 +570,10 @@ pub enum ProviderDeltaOutcome {
     /// The delta's sequence number was already applied; nothing changed.
     Duplicate { last_sequence: u64 },
     /// A gap (or missing base) was detected and the query was resynchronized from a snapshot.
-    Resynced { reason: String, snapshot: QueryEnvelope },
+    Resynced {
+        reason: String,
+        snapshot: QueryEnvelope,
+    },
 }
 
 /// What happened to an envelope handed to [`SignalHub::publish_query`].
@@ -558,9 +583,14 @@ pub enum PublishOutcome {
     NoSubscribers,
     Published,
     /// The delta's `base_version` did not match the channel's last published version.
-    DeltaRejected { expected_base: u64, got_base: Option<u64> },
+    DeltaRejected {
+        expected_base: u64,
+        got_base: Option<u64>,
+    },
     /// The snapshot's version is older than the channel's latest published version.
-    Superseded { latest: u64 },
+    Superseded {
+        latest: u64,
+    },
 }
 
 struct QueryChannel {
@@ -728,7 +758,8 @@ impl SignalHub {
             self.notify_activity(&snapshot);
             return PublishOutcome::NoSubscribers;
         }
-        if let (Some((prev_version, prev_value)), Some(new_value)) = (previous, snapshot.value.as_ref())
+        if let (Some((prev_version, prev_value)), Some(new_value)) =
+            (previous, snapshot.value.as_ref())
         {
             if let (Some(old_arr), Some(new_arr)) = (prev_value.as_array(), new_value.as_array()) {
                 if let Some((field, ops)) =
@@ -795,7 +826,10 @@ impl SignalHub {
 
     /// Number of live consumers (stream + watch receivers) of one query.
     pub fn subscriber_count(&self, query_key: &str) -> usize {
-        self.queries.get(query_key).map(|c| c.receivers()).unwrap_or(0)
+        self.queries
+            .get(query_key)
+            .map(|c| c.receivers())
+            .unwrap_or(0)
     }
 
     pub fn is_query_subscribed(&self, query_key: &str) -> bool {
@@ -881,7 +915,16 @@ mod tests {
     use serde_json::json;
 
     fn snap(qk: &str, version: u64, value: serde_json::Value) -> QueryEnvelope {
-        QueryEnvelope::snapshot("inst", qk, 1, version, QueryStatus::Fresh, None, value, None)
+        QueryEnvelope::snapshot(
+            "inst",
+            qk,
+            1,
+            version,
+            QueryStatus::Fresh,
+            None,
+            value,
+            None,
+        )
     }
 
     fn roundtrip(old: serde_json::Value, new: serde_json::Value) -> Option<Vec<serde_json::Value>> {
@@ -913,7 +956,9 @@ mod tests {
         assert!(compute_keyed_delta(dup.as_array().unwrap(), &[], "id").is_none());
         let old = json!([{"id": "a"}, {"id": "b"}]);
         let moved = json!([{"id": "b"}, {"id": "a"}]);
-        assert!(compute_keyed_delta(old.as_array().unwrap(), moved.as_array().unwrap(), "id").is_none());
+        assert!(
+            compute_keyed_delta(old.as_array().unwrap(), moved.as_array().unwrap(), "id").is_none()
+        );
     }
 
     #[test]
@@ -922,7 +967,8 @@ mod tests {
         let old = json!([{"number": 1, "s": "open"}, {"number": 2, "s": "open"}]);
         let new = json!([{"number": 1, "s": "merged"}, {"number": 2, "s": "open"}]);
         let (field, ops) =
-            compute_keyed_delta_inferred(old.as_array().unwrap(), new.as_array().unwrap(), "id").unwrap();
+            compute_keyed_delta_inferred(old.as_array().unwrap(), new.as_array().unwrap(), "id")
+                .unwrap();
         assert_eq!(field, "number");
         assert_eq!(ops.len(), 1);
         // Strict key field: a row missing it means no delta.
@@ -933,12 +979,18 @@ mod tests {
     #[test]
     fn hub_drops_publishes_without_subscribers_and_releases_idle_channels() {
         let hub = SignalHub::with_idle_grace(32, Duration::ZERO);
-        assert_eq!(hub.publish_query(snap("q1", 1, json!([]))), PublishOutcome::NoSubscribers);
+        assert_eq!(
+            hub.publish_query(snap("q1", 1, json!([]))),
+            PublishOutcome::NoSubscribers
+        );
         assert_eq!(hub.query_channel_count(), 0);
 
         let rx = hub.subscribe_stream("q1");
         assert_eq!(hub.subscriber_count("q1"), 1);
-        assert_eq!(hub.publish_query(snap("q1", 1, json!([]))), PublishOutcome::Published);
+        assert_eq!(
+            hub.publish_query(snap("q1", 1, json!([]))),
+            PublishOutcome::Published
+        );
         assert!(hub.sweep_idle().is_empty());
         drop(rx);
         assert_eq!(hub.subscriber_count("q1"), 0);
@@ -963,7 +1015,10 @@ mod tests {
         let bad = QueryEnvelope::delta("inst", "q1", 1, 1, 2, None, vec![]);
         assert_eq!(
             hub.publish_query(bad),
-            PublishOutcome::DeltaRejected { expected_base: 3, got_base: Some(1) }
+            PublishOutcome::DeltaRejected {
+                expected_base: 3,
+                got_base: Some(1)
+            }
         );
         let good = QueryEnvelope::delta("inst", "q1", 1, 3, 4, None, vec![]);
         assert_eq!(hub.publish_query(good), PublishOutcome::Published);
@@ -1011,10 +1066,16 @@ mod tests {
         let t = SourceSequenceTracker::default();
         assert_eq!(t.check_and_advance("q", 5), SequenceCheck::Baseline);
         assert_eq!(t.check_and_advance("q", 6), SequenceCheck::InOrder);
-        assert_eq!(t.check_and_advance("q", 6), SequenceCheck::Duplicate { last: 6 });
+        assert_eq!(
+            t.check_and_advance("q", 6),
+            SequenceCheck::Duplicate { last: 6 }
+        );
         assert_eq!(
             t.check_and_advance("q", 9),
-            SequenceCheck::Gap { expected: 7, got: 9 }
+            SequenceCheck::Gap {
+                expected: 7,
+                got: 9
+            }
         );
         t.reset("q", Some(9));
         assert_eq!(t.check_and_advance("q", 10), SequenceCheck::InOrder);
@@ -1024,7 +1085,9 @@ mod tests {
 
     #[test]
     fn envelope_updated_at_reports_last_success() {
-        let ts = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().with_timezone(&Utc);
+        let ts = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let env = snap("q", 1, json!(1)).with_updated_at(ts);
         assert_eq!(env.updated_at, ts.to_rfc3339());
         let err = QueryEnvelope::error("inst", "q", 1, None, "down".into());
@@ -1056,7 +1119,13 @@ mod query_activity_tests {
         }
         let first = rx.recv().await.unwrap();
         let second = rx.recv().await.unwrap();
-        assert_eq!((first.instance.as_str(), first.query_key.as_str()), ("open_prs", "qk_a"));
-        assert_eq!((second.instance.as_str(), second.query_key.as_str()), ("linked_prs", "qk_b"));
+        assert_eq!(
+            (first.instance.as_str(), first.query_key.as_str()),
+            ("open_prs", "qk_a")
+        );
+        assert_eq!(
+            (second.instance.as_str(), second.query_key.as_str()),
+            ("linked_prs", "qk_b")
+        );
     }
 }

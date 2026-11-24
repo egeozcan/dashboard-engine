@@ -51,7 +51,11 @@ async fn init_generates_password_and_never_silently_overwrites_credentials() {
     let tmp = TempDir::new().unwrap();
     let (ws, data) = (tmp.path().join("ws"), tmp.path().join("data"));
     let first = dash(&ws, &data, &["init"]).await;
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     let out = String::from_utf8_lossy(&first.stdout).to_string();
     let line = out
         .lines()
@@ -67,13 +71,26 @@ async fn init_generates_password_and_never_silently_overwrites_credentials() {
     assert!(!String::from_utf8_lossy(&second.stdout).contains("Generated Administrator password"));
 
     // Too-short explicit passwords are refused.
-    let short = dash(&ws, &data, &["init", "--reset-admin-password", "--admin-password", "abc"]).await;
+    let short = dash(
+        &ws,
+        &data,
+        &["init", "--reset-admin-password", "--admin-password", "abc"],
+    )
+    .await;
     assert!(!short.status.success());
 
     // The generated password works for browser login.
     let addr = free_addr();
     let mut child = tokio::process::Command::new(BIN)
-        .args(["--workspace", ws.to_str().unwrap(), "--data-dir", data.to_str().unwrap(), "serve", "--bind", &addr])
+        .args([
+            "--workspace",
+            ws.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+            "serve",
+            "--bind",
+            &addr,
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -101,13 +118,38 @@ async fn init_generates_password_and_never_silently_overwrites_credentials() {
 async fn cli_commands_route_to_running_daemon_and_stdio_mcp_proxies_cleanly() {
     let tmp = TempDir::new().unwrap();
     let (ws, data) = (tmp.path().join("ws"), tmp.path().join("data"));
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
-    let init = dash(&ws, &data, &["init", "--admin-password", "secret123", "--from-fixture", fixture.to_str().unwrap()]).await;
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
+    let init = dash(
+        &ws,
+        &data,
+        &[
+            "init",
+            "--admin-password",
+            "secret123",
+            "--from-fixture",
+            fixture.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 
     let addr = free_addr();
     let mut child = tokio::process::Command::new(BIN)
-        .args(["--workspace", ws.to_str().unwrap(), "--data-dir", data.to_str().unwrap(), "serve", "--bind", &addr, "--use-mocks"])
+        .args([
+            "--workspace",
+            ws.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+            "serve",
+            "--bind",
+            &addr,
+            "--use-mocks",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -124,47 +166,98 @@ async fn cli_commands_route_to_running_daemon_and_stdio_mcp_proxies_cleanly() {
     let tok = dash(
         &ws,
         &data,
-        &["token", "create", "stdio-bot", "--ceiling", r#"{"allowed_providers":["*"],"can_author_drafts":true}"#, "--expires-in", "1h"],
+        &[
+            "token",
+            "create",
+            "stdio-bot",
+            "--ceiling",
+            r#"{"allowed_providers":["*"],"can_author_drafts":true}"#,
+            "--expires-in",
+            "1h",
+        ],
     )
     .await;
-    assert!(tok.status.success(), "{}", String::from_utf8_lossy(&tok.stderr));
+    assert!(
+        tok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tok.stderr)
+    );
     let tok_json: Value = serde_json::from_slice(&tok.stdout).unwrap();
     let agent_token = tok_json["token"].as_str().unwrap().to_string();
     assert!(tok_json["agent"]["expires_at"].is_string());
 
     let doctor = dash(&ws, &data, &["doctor"]).await;
     let doc: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert!(doc["checks"].as_array().unwrap().iter().any(|c| c["name"] == "sqlite_quick_check" && c["ok"] == true));
+    assert!(doc["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == "sqlite_quick_check" && c["ok"] == true));
 
     let reload = dash(&ws, &data, &["reload"]).await;
-    assert!(reload.status.success(), "{}", String::from_utf8_lossy(&reload.stderr));
+    assert!(
+        reload.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reload.stderr)
+    );
 
     // Secret plaintext from stdin (never argv), stored by the daemon.
     let mut set = tokio::process::Command::new(BIN)
-        .args(["--workspace", ws.to_str().unwrap(), "--data-dir", data.to_str().unwrap(), "secret", "set", "cli-secret"])
+        .args([
+            "--workspace",
+            ws.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+            "secret",
+            "set",
+            "cli-secret",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    set.stdin.take().unwrap().write_all(b"s3cr3t-from-stdin\n").await.unwrap();
+    set.stdin
+        .take()
+        .unwrap()
+        .write_all(b"s3cr3t-from-stdin\n")
+        .await
+        .unwrap();
     let set_out = set.wait_with_output().await.unwrap();
-    assert!(set_out.status.success(), "{}", String::from_utf8_lossy(&set_out.stderr));
+    assert!(
+        set_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
     assert!(!String::from_utf8_lossy(&set_out.stdout).contains("s3cr3t-from-stdin"));
     let listed = dash(&ws, &data, &["secret", "list"]).await;
     assert!(String::from_utf8_lossy(&listed.stdout).contains("cli-secret"));
 
     let git = dash(&ws, &data, &["git", "status"]).await;
-    assert!(git.status.success(), "{}", String::from_utf8_lossy(&git.stderr));
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
 
     let manifest = dash(&ws, &data, &["manifest", "engineering.linked_prs"]).await;
-    assert!(manifest.status.success(), "{}", String::from_utf8_lossy(&manifest.stderr));
+    assert!(
+        manifest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&manifest.stderr)
+    );
     let m: Value = serde_json::from_slice(&manifest.stdout).unwrap();
     assert_eq!(m["id"], "engineering.linked_prs");
 
     // stdio MCP: one JSON line per request, nothing for notifications, errors stay JSON-RPC.
     let mut proxy = tokio::process::Command::new(BIN)
-        .args(["mcp-stdio", "--url", &format!("http://{addr}/mcp"), "--token", &agent_token])
+        .args([
+            "mcp-stdio",
+            "--url",
+            &format!("http://{addr}/mcp"),
+            "--token",
+            &agent_token,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -178,12 +271,18 @@ async fn cli_commands_route_to_running_daemon_and_stdio_mcp_proxies_cleanly() {
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
         json!({ "jsonrpc": "2.0", "id": 3, "method": "no/such/method" }),
     ] {
-        stdin.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
+        stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .unwrap();
     }
     stdin.write_all(b"not json\n").await.unwrap();
     drop(stdin);
     let mut lines = Vec::new();
-    while let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(20), out.next_line()).await.unwrap() {
+    while let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(20), out.next_line())
+        .await
+        .unwrap()
+    {
         lines.push(serde_json::from_str::<Value>(&l).expect("every stdout line is JSON"));
     }
     assert_eq!(lines.len(), 4, "{lines:?}");
@@ -196,16 +295,26 @@ async fn cli_commands_route_to_running_daemon_and_stdio_mcp_proxies_cleanly() {
 
     // SIGTERM triggers the graceful drain path: the process exits cleanly and unpublishes itself.
     let pid = child.id().unwrap().to_string();
-    let killed = std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
     assert!(killed.success());
     let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
         .await
         .expect("daemon must exit after SIGTERM")
         .unwrap();
-    assert!(status.success(), "graceful shutdown must exit 0, got {status:?}");
+    assert!(
+        status.success(),
+        "graceful shutdown must exit 0, got {status:?}"
+    );
     assert!(!data.join("daemon.json").exists());
 
     // With no daemon, CLI commands run in-process under the Installation lock.
     let offline = dash(&ws, &data, &["secret", "list"]).await;
-    assert!(offline.status.success(), "{}", String::from_utf8_lossy(&offline.stderr));
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
 }

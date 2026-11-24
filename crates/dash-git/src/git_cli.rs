@@ -125,7 +125,12 @@ pub async fn ensure_git_repo(dir: &Path, branch: &str) -> Result<String, GitErro
     run_git(dir, &["add", "-A"]).await?;
     run_git(
         dir,
-        &["commit", "--allow-empty", "-m", "chore: initialize dash workspace"],
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "chore: initialize dash workspace",
+        ],
     )
     .await?;
     git_head(dir).await
@@ -156,11 +161,7 @@ pub async fn git_commit_all(
 
 pub async fn git_history(dir: &Path, limit: usize) -> Result<Vec<GitCommitInfo>, GitError> {
     let lim = format!("-n{limit}");
-    let out = run_git(
-        dir,
-        &["log", &lim, "--pretty=format:%H\t%an\t%aI\t%s"],
-    )
-    .await?;
+    let out = run_git(dir, &["log", &lim, "--pretty=format:%H\t%an\t%aI\t%s"]).await?;
     let mut commits = Vec::new();
     for line in out.lines() {
         let parts: Vec<&str> = line.splitn(4, '\t').collect();
@@ -291,7 +292,9 @@ pub async fn run_git_env(
     envs: &[(&str, &str)],
 ) -> Result<String, GitError> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0").args(args);
+    cmd.current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -323,7 +326,11 @@ pub async fn git_tree_of(dir: &Path, rev: &str) -> Result<String, GitError> {
 
 /// Resolve a revision expression to a full commit id (fails if it is not a commit).
 pub async fn git_resolve_commit(dir: &Path, rev: &str) -> Result<String, GitError> {
-    run_git(dir, &["rev-parse", "--verify", &format!("{rev}^{{commit}}")]).await
+    run_git(
+        dir,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .await
 }
 
 /// Stage every change of a draft worktree into its own (draft-private) index and return the
@@ -408,7 +415,11 @@ pub async fn git_update_head(
     expected_old: &str,
     reason: &str,
 ) -> Result<(), GitError> {
-    run_git(dir, &["update-ref", "-m", reason, "HEAD", new, expected_old]).await?;
+    run_git(
+        dir,
+        &["update-ref", "-m", reason, "HEAD", new, expected_old],
+    )
+    .await?;
     Ok(())
 }
 
@@ -508,12 +519,17 @@ mod plumbing_tests {
         let tmp = tempfile::tempdir().unwrap();
         let head = repo_with_commit(tmp.path()).await;
         let head_tree = git_tree_of(tmp.path(), &head).await.unwrap();
-        assert_eq!(git_snapshot_worktree_tree(tmp.path()).await.unwrap(), head_tree);
+        assert_eq!(
+            git_snapshot_worktree_tree(tmp.path()).await.unwrap(),
+            head_tree
+        );
 
         std::fs::remove_file(tmp.path().join("b.txt")).unwrap();
         let snap = git_snapshot_worktree_tree(tmp.path()).await.unwrap();
         assert_ne!(snap, head_tree);
-        let diff = git_diff_name_status(tmp.path(), &head_tree, &snap).await.unwrap();
+        let diff = git_diff_name_status(tmp.path(), &head_tree, &snap)
+            .await
+            .unwrap();
         assert_eq!(diff, vec![('D', "b.txt".to_string())]);
         // The real index still matches HEAD (nothing was staged by the snapshot)
         assert_eq!(git_index_tree(tmp.path()).await.unwrap(), head_tree);
@@ -554,10 +570,16 @@ mod plumbing_tests {
         git_read_tree_fast_forward(&ws, &base2, &c).await.unwrap();
         assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "a2\n");
         assert!(!ws.join("b.txt").exists());
-        assert_eq!(std::fs::read_to_string(ws.join("ignored.local")).unwrap(), "keep me");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("ignored.local")).unwrap(),
+            "keep me"
+        );
         assert!(git_tracked_changes(&ws).await.unwrap().is_empty());
         let msg = git_commit_message(&ws, "HEAD").await.unwrap();
-        assert_eq!(commit_trailer(&msg, "Dash-Author").as_deref(), Some("agt_1"));
+        assert_eq!(
+            commit_trailer(&msg, "Dash-Author").as_deref(),
+            Some("agt_1")
+        );
         let hist = git_history(&ws, 1).await.unwrap();
         assert_eq!(hist[0].author, "agt_1");
     }
@@ -573,7 +595,10 @@ mod plumbing_tests {
         git_export_tree(&ws, &head, &out).await.unwrap();
         assert_eq!(std::fs::read_to_string(out.join("a.txt")).unwrap(), "a1\n");
         assert!(!out.join(".git").exists());
-        assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "dirty\n");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "dirty\n"
+        );
         assert_eq!(git_tracked_changes(&ws).await.unwrap().len(), 1);
     }
 }

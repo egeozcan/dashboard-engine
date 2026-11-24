@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn copy_ecc_fixture(dst: &Path) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/engineering-command-center");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
     dash_git::packages::copy_tree_excluding_git(&src, dst).unwrap();
 }
 
@@ -73,7 +73,11 @@ async fn benchmark_gates_section_15_3() {
     let client = reqwest::Client::new();
     let mut startup_ms = None;
     for _ in 0..200 {
-        if let Ok(r) = client.get(format!("http://{bind_addr}/healthz")).send().await {
+        if let Ok(r) = client
+            .get(format!("http://{bind_addr}/healthz"))
+            .send()
+            .await
+        {
             if r.status() == 200 {
                 startup_ms = Some(start_t0.elapsed().as_secs_f64() * 1000.0);
                 break;
@@ -87,7 +91,10 @@ async fn benchmark_gates_section_15_3() {
     let _ = child.kill().await;
 
     assert!(startup_ms <= 2000.0, "startup {startup_ms:.1} ms > 2000 ms");
-    assert!(idle_rss_mib <= 100.0, "idle RSS {idle_rss_mib:.1} MiB > 100 MiB");
+    assert!(
+        idle_rss_mib <= 100.0,
+        "idle RSS {idle_rss_mib:.1} MiB > 100 MiB"
+    );
 
     // 2. Warm in-memory provider cache query p95 <= 5 ms & 100-subscriber signal propagation p95 <= 100 ms
     let tmp = TempDir::new().unwrap();
@@ -105,7 +112,12 @@ async fn benchmark_gates_section_15_3() {
     let admin = Principal::administrator();
 
     let init_q = services
-        .provider_query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, false)
+        .provider_query(
+            "open_prs",
+            json!({"repository": "acme/platform", "state": "open"}),
+            &admin,
+            false,
+        )
         .await
         .unwrap();
 
@@ -113,33 +125,49 @@ async fn benchmark_gates_section_15_3() {
     for _ in 0..200 {
         let t = Instant::now();
         let _ = services
-            .provider_query("open_prs", json!({"repository": "acme/platform", "state": "open"}), &admin, false)
+            .provider_query(
+                "open_prs",
+                json!({"repository": "acme/platform", "state": "open"}),
+                &admin,
+                false,
+            )
             .await
             .unwrap();
         warm_latencies_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     warm_latencies_ms.sort_by(|a, b| a.total_cmp(b));
     let warm_p95_ms = warm_latencies_ms[(warm_latencies_ms.len() * 95) / 100];
-    assert!(warm_p95_ms <= 5.0, "warm query p95 {warm_p95_ms:.3} ms > 5 ms");
+    assert!(
+        warm_p95_ms <= 5.0,
+        "warm query p95 {warm_p95_ms:.3} ms > 5 ms"
+    );
 
     // Signal propagation to 100 local subscribers p95 <= 100 ms
     let mut prop_latencies_ms = Vec::with_capacity(20);
     for iter in 0..20 {
         let mut rxs = Vec::with_capacity(100);
         for _ in 0..100 {
-            rxs.push(services.engine().signals.subscribe_stream(&init_q.query_key));
+            rxs.push(
+                services
+                    .engine()
+                    .signals
+                    .subscribe_stream(&init_q.query_key),
+            );
         }
         let t = Instant::now();
-        services.engine().signals.publish_query(QueryEnvelope::snapshot(
-            "open_prs",
-            &init_q.query_key,
-            1,
-            100 + iter,
-            QueryStatus::Fresh,
-            None,
-            json!([]),
-            None,
-        ));
+        services
+            .engine()
+            .signals
+            .publish_query(QueryEnvelope::snapshot(
+                "open_prs",
+                &init_q.query_key,
+                1,
+                100 + iter,
+                QueryStatus::Fresh,
+                None,
+                json!([]),
+                None,
+            ));
         for mut rx in rxs {
             let _ = rx.recv().await.unwrap();
         }
@@ -147,19 +175,29 @@ async fn benchmark_gates_section_15_3() {
     }
     prop_latencies_ms.sort_by(|a, b| a.total_cmp(b));
     let prop_p95_ms = prop_latencies_ms[(prop_latencies_ms.len() * 95) / 100];
-    assert!(prop_p95_ms <= 100.0, "signal propagation p95 {prop_p95_ms:.3} ms > 100 ms");
+    assert!(
+        prop_p95_ms <= 100.0,
+        "signal propagation p95 {prop_p95_ms:.3} ms > 100 ms"
+    );
 
     // 3. Failure isolation: looping Luau does not stall /healthz
     let app = build_router(services.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let srv = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let hz_t = Instant::now();
-    let hz = client.get(format!("http://{addr}/healthz")).send().await.unwrap();
+    let hz = client
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(hz.status(), 200);
     let health_ms = hz_t.elapsed().as_secs_f64() * 1000.0;
     srv.abort();

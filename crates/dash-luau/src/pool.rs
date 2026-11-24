@@ -112,12 +112,21 @@ impl ResourceBudget {
     }
 
     fn clamp_to(mut self, c: &ResourceBudget) -> Self {
-        self.memory_limit_bytes = self.memory_limit_bytes.clamp(1024 * 1024, c.memory_limit_bytes.max(1024 * 1024));
-        self.wall_timeout = self.wall_timeout.clamp(Duration::from_millis(1), c.wall_timeout.max(Duration::from_millis(1)));
+        self.memory_limit_bytes = self
+            .memory_limit_bytes
+            .clamp(1024 * 1024, c.memory_limit_bytes.max(1024 * 1024));
+        self.wall_timeout = self.wall_timeout.clamp(
+            Duration::from_millis(1),
+            c.wall_timeout.max(Duration::from_millis(1)),
+        );
         self.max_interrupts = self.max_interrupts.clamp(1, c.max_interrupts.max(1));
         self.idle_ttl = self.idle_ttl.min(c.idle_ttl);
-        self.max_concurrent_executions = self.max_concurrent_executions.clamp(1, c.max_concurrent_executions.max(1));
-        self.max_pending_per_instance = self.max_pending_per_instance.min(c.max_pending_per_instance);
+        self.max_concurrent_executions = self
+            .max_concurrent_executions
+            .clamp(1, c.max_concurrent_executions.max(1));
+        self.max_pending_per_instance = self
+            .max_pending_per_instance
+            .min(c.max_pending_per_instance);
         self.queue_timeout = self.queue_timeout.min(c.queue_timeout);
         self
     }
@@ -316,7 +325,9 @@ impl VmPool {
         let budget = budget.clamp_to(&ceiling);
         Self {
             vms: Arc::new(DashMap::new()),
-            permits: Arc::new(tokio::sync::Semaphore::new(budget.max_concurrent_executions)),
+            permits: Arc::new(tokio::sync::Semaphore::new(
+                budget.max_concurrent_executions,
+            )),
             budget,
             ceiling,
             total_reclaimed: Arc::new(AtomicU64::new(0)),
@@ -664,10 +675,14 @@ impl VmPool {
                 self.counters.timeouts.fetch_add(1, Ordering::Relaxed);
             }
             Err(RuntimeError::MemoryExceeded(_)) => {
-                self.counters.memory_exceeded.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .memory_exceeded
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Err(RuntimeError::QueueFull(_)) => {
-                self.counters.queue_rejections.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .queue_rejections
+                    .fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -738,23 +753,21 @@ impl VmPool {
         };
 
         // Wait for the Instance VM asynchronously: no blocking-pool thread is held while queued.
-        let guard = match tokio::time::timeout_at(
-            queue_deadline_tokio,
-            Arc::clone(&vm.lua).lock_owned(),
-        )
-        .await
-        {
-            Ok(g) => g,
-            Err(_) => {
-                if inherited_deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(RuntimeError::Timeout(budget.wall_timeout));
+        let guard =
+            match tokio::time::timeout_at(queue_deadline_tokio, Arc::clone(&vm.lua).lock_owned())
+                .await
+            {
+                Ok(g) => g,
+                Err(_) => {
+                    if inherited_deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Err(RuntimeError::Timeout(budget.wall_timeout));
+                    }
+                    return Err(RuntimeError::QueueFull(format!(
+                        "instance '{}' VM busy for longer than {:?}",
+                        bundle.instance_id, budget.queue_timeout
+                    )));
                 }
-                return Err(RuntimeError::QueueFull(format!(
-                    "instance '{}' VM busy for longer than {:?}",
-                    bundle.instance_id, budget.queue_timeout
-                )));
-            }
-        };
+            };
         stats.queue_ms = queued_at.elapsed().as_millis() as u64;
 
         let started = Instant::now();
@@ -821,7 +834,9 @@ impl VmPool {
                     HandlerOutcome::Cancelled => Err(RuntimeError::Cancelled),
                     HandlerOutcome::Failed(err) => Err(err),
                     HandlerOutcome::Lua(e) => {
-                        if timed_out.load(Ordering::Relaxed) || e.to_string().contains("DASH_TIMEOUT") {
+                        if timed_out.load(Ordering::Relaxed)
+                            || e.to_string().contains("DASH_TIMEOUT")
+                        {
                             Err(RuntimeError::Timeout(reported_timeout))
                         } else if e.to_string().contains("DASH_CANCELLED") {
                             Err(RuntimeError::Cancelled)
@@ -921,7 +936,8 @@ async fn run_module_handler(
         }
     };
 
-    let ctx_ud = match lua.create_userdata(LuaContext::with_emit_declarations(ctx_cfg, emit_decls)) {
+    let ctx_ud = match lua.create_userdata(LuaContext::with_emit_declarations(ctx_cfg, emit_decls))
+    {
         Ok(u) => u,
         Err(e) => return HandlerOutcome::Lua(e),
     };
@@ -1002,7 +1018,10 @@ impl ModuleLoader {
     }
 
     pub(crate) fn preload(&self, name: &str, key: mlua::RegistryKey) {
-        self.loaded.lock().unwrap().insert(format!("preload:{name}"), key);
+        self.loaded
+            .lock()
+            .unwrap()
+            .insert(format!("preload:{name}"), key);
     }
 
     pub(crate) fn install(self: &Arc<Self>, lua: &Lua, dash_sdk: Table) -> mlua::Result<()> {
@@ -1056,7 +1075,10 @@ fn build_sandboxed_vm(
 ) -> Result<Lua, RuntimeError> {
     let lua = new_sandbox_lua(budget.memory_limit_bytes)?;
     let dash_sdk = build_dash_runtime_sdk(&lua)?;
-    let loader = ModuleLoader::new(bundle.resolved_libraries.clone(), &bundle.manifest.libraries);
+    let loader = ModuleLoader::new(
+        bundle.resolved_libraries.clone(),
+        &bundle.manifest.libraries,
+    );
     loader.install(&lua, dash_sdk)?;
     lua.sandbox(true)?;
     Ok(lua)
@@ -1083,31 +1105,66 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl HostBridge for ProbeBridge {
-        async fn query_input(&self, _n: &str, _p: serde_json::Value) -> Result<serde_json::Value, String> {
-            self.seen_deadlines.lock().unwrap().push(current_execution_deadline());
+        async fn query_input(
+            &self,
+            _n: &str,
+            _p: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            self.seen_deadlines
+                .lock()
+                .unwrap()
+                .push(current_execution_deadline());
             tokio::time::sleep(self.sleep).await;
             Ok(json!([1, 2, 3]))
         }
-        async fn call_input(&self, _n: &str, _o: &str, _a: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn call_input(
+            &self,
+            _n: &str,
+            _o: &str,
+            _a: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             tokio::time::sleep(self.sleep).await;
             Ok(json!({ "ok": true }))
         }
-        async fn invoke_action(&self, _n: &str, _a: serde_json::Value, _k: Option<String>) -> Result<serde_json::Value, String> {
+        async fn invoke_action(
+            &self,
+            _n: &str,
+            _a: serde_json::Value,
+            _k: Option<String>,
+        ) -> Result<serde_json::Value, String> {
             Ok(json!({}))
         }
         async fn http_request(&self, _r: HttpHostRequest) -> Result<HttpHostResponse, String> {
             Err("blocked".into())
         }
         async fn emit_event(&self, t: &str, p: serde_json::Value, d: bool) -> Result<(), String> {
-            self.emitted.lock().unwrap().push((t.into(), "?".into(), d, p));
+            self.emitted
+                .lock()
+                .unwrap()
+                .push((t.into(), "?".into(), d, p));
             Ok(())
         }
-        async fn emit_event_versioned(&self, t: &str, v: &str, p: serde_json::Value, d: bool) -> Result<(), String> {
-            self.emitted.lock().unwrap().push((t.into(), v.into(), d, p));
+        async fn emit_event_versioned(
+            &self,
+            t: &str,
+            v: &str,
+            p: serde_json::Value,
+            d: bool,
+        ) -> Result<(), String> {
+            self.emitted
+                .lock()
+                .unwrap()
+                .push((t.into(), v.into(), d, p));
             Ok(())
         }
         async fn state_get(&self, _s: &str, k: &str) -> Result<serde_json::Value, String> {
-            Ok(self.state.lock().unwrap().get(k).cloned().unwrap_or(serde_json::Value::Null))
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .get(k)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null))
         }
         async fn state_set(&self, _s: &str, k: &str, v: serde_json::Value) -> Result<(), String> {
             self.state.lock().unwrap().insert(k.into(), v);
@@ -1183,11 +1240,27 @@ return R
         let b = bundle("slow", DP_DECL, AWAIT_RT);
         let t0 = Instant::now();
         let res = pool
-            .execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "slow", &["up"], bridge.clone()), None)
+            .execute_handler(
+                &b,
+                "query",
+                cfg(
+                    DefinitionCategory::DataProvider,
+                    "slow",
+                    &["up"],
+                    bridge.clone(),
+                ),
+                None,
+            )
             .await;
         assert!(matches!(res, Err(RuntimeError::Timeout(_))), "{res:?}");
-        assert!(t0.elapsed() < Duration::from_secs(2), "deadline not enforced during await");
-        assert!(pool.vm_uid("slow").is_none(), "timed-out VM must be evicted");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "deadline not enforced during await"
+        );
+        assert!(
+            pool.vm_uid("slow").is_none(),
+            "timed-out VM must be evicted"
+        );
         // The host operation saw the invocation's deadline (nested executions inherit it).
         let seen = bridge.seen_deadlines.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -1208,7 +1281,17 @@ return R
         });
         let t0 = Instant::now();
         let res = pool
-            .execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "cancel_me", &["up"], probe(5_000)), Some(flag))
+            .execute_handler(
+                &b,
+                "query",
+                cfg(
+                    DefinitionCategory::DataProvider,
+                    "cancel_me",
+                    &["up"],
+                    probe(5_000),
+                ),
+                Some(flag),
+            )
             .await;
         assert!(matches!(res, Err(RuntimeError::Cancelled)), "{res:?}");
         assert!(t0.elapsed() < Duration::from_secs(1));
@@ -1224,14 +1307,27 @@ return R
         let b = bundle("busy", DP_DECL, AWAIT_RT);
         let (p2, b2, br2) = (pool.clone(), b.clone(), bridge.clone());
         let first = tokio::spawn(async move {
-            p2.execute_handler(&b2, "query", cfg(DefinitionCategory::DataProvider, "busy", &["up"], br2), None)
-                .await
+            p2.execute_handler(
+                &b2,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "busy", &["up"], br2),
+                None,
+            )
+            .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let second = pool
-            .execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "busy", &["up"], bridge), None)
+            .execute_handler(
+                &b,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "busy", &["up"], bridge),
+                None,
+            )
             .await;
-        assert!(matches!(second, Err(RuntimeError::QueueFull(_))), "{second:?}");
+        assert!(
+            matches!(second, Err(RuntimeError::QueueFull(_))),
+            "{second:?}"
+        );
         assert!(first.await.unwrap().is_ok());
         assert_eq!(pool.metrics().total_queue_rejections, 1);
     }
@@ -1248,18 +1344,41 @@ return R
         let b = bundle("inst_b", DP_DECL, AWAIT_RT);
         let (p2, br2) = (pool.clone(), bridge.clone());
         let first = tokio::spawn(async move {
-            p2.execute_handler(&a, "query", cfg(DefinitionCategory::DataProvider, "inst_a", &["up"], br2), None)
-                .await
+            p2.execute_handler(
+                &a,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "inst_a", &["up"], br2),
+                None,
+            )
+            .await
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
         let second = pool
-            .execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "inst_b", &["up"], bridge.clone()), None)
+            .execute_handler(
+                &b,
+                "query",
+                cfg(
+                    DefinitionCategory::DataProvider,
+                    "inst_b",
+                    &["up"],
+                    bridge.clone(),
+                ),
+                None,
+            )
             .await;
-        assert!(matches!(second, Err(RuntimeError::QueueFull(_))), "{second:?}");
+        assert!(
+            matches!(second, Err(RuntimeError::QueueFull(_))),
+            "{second:?}"
+        );
         assert!(first.await.unwrap().is_ok());
         // The slot is free again once the first execution finished.
         let third = pool
-            .execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "inst_b", &["up"], bridge), None)
+            .execute_handler(
+                &b,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "inst_b", &["up"], bridge),
+                None,
+            )
             .await;
         assert!(third.is_ok(), "{third:?}");
     }
@@ -1273,8 +1392,13 @@ return R
         for _ in 0..8 {
             let (p, b, br) = (pool.clone(), b.clone(), bridge.clone());
             handles.push(tokio::spawn(async move {
-                p.execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "shared", &["up"], br), None)
-                    .await
+                p.execute_handler(
+                    &b,
+                    "query",
+                    cfg(DefinitionCategory::DataProvider, "shared", &["up"], br),
+                    None,
+                )
+                .await
             }));
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -1283,7 +1407,11 @@ return R
         for h in handles {
             assert!(h.await.unwrap().is_ok());
         }
-        assert_eq!(pool.metrics().total_vm_starts, 1, "exactly one VM for one Instance");
+        assert_eq!(
+            pool.metrics().total_vm_starts,
+            1,
+            "exactly one VM for one Instance"
+        );
         assert_eq!(pool.reclaim_idle(Some(Duration::ZERO)), 1);
     }
 
@@ -1291,9 +1419,19 @@ return R
     async fn eviction_only_removes_the_failed_vm() {
         let pool = VmPool::new(budget(1_000));
         let b = bundle("evict_me", DP_DECL, AWAIT_RT);
-        pool.execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "evict_me", &["up"], probe(0)), None)
-            .await
-            .unwrap();
+        pool.execute_handler(
+            &b,
+            "query",
+            cfg(
+                DefinitionCategory::DataProvider,
+                "evict_me",
+                &["up"],
+                probe(0),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
         let uid = pool.vm_uid("evict_me").unwrap();
         pool.evict_vm("evict_me", "vm_someone_else");
         assert_eq!(pool.vm_uid("evict_me").as_deref(), Some(uid.as_str()));
@@ -1309,9 +1447,15 @@ return R
         };
         let pool = VmPool::with_ceiling(budget(3_000), ceiling);
         // The default budget is clamped to the ceiling as well.
-        assert_eq!(pool.effective_budget("anything").wall_timeout, Duration::from_millis(400));
+        assert_eq!(
+            pool.effective_budget("anything").wall_timeout,
+            Duration::from_millis(400)
+        );
         pool.set_budget_resolver(Arc::new(|id: &str| match id {
-            "tight" => Some(ResourceOverrides { timeout_ms: Some(60), ..Default::default() }),
+            "tight" => Some(ResourceOverrides {
+                timeout_ms: Some(60),
+                ..Default::default()
+            }),
             "greedy" => Some(ResourceOverrides {
                 timeout_ms: Some(3_600_000),
                 memory_limit_mib: Some(1 << 20),
@@ -1319,20 +1463,41 @@ return R
             }),
             _ => None,
         }));
-        assert_eq!(pool.effective_budget("tight").wall_timeout, Duration::from_millis(60));
+        assert_eq!(
+            pool.effective_budget("tight").wall_timeout,
+            Duration::from_millis(60)
+        );
         let greedy = pool.effective_budget("greedy");
         assert_eq!(greedy.wall_timeout, Duration::from_millis(400));
-        assert_eq!(greedy.memory_limit_bytes, ResourceBudget::default_ceiling().memory_limit_bytes);
+        assert_eq!(
+            greedy.memory_limit_bytes,
+            ResourceBudget::default_ceiling().memory_limit_bytes
+        );
 
         let bridge = probe(200);
         let tight = bundle("tight", DP_DECL, AWAIT_RT);
         let res = pool
-            .execute_handler(&tight, "query", cfg(DefinitionCategory::DataProvider, "tight", &["up"], bridge.clone()), None)
+            .execute_handler(
+                &tight,
+                "query",
+                cfg(
+                    DefinitionCategory::DataProvider,
+                    "tight",
+                    &["up"],
+                    bridge.clone(),
+                ),
+                None,
+            )
             .await;
         assert!(matches!(res, Err(RuntimeError::Timeout(_))), "{res:?}");
         let normal = bundle("normal", DP_DECL, AWAIT_RT);
         let res = pool
-            .execute_handler(&normal, "query", cfg(DefinitionCategory::DataProvider, "normal", &["up"], bridge), None)
+            .execute_handler(
+                &normal,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "normal", &["up"], bridge),
+                None,
+            )
             .await;
         assert!(res.is_ok(), "{res:?}");
     }
@@ -1342,13 +1507,25 @@ return R
         let pool = VmPool::new(budget(2_000));
         let seen: Arc<Mutex<Vec<ExecutionStats>>> = Arc::default();
         let s2 = Arc::clone(&seen);
-        pool.set_execution_observer(Arc::new(move |s: &ExecutionStats| s2.lock().unwrap().push(s.clone())));
+        pool.set_execution_observer(Arc::new(move |s: &ExecutionStats| {
+            s2.lock().unwrap().push(s.clone())
+        }));
         let bridge = probe(20);
         let b = bundle("observed", DP_DECL, AWAIT_RT);
         for _ in 0..2 {
-            pool.execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "observed", &["up"], bridge.clone()), None)
-                .await
-                .unwrap();
+            pool.execute_handler(
+                &b,
+                "query",
+                cfg(
+                    DefinitionCategory::DataProvider,
+                    "observed",
+                    &["up"],
+                    bridge.clone(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
         }
         let stats = seen.lock().unwrap().clone();
         assert_eq!(stats.len(), 2);
@@ -1367,7 +1544,8 @@ return R
         let mut libs = BTreeMap::new();
         libs.insert(
             "pkg.a".to_string(),
-            "local b = require(\"pkg.b\")\nreturn { v = function() return b.v + 1 end }".to_string(),
+            "local b = require(\"pkg.b\")\nreturn { v = function() return b.v + 1 end }"
+                .to_string(),
         );
         libs.insert("pkg.b".to_string(), "return { v = 41 }".to_string());
         libs.insert("pkg.secret".to_string(), "return { v = 0 }".to_string());
@@ -1379,10 +1557,19 @@ return dash.data_provider { id = "t.libs", libraries = { "pkg.a" } }
         let mut b = bundle("libs_ok", decl, ok_rt);
         b.resolved_libraries = libs.clone();
         let v = pool
-            .execute_handler(&b, "query", cfg(DefinitionCategory::DataProvider, "libs_ok", &[], probe(0)), None)
+            .execute_handler(
+                &b,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "libs_ok", &[], probe(0)),
+                None,
+            )
             .await
             .unwrap();
-        assert_eq!(v, json!(42), "transitive library loaded by a declared library");
+        assert_eq!(
+            v,
+            json!(42),
+            "transitive library loaded by a declared library"
+        );
 
         for (id, rt) in [
             ("libs_undeclared", "local R = {}\nfunction R.query(ctx) return require(\"pkg.secret\").v end\nreturn R"),

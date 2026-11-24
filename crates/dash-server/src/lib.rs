@@ -35,8 +35,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         let data = tmp.path().join("data");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
         dash_git::packages::copy_tree_excluding_git(&fixture, &ws).unwrap();
 
         let store = SqliteStore::open(&data).unwrap();
@@ -75,7 +75,11 @@ mod tests {
         assert_eq!(hz.status(), 200);
 
         // 2. Unauthenticated API & MCP requests rejected (401)
-        let unauth = client.get(format!("{base}/api/graph")).send().await.unwrap();
+        let unauth = client
+            .get(format!("{base}/api/graph"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(unauth.status(), 401);
 
         // 3. Browser login sets HttpOnly cookie & returns CSRF token; mutations without CSRF fail 403!
@@ -233,13 +237,17 @@ mod tests {
 
         // Custom widget asset requires authentication and serves with a sandboxing CSP
         let anon_widget = client
-            .get(format!("{base}/widgets/engineering.pr_badge_widget/assets/index.html"))
+            .get(format!(
+                "{base}/widgets/engineering.pr_badge_widget/assets/index.html"
+            ))
             .send()
             .await
             .unwrap();
         assert_eq!(anon_widget.status(), 401);
         let widget_resp = client
-            .get(format!("{base}/widgets/engineering.pr_badge_widget/assets/index.html"))
+            .get(format!(
+                "{base}/widgets/engineering.pr_badge_widget/assets/index.html"
+            ))
             .header("cookie", &session_cookie)
             .send()
             .await
@@ -354,7 +362,12 @@ mod tests {
 
         // DNS rebinding: Origin == Host == attacker name. Host allowlist rejects it everywhere,
         // including unauthenticated login, /healthz and /mcp.
-        for (method, path) in [("POST", "/api/auth/login"), ("GET", "/healthz"), ("POST", "/mcp"), ("GET", "/api/graph")] {
+        for (method, path) in [
+            ("POST", "/api/auth/login"),
+            ("GET", "/healthz"),
+            ("POST", "/mcp"),
+            ("GET", "/api/graph"),
+        ] {
             let req = client
                 .request(method.parse().unwrap(), format!("{base}{path}"))
                 .header("host", format!("evil.example:{}", addr.port()))
@@ -362,7 +375,11 @@ mod tests {
                 .header("authorization", format!("Bearer {admin_tok}"))
                 .json(&json!({ "username": "admin", "password": "pass1234" }));
             let r = req.send().await.unwrap();
-            assert_eq!(r.status(), 421, "{method} {path} must reject rebinding Host");
+            assert_eq!(
+                r.status(),
+                421,
+                "{method} {path} must reject rebinding Host"
+            );
         }
 
         // Login itself validates Origin.
@@ -394,7 +411,14 @@ mod tests {
         }
         services
             .store()
-            .append_audit("admin", "administrator", "action.invoke", "merge_pr", "ok", json!({ "repo": "acme/platform", "state": "open" }))
+            .append_audit(
+                "admin",
+                "administrator",
+                "action.invoke",
+                "merge_pr",
+                "ok",
+                json!({ "repo": "acme/platform", "state": "open" }),
+            )
             .unwrap();
         let a = services.audit_query(1).unwrap();
         assert_eq!(a[0].detail["repo"], "acme/platform");
@@ -452,7 +476,13 @@ mod tests {
         let (_tmp, services, addr, admin_tok, server_h) = boot_test_server().await;
         let base = format!("http://{addr}/mcp");
         let client = reqwest::Client::new();
-        let tok = agent(&services, CapabilityCeiling { can_author_drafts: true, ..Default::default() });
+        let tok = agent(
+            &services,
+            CapabilityCeiling {
+                can_author_drafts: true,
+                ..Default::default()
+            },
+        );
 
         let init = client
             .post(&base)
@@ -463,9 +493,15 @@ mod tests {
             .unwrap();
         assert_eq!(init.status(), 200);
         assert_eq!(init.headers()["mcp-protocol-version"], "2025-03-26");
-        let sid = init.headers()["mcp-session-id"].to_str().unwrap().to_string();
+        let sid = init.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
         let init_body: serde_json::Value = init.json().await.unwrap();
-        assert_eq!(init_body["result"]["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(
+            init_body["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
 
         // Notification -> 202, empty body.
         let note = client
@@ -507,7 +543,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parse.status(), 400);
-        assert_eq!(parse.json::<serde_json::Value>().await.unwrap()["error"]["code"], -32700);
+        assert_eq!(
+            parse.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            -32700
+        );
 
         // Array results are wrapped so structuredContent is an object.
         let cat: serde_json::Value = client
@@ -568,9 +607,18 @@ mod tests {
         let (_tmp, services, addr, _admin_tok, server_h) = boot_test_server().await;
         let base = format!("http://{addr}");
         let client = reqwest::Client::new();
-        let author = agent(&services, CapabilityCeiling { can_author_drafts: true, ..Default::default() });
+        let author = agent(
+            &services,
+            CapabilityCeiling {
+                can_author_drafts: true,
+                ..Default::default()
+            },
+        );
         let reader = agent(&services, CapabilityCeiling::default());
-        let admin_draft = services.draft_begin(&Principal::administrator()).await.unwrap();
+        let admin_draft = services
+            .draft_begin(&Principal::administrator())
+            .await
+            .unwrap();
 
         // Read-only Agent cannot abort the Administrator's Draft (HTTP and MCP).
         let abort = client
@@ -591,7 +639,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mcp_abort["result"]["isError"], true);
-        assert_eq!(services.draft_status(&admin_draft.draft_id).unwrap().status, "open");
+        assert_eq!(
+            services.draft_status(&admin_draft.draft_id).unwrap().status,
+            "open"
+        );
 
         // definition_create on an existing Definition / instance_configure on a missing Instance fail.
         let own: serde_json::Value = client
@@ -604,10 +655,16 @@ mod tests {
             .json()
             .await
             .unwrap();
-        let own_id = own["result"]["structuredContent"]["draft_id"].as_str().unwrap().to_string();
+        let own_id = own["result"]["structuredContent"]["draft_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let cfg_missing = services.instance_configure_in_draft(
             &own_id,
-            &serde_json::from_value(json!({ "id": "nope_missing", "category": "data_provider", "definition": "x.y" })).unwrap(),
+            &serde_json::from_value(
+                json!({ "id": "nope_missing", "category": "data_provider", "definition": "x.y" }),
+            )
+            .unwrap(),
             &Principal::administrator(),
         );
         assert!(cfg_missing.unwrap_err().contains("does not exist"));
@@ -621,7 +678,14 @@ mod tests {
         // Executions and audits are filtered for non-Administrators.
         services
             .store()
-            .append_audit("admin", "administrator", "secret.set", "github-work", "ok", json!({}))
+            .append_audit(
+                "admin",
+                "administrator",
+                "secret.set",
+                "github-work",
+                "ok",
+                json!({}),
+            )
             .unwrap();
         let audits: serde_json::Value = client
             .get(format!("{base}/api/diagnostics/audits"))
@@ -632,7 +696,11 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(audits.as_array().unwrap().iter().all(|a| a["principal_kind"] == "agent"));
+        assert!(audits
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["principal_kind"] == "agent"));
         let execs: serde_json::Value = client
             .get(format!("{base}/api/executions"))
             .header("authorization", format!("Bearer {reader}"))
@@ -719,7 +787,10 @@ mod tests {
         let reader = Principal {
             id: "agt_r".into(),
             kind: dash_core::PrincipalKind::Agent,
-            ceiling: CapabilityCeiling { allowed_providers: BTreeSet::from(["open_prs".into()]), ..Default::default() },
+            ceiling: CapabilityCeiling {
+                allowed_providers: BTreeSet::from(["open_prs".into()]),
+                ..Default::default()
+            },
         };
         let explain = services.capability_explain("open_prs", &reader);
         assert_eq!(explain["provider_access"]["allowed"], true);
@@ -734,8 +805,18 @@ mod tests {
         let (_tmp, services, _addr, _admin_tok, server_h) = boot_test_server().await;
         let doc = services.workspace_doctor().unwrap();
         let checks = doc["checks"].as_array().unwrap();
-        for name in ["sqlite_quick_check", "sqlite_journal_mode", "vault_decrypts_all_secrets", "admin_credentials", "activation_journal", "sqlite_size_budget"] {
-            assert!(checks.iter().any(|c| c["name"] == name), "missing check {name}");
+        for name in [
+            "sqlite_quick_check",
+            "sqlite_journal_mode",
+            "vault_decrypts_all_secrets",
+            "admin_credentials",
+            "activation_journal",
+            "sqlite_size_budget",
+        ] {
+            assert!(
+                checks.iter().any(|c| c["name"] == name),
+                "missing check {name}"
+            );
         }
         assert_eq!(doc["sqlite_ok"], true);
 
@@ -756,11 +837,16 @@ mod tests {
         services.engine().graph.store(std::sync::Arc::new(graph));
         let g = services.graph_inspect_for(&agent_p);
         let text = g["instances"].to_string();
-        assert!(!text.contains("github-work"), "secret names must be masked: {text}");
+        assert!(
+            !text.contains("github-work"),
+            "secret names must be masked: {text}"
+        );
         assert!(text.contains("secret://[hidden]"));
         let mut granted = agent_p.clone();
         granted.ceiling.allowed_secrets = BTreeSet::from(["github-work".into()]);
-        assert!(services.graph_inspect_for(&granted)["instances"].to_string().contains("secret://github-work"));
+        assert!(services.graph_inspect_for(&granted)["instances"]
+            .to_string()
+            .contains("secret://github-work"));
         let report = services.enforce_retention().await.unwrap();
         assert!(!report.over_budget);
         server_h.abort();

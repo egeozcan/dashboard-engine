@@ -92,7 +92,9 @@ impl VaultKeySource {
         Self {
             master_key: non_empty("DASH_MASTER_KEY"),
             key_file: non_empty("DASH_MASTER_KEY_FILE").map(PathBuf::from),
-            passphrase: std::env::var("DASH_VAULT_PASSPHRASE").ok().filter(|v| !v.is_empty()),
+            passphrase: std::env::var("DASH_VAULT_PASSPHRASE")
+                .ok()
+                .filter(|v| !v.is_empty()),
         }
     }
 }
@@ -337,7 +339,8 @@ impl SecretVault {
         key_version: i64,
         plaintext: &str,
     ) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| VaultError::InvalidMasterKey)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| VaultError::InvalidMasterKey)?;
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -365,7 +368,8 @@ impl SecretVault {
         if nonce_bytes.len() != 12 {
             return Err(VaultError::DecryptionFailed);
         }
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| VaultError::InvalidMasterKey)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| VaultError::InvalidMasterKey)?;
         let nonce = Nonce::from_slice(nonce_bytes);
         let aad = format!("{secret_name}:v{key_version}");
         let plain = cipher
@@ -513,7 +517,10 @@ mod tests {
     fn default_key_file_is_created_0600_and_reported_unprotected() {
         let tmp = tempfile::tempdir().unwrap();
         let v = SecretVault::load_with(tmp.path(), &VaultKeySource::default()).unwrap();
-        assert!(matches!(v.key_protection(), KeyProtection::UnprotectedColocated { .. }));
+        assert!(matches!(
+            v.key_protection(),
+            KeyProtection::UnprotectedColocated { .. }
+        ));
         assert!(v.key_protection().warning().is_some());
         #[cfg(unix)]
         {
@@ -538,7 +545,10 @@ mod tests {
             ..Default::default()
         };
         let v = SecretVault::load_with(tmp.path(), &src).unwrap();
-        assert!(matches!(v.key_protection(), KeyProtection::PassphraseWrapped { .. }));
+        assert!(matches!(
+            v.key_protection(),
+            KeyProtection::PassphraseWrapped { .. }
+        ));
         assert!(v.key_protection().warning().is_none());
         let raw = std::fs::read_to_string(tmp.path().join("vault.key")).unwrap();
         assert!(raw.starts_with(WRAPPED_KEY_PREFIX));
@@ -586,7 +596,10 @@ mod tests {
             ..Default::default()
         };
         let v = SecretVault::load_with(data.path(), &src).unwrap();
-        assert!(matches!(v.key_protection(), KeyProtection::ExternalKeyFile { .. }));
+        assert!(matches!(
+            v.key_protection(),
+            KeyProtection::ExternalKeyFile { .. }
+        ));
         assert!(!data.path().join("vault.key").exists());
         assert!(keys.path().join("dash-master.key").exists());
 
@@ -596,7 +609,10 @@ mod tests {
             ..Default::default()
         };
         let v2 = SecretVault::load_with(data.path(), &inside).unwrap();
-        assert!(matches!(v2.key_protection(), KeyProtection::UnprotectedColocated { .. }));
+        assert!(matches!(
+            v2.key_protection(),
+            KeyProtection::UnprotectedColocated { .. }
+        ));
     }
 
     #[test]

@@ -114,7 +114,12 @@ impl AppServices {
         target: &str,
     ) -> Result<(), String> {
         if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            return Err(self.deny(principal, operation, target, "principal lacks can_author_drafts"));
+            return Err(self.deny(
+                principal,
+                operation,
+                target,
+                "principal lacks can_author_drafts",
+            ));
         }
         Ok(())
     }
@@ -219,7 +224,6 @@ impl AppServices {
         .map_err(|e| e.to_string())?;
         Ok(g.instances.get(instance_id).cloned())
     }
-
 
     /// Spawn background workers (§7.2, §7.3, §7.4, ADR-0002), all under explicit Service
     /// principals:
@@ -343,7 +347,10 @@ impl AppServices {
                 "events",
                 "",
                 "",
-                &format!("{} durable Event deliveries failed and were dead-lettered", report.failed),
+                &format!(
+                    "{} durable Event deliveries failed and were dead-lettered",
+                    report.failed
+                ),
             );
         }
         report
@@ -379,7 +386,10 @@ impl AppServices {
                 ("event_lag", snap.event_lag as f64),
                 ("sqlite_bytes", snap.sqlite_bytes as f64),
                 ("sqlite_wal_bytes", snap.sqlite_wal_bytes as f64),
-                ("trace_write_queue_depth", snap.trace_write_queue_depth as f64),
+                (
+                    "trace_write_queue_depth",
+                    snap.trace_write_queue_depth as f64,
+                ),
                 (
                     "refresh_latency_p95_ms",
                     snap.refresh_latency_p95_ms.unwrap_or(0) as f64,
@@ -452,9 +462,13 @@ impl AppServices {
             .events
             .prune_retained(dash_core::events::DEFAULT_EVENT_RETENTION_DAYS)
         {
-            self.engine()
-                .telemetry
-                .log("warn", "events", "", "", &format!("event retention failed: {e}"));
+            self.engine().telemetry.log(
+                "warn",
+                "events",
+                "",
+                "",
+                &format!("event retention failed: {e}"),
+            );
         }
     }
 
@@ -526,13 +540,23 @@ impl AppServices {
                 keep_warm.extend(sets.iter().map(|p| (sp.to_string(), p.clone())));
             }
         }
-        for series in g.workspace.history.iter().filter(|h| h.instance_id == inst_id) {
+        for series in g
+            .workspace
+            .history
+            .iter()
+            .filter(|h| h.instance_id == inst_id)
+        {
             keep_warm.push((series.service_principal.clone(), series.params.clone()));
         }
         for (sp_id, params) in keep_warm {
             match self.engine().automations.resolve_service_principal(&sp_id) {
                 Ok(sp) => {
-                    let qk = queries.compute_query_key(inst_id, &def.manifest.identity_version, &params, &sp);
+                    let qk = queries.compute_query_key(
+                        inst_id,
+                        &def.manifest.identity_version,
+                        &params,
+                        &sp,
+                    );
                     targets.entry(qk).or_insert((params, sp));
                 }
                 Err(e) => self.engine().telemetry.log(
@@ -588,7 +612,8 @@ impl AppServices {
     async fn refresh_active_dependents(&self, query_key: &str) -> usize {
         let queries = &self.engine().queries;
         let mut refreshed = 0;
-        let mut frontier: Vec<String> = queries.reverse_subscribers(query_key).into_iter().collect();
+        let mut frontier: Vec<String> =
+            queries.reverse_subscribers(query_key).into_iter().collect();
         let mut seen = std::collections::BTreeSet::new();
         while let Some(dep) = frontier.pop() {
             if !seen.insert(dep.clone()) || !self.query_is_active(&dep) {
@@ -596,7 +621,12 @@ impl AppServices {
             }
             if let Some(entry) = queries.cached_entry(&dep) {
                 if queries
-                    .query(&entry.instance_id, entry.params.clone(), &entry.principal, true)
+                    .query(
+                        &entry.instance_id,
+                        entry.params.clone(),
+                        &entry.principal,
+                        true,
+                    )
                     .await
                     .is_ok()
                 {
@@ -615,7 +645,9 @@ impl AppServices {
         automation_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<dash_store::AutomationExecutionRecord>, String> {
-        self.engine().automations.list_executions(automation_id, limit)
+        self.engine()
+            .automations
+            .list_executions(automation_id, limit)
     }
 
     pub fn dead_letters(
@@ -627,7 +659,9 @@ impl AppServices {
         if !principal.ceiling.unrestricted && !principal.ceiling.can_resolve_executions {
             return Err("principal lacks authority to inspect dead letters".into());
         }
-        self.engine().automations.list_dead_letters(include_resolved, limit)
+        self.engine()
+            .automations
+            .list_dead_letters(include_resolved, limit)
     }
 
     pub async fn dead_letter_redrive(
@@ -635,7 +669,10 @@ impl AppServices {
         dlq_id: &str,
         principal: &Principal,
     ) -> Result<serde_json::Value, String> {
-        self.engine().automations.redrive_dead_letter(dlq_id, principal).await
+        self.engine()
+            .automations
+            .redrive_dead_letter(dlq_id, principal)
+            .await
     }
 
     pub async fn events_replay(
@@ -650,7 +687,11 @@ impl AppServices {
         }
         self.engine()
             .automations
-            .replay_events(source_instance, after_sequence, reexecute.then_some(principal))
+            .replay_events(
+                source_instance,
+                after_sequence,
+                reexecute.then_some(principal),
+            )
             .await
     }
 
@@ -665,7 +706,10 @@ impl AppServices {
             .filter(|d| {
                 needle.is_empty()
                     || d.manifest.id.to_ascii_lowercase().contains(&needle)
-                    || d.manifest.description.to_ascii_lowercase().contains(&needle)
+                    || d.manifest
+                        .description
+                        .to_ascii_lowercase()
+                        .contains(&needle)
                     || d.manifest.category.as_str().contains(&needle)
             })
             .map(|d| CatalogEntry {
@@ -714,7 +758,6 @@ pub fn contract_json(def: &dash_core::LoadedDefinition) -> Result<serde_json::Va
 }
 
 impl AppServices {
-
     pub fn graph_inspect(&self) -> serde_json::Value {
         let g = self.graph();
         let validation = validate_configured_graph(&g, self.store(), false);
@@ -810,7 +853,12 @@ impl AppServices {
             _ => {}
         }
         out["action_authority"] = if i.category == DefinitionCategory::ActionProvider {
-            verdict(dash_core::check_action_authority(principal, i, &g, self.store()))
+            verdict(dash_core::check_action_authority(
+                principal,
+                i,
+                &g,
+                self.store(),
+            ))
         } else {
             serde_json::json!({
                 "allowed": false,
@@ -822,15 +870,31 @@ impl AppServices {
 
     /// Authorize `principal` to operate on a Draft (§2.1, §11.3): it needs `can_author_drafts`,
     /// and a non-Administrator may only touch Drafts it created.
-    pub fn authorize_draft(&self, draft_id: &str, principal: &Principal) -> Result<DraftRecord, String> {
+    pub fn authorize_draft(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
         if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
-            self.audit_denial(principal, "draft.access", draft_id, "principal lacks can_author_drafts");
+            self.audit_denial(
+                principal,
+                "draft.access",
+                draft_id,
+                "principal lacks can_author_drafts",
+            );
             return Err("principal lacks can_author_drafts".into());
         }
         let draft = self.draft_status(draft_id)?;
         if !principal.ceiling.unrestricted && draft.created_by != principal.id {
-            self.audit_denial(principal, "draft.access", draft_id, "draft belongs to another principal");
-            return Err(format!("draft '{draft_id}' not found or not owned by this principal"));
+            self.audit_denial(
+                principal,
+                "draft.access",
+                draft_id,
+                "draft belongs to another principal",
+            );
+            return Err(format!(
+                "draft '{draft_id}' not found or not owned by this principal"
+            ));
         }
         Ok(draft)
     }
@@ -849,11 +913,14 @@ impl AppServices {
     // Draft status/list/validate/preview/test/rebase/abort `_as` variants are defined below and
     // enforce ownership inside DraftManager.
 
-    pub async fn draft_activate_as(&self, draft_id: &str, principal: &Principal) -> Result<ActivationResult, String> {
+    pub async fn draft_activate_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<ActivationResult, String> {
         self.authorize_draft(draft_id, principal)?;
         self.draft_activate(draft_id, principal).await
     }
-
 
     /// `definition_create`: fails when the Definition directory already exists in the Draft.
     #[allow(clippy::too_many_arguments)]
@@ -873,7 +940,15 @@ impl AppServices {
                 "definition '{package}/{def_name}' already exists in draft; use definition_edit"
             ));
         }
-        self.definition_upsert_in_draft(draft_id, package, def_name, definition_luau, runtime_luau, tests_luau, principal)
+        self.definition_upsert_in_draft(
+            draft_id,
+            package,
+            def_name,
+            definition_luau,
+            runtime_luau,
+            tests_luau,
+            principal,
+        )
     }
 
     /// `definition_edit`: fails when the Definition does not exist in the Draft.
@@ -894,29 +969,56 @@ impl AppServices {
                 "definition '{package}/{def_name}' does not exist in draft; use definition_create"
             ));
         }
-        self.definition_upsert_in_draft(draft_id, package, def_name, definition_luau, runtime_luau, tests_luau, principal)
+        self.definition_upsert_in_draft(
+            draft_id,
+            package,
+            def_name,
+            definition_luau,
+            runtime_luau,
+            tests_luau,
+            principal,
+        )
     }
 
     /// `instance_create`: fails when an Instance with this id already exists in the Draft.
-    pub fn instance_create_in_draft(&self, draft_id: &str, inst: &InstanceConfig, principal: &Principal) -> Result<DraftRecord, String> {
+    pub fn instance_create_in_draft(
+        &self,
+        draft_id: &str,
+        inst: &InstanceConfig,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
         let draft = self.authorize_draft(draft_id, principal)?;
         if draft_instance_exists(&draft, &inst.id)? {
-            return Err(format!("instance '{}' already exists in draft; use instance_configure", inst.id));
+            return Err(format!(
+                "instance '{}' already exists in draft; use instance_configure",
+                inst.id
+            ));
         }
         self.instance_upsert_in_draft(draft_id, inst, principal)
     }
 
     /// `instance_configure`: fails when the Instance does not exist in the Draft.
-    pub fn instance_configure_in_draft(&self, draft_id: &str, inst: &InstanceConfig, principal: &Principal) -> Result<DraftRecord, String> {
+    pub fn instance_configure_in_draft(
+        &self,
+        draft_id: &str,
+        inst: &InstanceConfig,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
         let draft = self.authorize_draft(draft_id, principal)?;
         if !draft_instance_exists(&draft, &inst.id)? {
-            return Err(format!("instance '{}' does not exist in draft; use instance_create", inst.id));
+            return Err(format!(
+                "instance '{}' does not exist in draft; use instance_create",
+                inst.id
+            ));
         }
         self.instance_upsert_in_draft(draft_id, inst, principal)
     }
 
     /// Administrator-only hot reload of the bound Workspace via the Draft protocol (`dash reload`).
-    pub async fn workspace_reload(&self, principal: &Principal) -> Result<ActivationResult, String> {
+    pub async fn workspace_reload(
+        &self,
+        principal: &Principal,
+    ) -> Result<ActivationResult, String> {
         if !principal.ceiling.unrestricted {
             return Err("only the Administrator may reload the Workspace".into());
         }
@@ -963,7 +1065,11 @@ impl AppServices {
         self.draft_status_as(draft_id, &Principal::administrator())
     }
 
-    pub fn draft_status_as(&self, draft_id: &str, principal: &Principal) -> Result<DraftRecord, String> {
+    pub fn draft_status_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
         self.drafts
             .draft_status_as(draft_id, principal)
             .map_err(|e| e.to_string())
@@ -1012,7 +1118,8 @@ impl AppServices {
     }
 
     pub async fn draft_test(&self, draft_id: &str) -> Result<PreviewTestReport, String> {
-        self.draft_test_as(draft_id, &Principal::administrator()).await
+        self.draft_test_as(draft_id, &Principal::administrator())
+            .await
     }
 
     /// Test-focused report: validation, Definition tests and Scenario results (no Preview renders).
@@ -1058,7 +1165,11 @@ impl AppServices {
             .await
     }
 
-    pub async fn draft_abort_as(&self, draft_id: &str, principal: &Principal) -> Result<(), String> {
+    pub async fn draft_abort_as(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<(), String> {
         self.drafts
             .draft_abort_as(draft_id, principal)
             .await
@@ -1077,7 +1188,11 @@ impl AppServices {
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
         self.require_draft_author(principal, "draft.edit", draft_id)?;
-        self.record_draft_edit(draft_id, principal, &format!("definition:{package}.{def_name}"))?;
+        self.record_draft_edit(
+            draft_id,
+            principal,
+            &format!("definition:{package}.{def_name}"),
+        )?;
         self.drafts
             .draft_write_definition_as(
                 draft_id,
@@ -1127,9 +1242,7 @@ impl AppServices {
         if !inst.secrets.is_empty() {
             let existing = self.draft_instance(draft_id, &inst.id, principal)?;
             for slot in inst.secrets.keys() {
-                let unchanged = existing
-                    .as_ref()
-                    .and_then(|e| e.resolved_secret_name(slot))
+                let unchanged = existing.as_ref().and_then(|e| e.resolved_secret_name(slot))
                     == inst.resolved_secret_name(slot);
                 if unchanged {
                     continue;
@@ -1166,7 +1279,11 @@ impl AppServices {
         principal: &Principal,
     ) -> Result<DraftRecord, String> {
         self.require_draft_author(principal, "draft.edit", draft_id)?;
-        self.record_draft_edit(draft_id, principal, &format!("instance.delete:{instance_id}"))?;
+        self.record_draft_edit(
+            draft_id,
+            principal,
+            &format!("instance.delete:{instance_id}"),
+        )?;
         self.drafts
             .draft_delete_instance_as(draft_id, instance_id, principal)
             .map_err(|e| e.to_string())
@@ -1300,7 +1417,10 @@ impl AppServices {
             .await
     }
 
-    pub fn execution_inspect(&self, execution_id: Option<&str>) -> Result<serde_json::Value, String> {
+    pub fn execution_inspect(
+        &self,
+        execution_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         if let Some(id) = execution_id {
             let rec = self
                 .store()
@@ -1338,7 +1458,11 @@ impl AppServices {
                 .ok_or_else(|| format!("execution '{id}' not found"))?;
             Ok(serde_json::to_value(rec).unwrap())
         } else {
-            let scan = if principal.ceiling.unrestricted { 100 } else { 1000 };
+            let scan = if principal.ceiling.unrestricted {
+                100
+            } else {
+                1000
+            };
             let list: Vec<ActionExecutionRecord> = self
                 .store()
                 .list_action_executions(scan)
@@ -1401,7 +1525,11 @@ impl AppServices {
 
     /// Audit trail visible to `principal`: everything for the Administrator, only the
     /// Principal's own attributed records otherwise.
-    pub fn audit_query_for(&self, limit: usize, principal: &Principal) -> Result<Vec<AuditRecord>, String> {
+    pub fn audit_query_for(
+        &self,
+        limit: usize,
+        principal: &Principal,
+    ) -> Result<Vec<AuditRecord>, String> {
         if principal.ceiling.unrestricted {
             return self.audit_query(limit);
         }
@@ -1425,7 +1553,12 @@ impl AppServices {
 
     pub async fn git_sync(&self, principal: &Principal) -> Result<GitSyncRecord, String> {
         if !principal.ceiling.can_git_sync && !principal.ceiling.unrestricted {
-            return Err(self.deny(principal, "git.sync", "workspace", "principal lacks can_git_sync"));
+            return Err(self.deny(
+                principal,
+                "git.sync",
+                "workspace",
+                "principal lacks can_git_sync",
+            ));
         }
         self.drafts
             .git_sync(principal)
@@ -1442,8 +1575,12 @@ impl AppServices {
     ) -> Result<(DraftRecord, PackagesLock), String> {
         self.require_draft_author(principal, "package.update", package_name)?;
         // Only unrestricted (Administrator) principals may point dependencies at local paths.
-        dash_git::packages::validate_dependency_spec(package_name, &spec, principal.ceiling.unrestricted)
-            .map_err(|e| e.to_string())?;
+        dash_git::packages::validate_dependency_spec(
+            package_name,
+            &spec,
+            principal.ceiling.unrestricted,
+        )
+        .map_err(|e| e.to_string())?;
         self.record_draft_edit(draft_id, principal, &format!("dependency:{package_name}"))?;
         let requested = serde_json::to_value(&spec).unwrap_or_default();
         let result = self
@@ -1495,7 +1632,15 @@ impl AppServices {
         allowed_bindings: &[String],
         principal: &Principal,
     ) -> Result<SecretMetadata, String> {
-        self.secret_set_with_policy(name, description, plaintext, allowed_bindings, None, None, principal)
+        self.secret_set_with_policy(
+            name,
+            description,
+            plaintext,
+            allowed_bindings,
+            None,
+            None,
+            principal,
+        )
     }
 
     /// Set a secret plus its Administrator policy: destination hosts the credential may be
@@ -1571,7 +1716,11 @@ impl AppServices {
     }
 
     /// Set the Administrator network ceiling (audited as `network_policy.grant`).
-    pub fn network_policy_grant(&self, policy: NetworkPolicy, actor: &Principal) -> Result<(), String> {
+    pub fn network_policy_grant(
+        &self,
+        policy: NetworkPolicy,
+        actor: &Principal,
+    ) -> Result<(), String> {
         self.require_administrator(
             actor,
             "network_policy.grant",
@@ -1610,7 +1759,11 @@ impl AppServices {
             .ok_or_else(|| format!("instance '{instance_id}' not found in draft"))?;
         inst.secrets
             .insert(slot.to_string(), format!("secret://{secret_name}"));
-        self.record_draft_edit(draft_id, principal, &format!("secret.bind:{instance_id}.{slot}"))?;
+        self.record_draft_edit(
+            draft_id,
+            principal,
+            &format!("secret.bind:{instance_id}.{slot}"),
+        )?;
         let updated = self
             .drafts
             .draft_upsert_instance_as(draft_id, &inst, principal)
@@ -1706,7 +1859,11 @@ impl AppServices {
         let mut safe_ceiling = ceiling;
         // Agents NEVER become unrestricted Administrators!
         safe_ceiling.unrestricted = false;
-        let plaintext = format!("dsh_agt_{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let plaintext = format!(
+            "dsh_agt_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
         let rec = self
             .store()
             .create_agent_principal(
@@ -1861,8 +2018,8 @@ fn draft_instance_exists(draft: &DraftRecord, instance_id: &str) -> Result<bool,
             continue;
         }
         let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
         if let serde_yaml_ng::Value::Mapping(top) = doc {
             for (_, section) in top {
                 if let serde_yaml_ng::Value::Mapping(m) = section {
@@ -2004,7 +2161,11 @@ pub(crate) fn annotate_widget_asset_urls(g: &ConfiguredGraph, rendered: &mut ser
         let Some(obj) = node.as_object_mut() else {
             return;
         };
-        if let Some(wt) = obj.get("widget_type").and_then(|v| v.as_str()).map(str::to_string) {
+        if let Some(wt) = obj
+            .get("widget_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
             if let Some(def) = g.definitions.get(&wt) {
                 let safe_id = wt
                     .chars()
@@ -2156,11 +2317,10 @@ impl AppServices {
         let (ws_dir, def) = match draft_id {
             Some(id) => {
                 let (draft, g) = self.load_draft_graph(id, principal)?;
-                let def = g
-                    .definitions
-                    .get(definition_id)
-                    .cloned()
-                    .ok_or_else(|| format!("definition '{definition_id}' not found in draft"))?;
+                let def =
+                    g.definitions.get(definition_id).cloned().ok_or_else(|| {
+                        format!("definition '{definition_id}' not found in draft")
+                    })?;
                 (PathBuf::from(draft.worktree_path), def)
             }
             None => {
@@ -2196,7 +2356,11 @@ impl AppServices {
     }
 
     /// Unified diff of a Draft worktree against its base Revision (tracked and new files).
-    pub async fn draft_diff(&self, draft_id: &str, principal: &Principal) -> Result<DraftDiff, String> {
+    pub async fn draft_diff(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<DraftDiff, String> {
         use dash_git::git_cli::{run_git, run_git_allow_exit_1};
         let draft = self.draft_status_as(draft_id, principal)?;
         if draft.status == "aborted" || draft.status == "activated" {
@@ -2207,20 +2371,25 @@ impl AppServices {
         let mut files: Vec<DraftDiffFile> = Vec::new();
         let mut budget = MAX_DRAFT_DIFF_BYTES;
         let mut truncated = false;
-        let mut push_patch = |files: &mut Vec<DraftDiffFile>, path: String, status: String, patch: String| {
-            let patch = if patch.len() > budget {
-                truncated = true;
-                let mut cut = budget;
-                while cut > 0 && !patch.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                patch[..cut].to_string()
-            } else {
-                patch
+        let mut push_patch =
+            |files: &mut Vec<DraftDiffFile>, path: String, status: String, patch: String| {
+                let patch = if patch.len() > budget {
+                    truncated = true;
+                    let mut cut = budget;
+                    while cut > 0 && !patch.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    patch[..cut].to_string()
+                } else {
+                    patch
+                };
+                budget -= patch.len();
+                files.push(DraftDiffFile {
+                    path,
+                    status,
+                    patch,
+                });
             };
-            budget -= patch.len();
-            files.push(DraftDiffFile { path, status, patch });
-        };
 
         let name_status = run_git(&wt, &["diff", "--name-status", "--no-renames", &base, "--"])
             .await
@@ -2237,9 +2406,12 @@ impl AppServices {
                 Some('R') => "renamed",
                 _ => "modified",
             };
-            let patch = run_git(&wt, &["diff", "--no-color", "--no-renames", &base, "--", &path])
-                .await
-                .map_err(|e| e.to_string())?;
+            let patch = run_git(
+                &wt,
+                &["diff", "--no-color", "--no-renames", &base, "--", &path],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             push_patch(&mut files, path, status.into(), patch);
         }
 

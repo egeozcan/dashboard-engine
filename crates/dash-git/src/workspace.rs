@@ -119,7 +119,10 @@ struct InstanceEntryYaml {
     definition: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     inputs: BTreeMap<String, String>,
-    #[serde(default = "default_null", skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(
+        default = "default_null",
+        skip_serializing_if = "serde_json::Value::is_null"
+    )]
     config: serde_json::Value,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     secrets: BTreeMap<String, String>,
@@ -206,31 +209,51 @@ pub fn load_workspace_graph(
         if conn_path.exists() {
             let f: ConnectorsFile = serde_yaml_ng::from_str(&std::fs::read_to_string(&conn_path)?)
                 .map_err(|e| GitError::Workspace(format!("connectors.yaml: {e}")))?;
-            insert_instances(&mut graph.instances, f.connectors, DefinitionCategory::Connector);
+            insert_instances(
+                &mut graph.instances,
+                f.connectors,
+                DefinitionCategory::Connector,
+            );
         }
         let data_path = inst_dir.join("data.yaml");
         if data_path.exists() {
             let f: DataFile = serde_yaml_ng::from_str(&std::fs::read_to_string(&data_path)?)
                 .map_err(|e| GitError::Workspace(format!("data.yaml: {e}")))?;
-            insert_instances(&mut graph.instances, f.data, DefinitionCategory::DataProvider);
+            insert_instances(
+                &mut graph.instances,
+                f.data,
+                DefinitionCategory::DataProvider,
+            );
         }
         let act_path = inst_dir.join("actions.yaml");
         if act_path.exists() {
             let f: ActionsFile = serde_yaml_ng::from_str(&std::fs::read_to_string(&act_path)?)
                 .map_err(|e| GitError::Workspace(format!("actions.yaml: {e}")))?;
-            insert_instances(&mut graph.instances, f.actions, DefinitionCategory::ActionProvider);
+            insert_instances(
+                &mut graph.instances,
+                f.actions,
+                DefinitionCategory::ActionProvider,
+            );
         }
         let adp_path = inst_dir.join("adapters.yaml");
         if adp_path.exists() {
             let f: AdaptersFile = serde_yaml_ng::from_str(&std::fs::read_to_string(&adp_path)?)
                 .map_err(|e| GitError::Workspace(format!("adapters.yaml: {e}")))?;
-            insert_instances(&mut graph.instances, f.adapters, DefinitionCategory::Adapter);
+            insert_instances(
+                &mut graph.instances,
+                f.adapters,
+                DefinitionCategory::Adapter,
+            );
         }
         let auto_path = inst_dir.join("automations.yaml");
         if auto_path.exists() {
             let f: AutomationsFile = serde_yaml_ng::from_str(&std::fs::read_to_string(&auto_path)?)
                 .map_err(|e| GitError::Workspace(format!("automations.yaml: {e}")))?;
-            insert_instances(&mut graph.instances, f.automations, DefinitionCategory::Automation);
+            insert_instances(
+                &mut graph.instances,
+                f.automations,
+                DefinitionCategory::Automation,
+            );
         }
         let sp_path = inst_dir.join("service_principals.yaml");
         if sp_path.exists() {
@@ -383,7 +406,7 @@ fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
             invalidates: vec![],
             dashboard_state_reads: vec![],
             accepts_requests: vec![],
-        request_schemas: BTreeMap::new(),
+            request_schemas: BTreeMap::new(),
             widget_props: Some(SchemaSpec::Any),
             widget_asset: Some("builtin".into()),
             updates: UpdateModes::default(),
@@ -545,7 +568,9 @@ fn load_package_dir(
         let manifest = evaluate_declaration(&decl_src, &resolved_sources).map_err(|e| {
             GitError::Workspace(format!("declaration '{}': {e}", decl_path.display()))
         })?;
-        let ctx = |msg: String| GitError::Workspace(format!("declaration '{}': {msg}", decl_path.display()));
+        let ctx = |msg: String| {
+            GitError::Workspace(format!("declaration '{}': {msg}", decl_path.display()))
+        };
 
         // A Definition's ID is `package.definition` and must belong to its containing Package.
         let def_id = manifest.id.clone();
@@ -584,7 +609,8 @@ fn load_package_dir(
             }
         };
 
-        let tests_source = source_text(&resolved_sources, "tests.luau", &def_dir.join("tests.luau"))?;
+        let tests_source =
+            source_text(&resolved_sources, "tests.luau", &def_dir.join("tests.luau"))?;
 
         // Load JSON fixtures (under fixtures/ or declared paths). Declared fixtures must exist and
         // parse; other JSON files are offered as fixtures when they parse.
@@ -595,8 +621,11 @@ fn load_package_dir(
                     "fixture '{fixture_name}' path '{rel}' does not exist in the Definition directory"
                 )));
             };
-            let val = serde_json::from_slice::<serde_json::Value>(bytes)
-                .map_err(|e| ctx(format!("fixture '{fixture_name}' ({rel}) is not valid JSON: {e}")))?;
+            let val = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| {
+                ctx(format!(
+                    "fixture '{fixture_name}' ({rel}) is not valid JSON: {e}"
+                ))
+            })?;
             fixtures.insert(rel.clone(), val);
         }
         for (rel, bytes) in &resolved_sources {
@@ -720,7 +749,8 @@ fn finalize_definitions(
                 target.manifest.category.as_str()
             )));
         }
-        if mock.package_name != target.package_name && !local_packages.contains(&mock.package_name) {
+        if mock.package_name != target.package_name && !local_packages.contains(&mock.package_name)
+        {
             return Err(GitError::Workspace(format!(
                 "mock '{mock_id}' must be declared in the connector's package '{}' or in a Workspace-local package",
                 target.package_name
@@ -832,13 +862,23 @@ fn finalize_definitions(
             h.update(b"\0sem\0");
             h.update(sem.as_bytes());
             h.update(b"\0");
-            h.update(serde_json::to_string(&registry[sem]).unwrap_or_default().as_bytes());
+            h.update(
+                serde_json::to_string(&registry[sem])
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
         }
         if let Some(t) = &mock_target {
             h.update(b"\0mock_target\0");
             h.update(t.as_bytes());
             h.update(b"\0");
-            h.update(own_identity.get(t).map(String::as_str).unwrap_or("").as_bytes());
+            h.update(
+                own_identity
+                    .get(t)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
         }
         def.manifest.identity_version = format!("sha256:{}", hex::encode(h.finalize()));
     }
@@ -852,7 +892,9 @@ fn is_widget_asset_path(rel: &str) -> bool {
     };
     !rest.is_empty()
         && !rel.contains('\\')
-        && rest.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+        && rest
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 fn find_definition_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GitError> {
@@ -985,7 +1027,10 @@ pub fn upsert_instance_in_workspace(
     Ok(())
 }
 
-pub fn delete_instance_in_workspace(workspace_dir: &Path, instance_id: &str) -> Result<bool, GitError> {
+pub fn delete_instance_in_workspace(
+    workspace_dir: &Path,
+    instance_id: &str,
+) -> Result<bool, GitError> {
     let inst_dir = workspace_dir.join("instances");
     let mut removed = false;
     let p = inst_dir.join("connectors.yaml");
@@ -1146,8 +1191,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn fixture_ws(tmp: &TempDir) -> (PathBuf, PathBuf) {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/engineering-command-center");
+        let src =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/engineering-command-center");
         let ws = tmp.path().join("ws");
         let data = tmp.path().join("data");
         crate::packages::copy_tree_excluding_git(&src, &ws).unwrap();
@@ -1181,13 +1226,19 @@ mod tests {
         let g2 = load(&ws, &data).unwrap();
 
         let id = |g: &ConfiguredGraph, d: &str| g.definitions[d].manifest.identity_version.clone();
-        assert_ne!(id(&g1, "engineering.pr_utils"), id(&g2, "engineering.pr_utils"));
+        assert_ne!(
+            id(&g1, "engineering.pr_utils"),
+            id(&g2, "engineering.pr_utils")
+        );
         assert_ne!(
             id(&g1, "engineering.linked_prs"),
             id(&g2, "engineering.linked_prs"),
             "a dependent's identity must change when a Library it requires changes"
         );
-        assert_eq!(id(&g1, "github.pull_requests"), id(&g2, "github.pull_requests"));
+        assert_eq!(
+            id(&g1, "github.pull_requests"),
+            id(&g2, "github.pull_requests")
+        );
         assert_ne!(g1.graph_digest(), g2.graph_digest());
     }
 
@@ -1200,15 +1251,21 @@ mod tests {
             "engineering",
             "uses_lib",
             r#"local dash = require("dash"); return dash.data_provider { id = "engineering.uses_lib" }"#,
-            Some(r#"local u = require("engineering.pr_utils"); local R = {}; function R.query(ctx) return {} end; return R"#),
+            Some(
+                r#"local u = require("engineering.pr_utils"); local R = {}; function R.query(ctx) return {} end; return R"#,
+            ),
         );
         let g1 = load(&ws, &data).unwrap();
         let lib_rt = ws.join("packages/engineering/pr_utils/runtime.luau");
         std::fs::write(&lib_rt, "local M = {}; return M").unwrap();
         let g2 = load(&ws, &data).unwrap();
         assert_ne!(
-            g1.definitions["engineering.uses_lib"].manifest.identity_version,
-            g2.definitions["engineering.uses_lib"].manifest.identity_version
+            g1.definitions["engineering.uses_lib"]
+                .manifest
+                .identity_version,
+            g2.definitions["engineering.uses_lib"]
+                .manifest
+                .identity_version
         );
     }
 
@@ -1217,7 +1274,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("wt");
         std::fs::create_dir_all(&ws).unwrap();
-        let decl = r#"local dash = require("dash"); return dash.data_provider { id = "eng.metric" }"#;
+        let decl =
+            r#"local dash = require("dash"); return dash.data_provider { id = "eng.metric" }"#;
         for (pkg, name) in [
             ("../escape", "metric"),
             ("/abs", "metric"),
@@ -1258,8 +1316,12 @@ mod tests {
         std::fs::create_dir_all(ws.join("packages")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, ws.join("packages/eng")).unwrap();
-        let decl = r#"local dash = require("dash"); return dash.data_provider { id = "eng.metric" }"#;
-        assert!(write_definition_in_workspace(&ws, "eng", "metric", decl, Some(QUERY_RT), None).is_err());
+        let decl =
+            r#"local dash = require("dash"); return dash.data_provider { id = "eng.metric" }"#;
+        assert!(
+            write_definition_in_workspace(&ws, "eng", "metric", decl, Some(QUERY_RT), None)
+                .is_err()
+        );
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 
@@ -1460,7 +1522,10 @@ mod tests {
         // github.connector's `get_pr` result is declared shapeless; the registry pairs it with the
         // shape declared by github.pull_requests.
         match &g.definitions["github.connector"].manifest.operations["get_pr"].result {
-            dash_luau::SchemaSpec::Semantic { semantic_type, shape } => {
+            dash_luau::SchemaSpec::Semantic {
+                semantic_type,
+                shape,
+            } => {
                 assert_eq!(semantic_type, "dev.pull_request@1");
                 assert!(shape.is_some());
             }
@@ -1508,7 +1573,11 @@ mod tests {
         assert!(err.contains("disallowed file type"), "{err}");
         std::fs::remove_file(assets.join("payload.exe")).unwrap();
 
-        std::fs::write(assets.join("big.js"), vec![b'a'; MAX_WIDGET_ASSET_BYTES + 1]).unwrap();
+        std::fs::write(
+            assets.join("big.js"),
+            vec![b'a'; MAX_WIDGET_ASSET_BYTES + 1],
+        )
+        .unwrap();
         let err = load(&ws, &data).unwrap_err().to_string();
         assert!(err.contains("limit"), "{err}");
     }
@@ -1539,8 +1608,16 @@ mod tests {
         linked.inputs.remove("issues");
         linked.inputs.insert("bogus".into(), "open_prs".into());
         let report = dash_core::validate_configured_graph(&g, &store, true);
-        assert!(report.issues.iter().any(|i| i.code == "UNBOUND_INPUT"), "{:?}", report.issues);
-        assert!(report.issues.iter().any(|i| i.code == "UNDECLARED_INPUT"), "{:?}", report.issues);
+        assert!(
+            report.issues.iter().any(|i| i.code == "UNBOUND_INPUT"),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            report.issues.iter().any(|i| i.code == "UNDECLARED_INPUT"),
+            "{:?}",
+            report.issues
+        );
     }
 
     #[tokio::test]
@@ -1548,7 +1625,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (ws, data) = fixture_ws(&tmp);
         let a = load(&ws, &data).unwrap();
-        let b = load_workspace_graph_async(&ws, &data, "test", 1, true).await.unwrap();
+        let b = load_workspace_graph_async(&ws, &data, "test", 1, true)
+            .await
+            .unwrap();
         assert_eq!(a.graph_digest(), b.graph_digest());
     }
 }
@@ -1581,8 +1660,15 @@ mod library_activation_tests {
         let decl = std::fs::read_to_string(lib_dir.join("definition.luau")).unwrap();
         let mut rt = std::fs::read_to_string(lib_dir.join("runtime.luau")).unwrap();
         rt.push_str("\n-- library-only change\n");
-        mgr.draft_write_definition(&draft.draft_id, "engineering", "pr_utils", &decl, Some(&rt), None)
-            .unwrap();
+        mgr.draft_write_definition(
+            &draft.draft_id,
+            "engineering",
+            "pr_utils",
+            &decl,
+            Some(&rt),
+            None,
+        )
+        .unwrap();
         let act = mgr.draft_activate(&draft.draft_id, &admin).await.unwrap();
         assert!(
             act.rebuilt_instances.contains(&"linked_prs".to_string()),
@@ -1590,7 +1676,9 @@ mod library_activation_tests {
             act.rebuilt_instances,
             act.carried_over_instances
         );
-        assert!(!act.carried_over_instances.contains(&"linked_prs".to_string()));
+        assert!(!act
+            .carried_over_instances
+            .contains(&"linked_prs".to_string()));
         assert!(act.carried_over_instances.contains(&"open_prs".to_string()));
     }
 }

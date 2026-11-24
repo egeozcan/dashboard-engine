@@ -103,7 +103,10 @@ fn trim_to_rows(
 impl SqliteStore {
     /// Apply the retention policy to every growing table and enforce the SQLite size budget.
     /// Safe to call repeatedly; intended for the daemon's maintenance loop (off the async runtime).
-    pub fn enforce_retention(&self, policy: &RetentionPolicy) -> Result<RetentionReport, StoreError> {
+    pub fn enforce_retention(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<RetentionReport, StoreError> {
         let mut report = RetentionReport {
             db_size_bytes_before: self.db_size_bytes(),
             db_size_budget_bytes: policy.db_size_budget_bytes,
@@ -329,7 +332,8 @@ impl SqliteStore {
         self.with_conn_sync(|conn| {
             let mut out = Vec::new();
             for t in TABLES {
-                let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?;
+                let n: i64 =
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?;
                 out.push(((*t).to_string(), n));
             }
             Ok(out)
@@ -376,8 +380,9 @@ impl SqliteStore {
         });
 
         let blobs = self.with_conn_sync(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT name, key_version, nonce, ciphertext FROM encrypted_secret_blobs")?;
+            let mut stmt = conn.prepare(
+                "SELECT name, key_version, nonce, ciphertext FROM encrypted_secret_blobs",
+            )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -396,14 +401,19 @@ impl SqliteStore {
             Ok(rows) => {
                 let failed: Vec<String> = rows
                     .iter()
-                    .filter(|(name, kv, nonce, ct)| self.vault().decrypt(name, *kv, nonce, ct).is_err())
+                    .filter(|(name, kv, nonce, ct)| {
+                        self.vault().decrypt(name, *kv, nonce, ct).is_err()
+                    })
                     .map(|(name, _, _, _)| name.clone())
                     .collect();
                 StoreCheck {
                     name: "vault_decrypts_all_secrets".into(),
                     ok: failed.is_empty(),
                     detail: if failed.is_empty() {
-                        format!("{} secret blob(s) decrypt with the current master key", rows.len())
+                        format!(
+                            "{} secret blob(s) decrypt with the current master key",
+                            rows.len()
+                        )
                     } else {
                         // Names only, never plaintext.
                         format!("cannot decrypt: {}", failed.join(", "))
@@ -489,13 +499,20 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        store.set_consumer_checkpoint("complete_work", "merge_pr", 2).unwrap();
+        store
+            .set_consumer_checkpoint("complete_work", "merge_pr", 2)
+            .unwrap();
 
-        let report = store.enforce_retention(&RetentionPolicy::default()).unwrap();
+        let report = store
+            .enforce_retention(&RetentionPolicy::default())
+            .unwrap();
         assert_eq!(report.trace_spans_deleted, 1);
         assert_eq!(report.sessions_deleted, 1);
         assert_eq!(report.action_executions_deleted, 1);
-        assert_eq!(report.events_deleted, 2, "events 1,2 consumed; 3 is newest and kept");
+        assert_eq!(
+            report.events_deleted, 2,
+            "events 1,2 consumed; 3 is newest and kept"
+        );
         assert!(store.get_action_execution("e_unknown").unwrap().is_some());
         assert!(store.get_action_execution("e_ok").unwrap().is_none());
         // Sequence continues after pruning (newest event per source kept).
@@ -532,21 +549,29 @@ mod tests {
     fn health_checks_report_integrity_and_missing_admin() {
         let dir = TempDir::new().unwrap();
         let store = SqliteStore::open(dir.path()).unwrap();
-        store.set_secret("s1", "", "plaintext-value-1", &[]).unwrap();
+        store
+            .set_secret("s1", "", "plaintext-value-1", &[])
+            .unwrap();
         let checks = store.health_checks();
         let get = |n: &str| checks.iter().find(|c| c.name == n).unwrap().clone();
         assert!(get("sqlite_quick_check").ok);
         assert!(get("sqlite_journal_mode").ok);
         assert!(get("vault_decrypts_all_secrets").ok);
         assert!(!get("admin_credentials").ok);
-        assert!(!get("vault_decrypts_all_secrets").detail.contains("plaintext-value-1"));
+        assert!(!get("vault_decrypts_all_secrets")
+            .detail
+            .contains("plaintext-value-1"));
     }
 
     #[test]
     fn audits_filtered_by_principal() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.append_audit("agt_a", "agent", "op", "t", "ok", json!({})).unwrap();
-        store.append_audit("admin", "administrator", "op", "t", "ok", json!({})).unwrap();
+        store
+            .append_audit("agt_a", "agent", "op", "t", "ok", json!({}))
+            .unwrap();
+        store
+            .append_audit("admin", "administrator", "op", "t", "ok", json!({}))
+            .unwrap();
         let mine = store.list_audits_for_principal("agt_a", 10).unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].principal_id, "agt_a");
