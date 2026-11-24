@@ -325,12 +325,38 @@ pub async fn update_package_lock(
     resolve_with_policy(workspace_dir, data_dir, Some((&existing, target))).await
 }
 
+/// Like [`update_package_lock`], but resolves the in-memory `manifest` (a candidate
+/// `packages.toml`) against the Workspace's current `packages.lock` and writes nothing: the
+/// caller persists `packages.toml` and `packages.lock` only once resolution succeeded, so a
+/// failed update never leaves an unresolvable requirement behind.
+pub async fn resolve_package_update(
+    workspace_dir: &Path,
+    data_dir: &Path,
+    manifest: &PackagesToml,
+    target: &str,
+) -> Result<PackagesLock, GitError> {
+    let existing = read_packages_lock(workspace_dir)?;
+    resolve_manifest(manifest, data_dir, Some((&existing, target))).await
+}
+
 async fn resolve_with_policy(
     workspace_dir: &Path,
     data_dir: &Path,
     reuse: Option<(&PackagesLock, &str)>,
 ) -> Result<PackagesLock, GitError> {
     let manifest = read_packages_toml(workspace_dir)?;
+    let lock = resolve_manifest(&manifest, data_dir, reuse).await?;
+    write_packages_lock(workspace_dir, &lock)?;
+    Ok(lock)
+}
+
+/// Resolve `manifest` transitively into a lock (fetching into the content-addressed cache);
+/// no Workspace file is written.
+async fn resolve_manifest(
+    manifest: &PackagesToml,
+    data_dir: &Path,
+    reuse: Option<(&PackagesLock, &str)>,
+) -> Result<PackagesLock, GitError> {
     let mut ctx = ResolveCtx {
         data_dir,
         existing: reuse
@@ -354,12 +380,10 @@ async fn resolve_with_policy(
         resolve_recursive(name, spec, true, &mut ctx).await?;
     }
 
-    let lock = PackagesLock {
+    Ok(PackagesLock {
         version: 1,
         packages: ctx.resolved.into_values().collect(),
-    };
-    write_packages_lock(workspace_dir, &lock)?;
-    Ok(lock)
+    })
 }
 
 struct ResolveCtx<'a> {
@@ -1149,5 +1173,143 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("conflicting dependency requirements"), "{err}");
+    }
+
+    /// Workspace with Package `ext` locked at `pinned`, one Instance of `ext.hello`, and an
+    /// initialized (committed) DraftManager that is dropped again. Returns (tmp, ws, data, repo).
+    async fn committed_locked_workspace() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        make_pkg_repo(&repo, "ext", "pinned").await;
+        let ws = tmp.path().join("ws");
+        let data = tmp.path().join("data");
+        write_ws_deps(&ws, &[("ext", &repo)]);
+        std::fs::create_dir_all(ws.join("instances")).unwrap();
+        std::fs::write(
+            ws.join("instances/data.yaml"),
+            "data:\n  hello_inst:\n    definition: ext.hello\n",
+        )
+        .unwrap();
+        resolve_and_lock_packages(&ws, &data).await.unwrap();
+        let store = dash_store::SqliteStore::open(&data).unwrap();
+        crate::DraftManager::initialize(
+            ws.clone(),
+            data.clone(),
+            store,
+            dash_luau::ResourceBudget::default(),
+        )
+        .await
+        .unwrap();
+        (tmp, ws, data, repo)
+    }
+
+    async fn start_and_query_hello(ws: &Path, data: &Path) -> serde_json::Value {
+        let store = dash_store::SqliteStore::open(data).unwrap();
+        let mgr = crate::DraftManager::initialize(
+            ws.to_path_buf(),
+            data.to_path_buf(),
+            store,
+            dash_luau::ResourceBudget::default(),
+        )
+        .await
+        .expect("startup materializes the active Revision's locked Packages");
+        mgr.engine()
+            .queries
+            .query(
+                "hello_inst",
+                serde_json::json!({}),
+                &dash_core::Principal::administrator(),
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap()
+    }
+
+    /// R3:git-startup-lock-materialization (a): the lock that is materialized is the one of the
+    /// Revision being loaded (HEAD), not an uncommitted working-tree edit of packages.lock.
+    #[tokio::test]
+    async fn startup_materializes_the_lock_of_head_not_the_dirty_working_tree() {
+        let (_tmp, ws, data, _repo) = committed_locked_workspace().await;
+        std::fs::remove_dir_all(data.join("package_cache")).unwrap();
+        // Uncommitted edit: the working-tree lock no longer pins `ext`.
+        write_packages_lock(&ws, &PackagesLock::default()).unwrap();
+        let v = start_and_query_hello(&ws, &data).await;
+        assert_eq!(v["v"], "pinned");
+    }
+
+    /// R3:git-startup-lock-materialization (b): a present but corrupt cache entry is repaired at
+    /// startup instead of failing the integrity check.
+    #[tokio::test]
+    async fn startup_repairs_a_corrupt_cache_entry() {
+        let (_tmp, ws, data, _repo) = committed_locked_workspace().await;
+        let lock = read_packages_lock(&ws).unwrap();
+        let dir = package_cache_dir(&data, &lock.packages[0].tree_digest);
+        std::fs::write(dir.join("hello/runtime.luau"), "return { evil = true }").unwrap();
+        let v = start_and_query_hello(&ws, &data).await;
+        assert_eq!(v["v"], "pinned");
+        cached_package_roots(&data, &lock).unwrap();
+    }
+
+    /// R3:git-dependency-update-partial-write: a failed `dependency_update` leaves the draft's
+    /// packages.toml / packages.lock untouched, so later updates are not poisoned.
+    #[tokio::test]
+    async fn failed_dependency_update_leaves_the_draft_untouched() {
+        let (tmp, ws, data, repo) = committed_locked_workspace().await;
+        let repo_b = tmp.path().join("b");
+        make_pkg_repo(&repo_b, "beta", "b1").await;
+        let store = dash_store::SqliteStore::open(&data).unwrap();
+        let mgr =
+            crate::DraftManager::initialize(ws, data, store, dash_luau::ResourceBudget::default())
+                .await
+                .unwrap();
+        let d = mgr
+            .draft_begin(&dash_core::Principal::administrator())
+            .await
+            .unwrap();
+        let wt = PathBuf::from(&d.worktree_path);
+        let toml_before = std::fs::read(wt.join("packages.toml")).unwrap();
+        let lock_before = std::fs::read(wt.join("packages.lock")).unwrap();
+
+        let err = mgr
+            .draft_update_dependency(
+                &d.draft_id,
+                "ext",
+                spec(&repo.to_string_lossy(), "no-such-tag", None),
+            )
+            .await
+            .expect_err("unknown ref must fail");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            std::fs::read(wt.join("packages.toml")).unwrap(),
+            toml_before
+        );
+        assert_eq!(
+            std::fs::read(wt.join("packages.lock")).unwrap(),
+            lock_before
+        );
+        assert!(mgr.draft_status(&d.draft_id).unwrap().changes.is_empty());
+
+        // A later, valid update of another dependency is not poisoned by the failed one.
+        let (_rec, lock) = mgr
+            .draft_update_dependency(
+                &d.draft_id,
+                "beta",
+                spec(&repo_b.to_string_lossy(), "main", None),
+            )
+            .await
+            .expect("valid update after a failed one");
+        let names: Vec<&str> = lock.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["beta", "ext"]);
+        let cfg = read_packages_toml(&wt).unwrap();
+        assert_eq!(cfg.dependencies["ext"].git_ref, "main");
+        assert_eq!(read_packages_lock(&wt).unwrap().packages, lock.packages);
+        let report = mgr.draft_validate(&d.draft_id).await.unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.code == "LOCK_MISMATCH"),
+            "{:?}",
+            report.issues
+        );
     }
 }

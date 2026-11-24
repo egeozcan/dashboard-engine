@@ -1247,22 +1247,41 @@ return dash.data_provider { id = "gh.prs", handler = "query",
         .iter()
         .any(|i| i.code == "PENDING_SECRET_GRANT"));
 
-        // 3. Edit a Library any connector can `require`.
-        let mut cand = base_graph();
-        cand.definitions.insert(
-            "gh.utils".into(),
-            def(
-                r#"local dash = require("dash"); return dash.library { id = "gh.utils" }"#,
-                "return { x = 1 }",
-            ),
+        // 3a. Edit a Library outside the connector's library closure: not a connector change.
+        let edited_utils = def(
+            r#"local dash = require("dash"); return dash.library { id = "gh.utils" }"#,
+            "return { x = 1 }",
         );
-        assert!(!check_draft_activation_authority(
+        let mut cand = base_graph();
+        cand.definitions
+            .insert("gh.utils".into(), edited_utils.clone());
+        assert!(check_draft_activation_authority(
             &store,
             &active,
             &cand,
             std::slice::from_ref(&ag)
         )
         .is_empty());
+
+        // 3b. Edit a Library the connector `require`s: a code change of the secret holder.
+        let requiring = |mut g: ConfiguredGraph| {
+            g.definitions.insert(
+                "gh.connector".into(),
+                def(CONNECTOR, "local u = require(\"gh.utils\")\nreturn {}"),
+            );
+            g
+        };
+        let active_req = requiring(base_graph());
+        let mut cand = requiring(base_graph());
+        cand.definitions.insert("gh.utils".into(), edited_utils);
+        assert!(check_draft_activation_authority(
+            &store,
+            &active_req,
+            &cand,
+            std::slice::from_ref(&ag)
+        )
+        .iter()
+        .any(|i| i.code == "PENDING_SECRET_GRANT" && i.target == "gh_reader"));
 
         // 4. Rebind a different secret onto a new connector Instance.
         let mut cand = base_graph();

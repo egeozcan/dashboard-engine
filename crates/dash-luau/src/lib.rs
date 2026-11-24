@@ -16,8 +16,9 @@ pub use manifest::{
     EventDeclSpec, InputRefSpec, SchemaSpec, TriggerDeclSpec, UpdateModes,
 };
 pub use pool::{
-    current_execution_deadline, BudgetResolver, CompiledInstanceBundle, ExecutionObserver,
-    ExecutionStats, PoolMetrics, ResourceBudget, ResourceOverrides, RuntimeError, VmPool,
+    current_execution_deadline, inherit_execution_scope, with_execution_deadline, BudgetResolver,
+    CompiledInstanceBundle, ExecutionObserver, ExecutionStats, PoolMetrics, ResourceBudget,
+    ResourceOverrides, RuntimeError, VmPool,
 };
 pub use test_runner::{
     run_definition_tests, run_definition_tests_with_budget, DefinitionTestCaseResult,

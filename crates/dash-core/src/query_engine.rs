@@ -726,7 +726,12 @@ impl QueryEngine {
             move |tick, cancel| {
                 let engine = engine.clone();
                 let job = Arc::clone(&job);
-                async move { engine.run_query_leader(job, tick, cancel).await }
+                // A dependency query issued from inside a running execution stays nested
+                // although its flight runs detached: it rides on the caller's pool permit and
+                // inherits the caller's remaining deadline (no permit starvation).
+                dash_luau::inherit_execution_scope(async move {
+                    engine.run_query_leader(job, tick, cancel).await
+                })
             },
         )
         .await

@@ -314,9 +314,11 @@ fn build_dash_declaration_sdk(lua: &Lua) -> mlua::Result<Table> {
                 t.set("definition", d)?;
             }
             if let Some(o) = opts {
-                if let Ok(caps) = o.get::<Value>("required_capabilities") {
-                    t.set("required_capabilities", caps)?;
-                }
+                reject_unknown_ref_options(&o, "dash.connector_ref", &["required_capabilities"])?;
+                t.set(
+                    "required_capabilities",
+                    o.get::<Value>("required_capabilities")?,
+                )?;
             }
             Ok(t)
         })?,
@@ -331,9 +333,8 @@ fn build_dash_declaration_sdk(lua: &Lua) -> mlua::Result<Table> {
                 t.set("definition", d)?;
             }
             if let Some(o) = opts {
-                if let Ok(exp) = o.get::<Value>("expected_output") {
-                    t.set("expected_output", exp)?;
-                }
+                reject_unknown_ref_options(&o, "dash.data_ref", &["expected_output"])?;
+                t.set("expected_output", o.get::<Value>("expected_output")?)?;
             }
             Ok(t)
         })?,
@@ -790,6 +791,30 @@ fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static 
     }
 }
 
+/// Options accepted by a `dash.*_ref(definition, opts)` constructor: anything else (a typo such
+/// as `required_capabilites`) is an error rather than a silently dropped contract.
+fn reject_unknown_ref_options(opts: &Table, ctor: &str, allowed: &[&str]) -> mlua::Result<()> {
+    for pair in opts.pairs::<Value, Value>() {
+        let (k, _) = pair?;
+        let key = match &k {
+            Value::String(s) => s.to_str()?.to_string(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "{ctor}: option keys must be strings, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        if !allowed.contains(&key.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "{ctor}: unknown option '{key}' (allowed: {})",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_known_keys(tbl: &Table, allowed: &[&str], ctx: &str) -> Result<(), DeclarationError> {
     for pair in tbl.pairs::<Value, Value>() {
         let (k, _) = pair?;
@@ -1005,6 +1030,23 @@ fn parse_inputs(tbl: &Table) -> Result<BTreeMap<String, InputRefSpec>, Declarati
                 "input '{name}' must use dash.connector_ref / dash.data_ref / dash.action_ref"
             ))
         })?;
+        // Hand-built ref tables get the same allowlist as the `dash.*_ref` constructors, so a
+        // misspelled option can never silently drop a capability or output contract.
+        let ctx = format!("input '{name}'");
+        match ref_kind.as_str() {
+            "connector" => check_known_keys(
+                &spec_tbl,
+                &["ref_kind", "definition", "required_capabilities"],
+                &ctx,
+            )?,
+            "data" => check_known_keys(
+                &spec_tbl,
+                &["ref_kind", "definition", "expected_output"],
+                &ctx,
+            )?,
+            "action" => check_known_keys(&spec_tbl, &["ref_kind", "definition"], &ctx)?,
+            _ => {}
+        }
         let definition: Option<String> = get_opt_string(&spec_tbl, "definition")?;
         let spec = match ref_kind.as_str() {
             "connector" => InputRefSpec::Connector {
@@ -1356,6 +1398,68 @@ mod tests {
         format!(
             "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"p.d\", {body} }}"
         )
+    }
+
+    /// R3:decl-ref-options-typos-dropped: a misspelled ref option must fail the declaration
+    /// instead of silently dropping the capability / expected-output contract.
+    #[test]
+    fn misspelled_ref_options_are_rejected() {
+        for (src, needle) in [
+            (
+                dp(
+                    r#"inputs = { gh = dash.connector_ref("g.c", { required_capabilites = { "prs.merge" } }) }"#,
+                ),
+                "required_capabilites",
+            ),
+            (
+                dp(
+                    r#"inputs = { up = dash.data_ref("g.p", { expected_ouput = dash.list("g.pr@1") }) }"#,
+                ),
+                "expected_ouput",
+            ),
+            // Hand-built ref tables are held to the same allowlist.
+            (
+                dp(
+                    r#"inputs = { gh = { ref_kind = "connector", definition = "g.c", required_capabilites = { "x" } } }"#,
+                ),
+                "required_capabilites",
+            ),
+            (
+                dp(
+                    r#"inputs = { up = { ref_kind = "data", definition = "g.p", expected_ouput = {} } }"#,
+                ),
+                "expected_ouput",
+            ),
+            (
+                dp(
+                    r#"inputs = { act = { ref_kind = "action", definition = "g.a", required_capabilities = {} } }"#,
+                ),
+                "required_capabilities",
+            ),
+        ] {
+            let err = eval(&src).expect_err(&src);
+            assert!(err.to_string().contains(needle), "{src}: {err}");
+        }
+
+        // Correctly spelled options still produce the contracts.
+        let m = eval(&dp(r#"inputs = {
+                gh = dash.connector_ref("g.c", { required_capabilities = { "prs.merge" } }),
+                up = dash.data_ref("g.p", { expected_output = dash.list("g.pr@1") }),
+            }"#))
+        .unwrap();
+        match &m.inputs["gh"] {
+            InputRefSpec::Connector {
+                required_capabilities,
+                ..
+            } => assert_eq!(required_capabilities, &vec!["prs.merge".to_string()]),
+            other => panic!("{other:?}"),
+        }
+        match &m.inputs["up"] {
+            InputRefSpec::Data {
+                expected_output, ..
+            } => assert!(expected_output.is_some()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
