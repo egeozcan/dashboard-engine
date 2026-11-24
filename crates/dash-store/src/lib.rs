@@ -1,1 +1,1734 @@
 //! SQLite storage engine, transactional migrations, secret vault, and redaction.
+
+pub mod migrations;
+pub mod vault;
+
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use thiserror::Error;
+use uuid::Uuid;
+
+pub use vault::{Redactor, SecretVault, VaultError};
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("vault error: {0}")]
+    Vault(#[from] VaultError),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("state CAS version conflict: expected {expected}, actual {actual}")]
+    CasConflict { expected: i64, actual: i64 },
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("blocking task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateRecord {
+    pub scope: String,
+    pub owner: String,
+    pub state_key: String,
+    pub schema_version: i64,
+    pub version: i64,
+    pub generation_id: i64,
+    pub value: serde_json::Value,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretMetadata {
+    pub name: String,
+    pub description: String,
+    pub key_version: i64,
+    pub allowed_bindings: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableEventRecord {
+    pub event_id: String,
+    pub source_instance: String,
+    pub sequence: i64,
+    pub emitted_at: String,
+    pub semantic_type: String,
+    pub schema_version: String,
+    pub trace_id: String,
+    pub durable: bool,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionExecutionRecord {
+    pub execution_id: String,
+    pub action_instance: String,
+    pub parent_execution_id: Option<String>,
+    pub principal_id: String,
+    pub principal_kind: String,
+    pub status: String,
+    pub idempotency_key: Option<String>,
+    pub args: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+    pub reason: Option<String>,
+    pub retry_safe: bool,
+    pub reconcile_attempts: i64,
+    pub trace_id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub audit_id: String,
+    pub timestamp: String,
+    pub principal_id: String,
+    pub principal_kind: String,
+    pub operation: String,
+    pub target: String,
+    pub outcome: String,
+    pub detail: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceSpanRecord {
+    pub span_id: String,
+    pub trace_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub principal_id: String,
+    pub attributes: serde_json::Value,
+    pub status: String,
+    pub started_at: String,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationJournalRecord {
+    pub journal_id: String,
+    pub draft_id: String,
+    pub base_revision: String,
+    pub target_revision: Option<String>,
+    pub generation_id: Option<i64>,
+    pub phase: String,
+    pub error_message: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftRecord {
+    pub draft_id: String,
+    pub base_revision: String,
+    pub worktree_path: String,
+    pub created_by: String,
+    pub status: String,
+    pub changes: Vec<String>,
+    pub validation_report: Option<serde_json::Value>,
+    pub test_report: Option<serde_json::Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPrincipalRecord {
+    pub agent_id: String,
+    pub name: String,
+    pub ceiling: serde_json::Value,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySeriesSpec {
+    pub series_id: String,
+    pub instance_id: String,
+    pub params: serde_json::Value,
+    pub aggregator: String,
+    pub cadence_secs: i64,
+    pub retention_days: i64,
+    pub service_principal: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySampleRecord {
+    pub sample_id: i64,
+    pub series_id: String,
+    pub sampled_at: String,
+    pub value_num: f64,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitSyncRecord {
+    pub active_revision: Option<String>,
+    pub remote_name: String,
+    pub remote_url: Option<String>,
+    pub sync_status: String,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone)]
+pub struct SqliteStore {
+    conn: Arc<Mutex<Connection>>,
+    db_path: Option<PathBuf>,
+    vault: SecretVault,
+}
+
+impl SqliteStore {
+    /// Open or create a persistent SQLite database in WAL mode inside `data_dir`.
+    pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
+        std::fs::create_dir_all(data_dir)?;
+        let db_path = data_dir.join("dash.db");
+        let conn = Connection::open(&db_path)?;
+        migrations::run_migrations(&conn)?;
+        let vault = SecretVault::load_or_create(data_dir)?;
+        let store = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            db_path: Some(db_path),
+            vault,
+        };
+        store.preload_redactor()?;
+        Ok(store)
+    }
+
+    /// Create an isolated in-memory SQLite store (for Preview and unit tests).
+    pub fn open_in_memory() -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        migrations::run_migrations(&conn)?;
+        let vault = SecretVault::generate_ephemeral();
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            db_path: None,
+            vault,
+        })
+    }
+
+    pub fn vault(&self) -> &SecretVault {
+        &self.vault
+    }
+
+    pub fn redactor(&self) -> &Redactor {
+        self.vault.redactor()
+    }
+
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    pub fn db_size_bytes(&self) -> u64 {
+        self.db_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .unwrap_or(0)
+    }
+
+    /// Execute a blocking SQLite closure without blocking Tokio worker threads.
+    pub async fn with_conn<F, R>(&self, f: F) -> Result<R, StoreError>
+    where
+        F: FnOnce(&Connection) -> Result<R, StoreError> + Send + 'static,
+        R: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().expect("sqlite mutex poisoned");
+            f(&guard)
+        })
+        .await?
+    }
+
+    /// Synchronous access helper for setup/teardown and tests.
+    pub fn with_conn_sync<F, R>(&self, f: F) -> Result<R, StoreError>
+    where
+        F: FnOnce(&Connection) -> Result<R, StoreError>,
+    {
+        let guard = self.conn.lock().expect("sqlite mutex poisoned");
+        f(&guard)
+    }
+
+    fn preload_redactor(&self) -> Result<(), StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, key_version, nonce, ciphertext FROM encrypted_secret_blobs",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (name, key_ver, nonce, ct) = row?;
+                if let Ok(plain) = self.vault.decrypt(&name, key_ver, &nonce, &ct) {
+                    self.vault.redactor().register_secret(&plain);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn backup_to(&self, dest_path: &Path) -> Result<(), StoreError> {
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.with_conn_sync(|conn| {
+            let mut dst = Connection::open(dest_path)?;
+            let backup = rusqlite::backup::Backup::new(conn, &mut dst)?;
+            backup.run_to_completion(5, std::time::Duration::from_millis(10), None)?;
+            Ok(())
+        })
+    }
+
+    // ---- Secrets ----
+
+    pub fn set_secret(
+        &self,
+        name: &str,
+        description: &str,
+        plaintext: &str,
+        allowed_bindings: &[String],
+    ) -> Result<SecretMetadata, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let allowed_json = serde_json::to_string(allowed_bindings)?;
+        let (key_version, created_at) = self.with_conn_sync(|conn| {
+            let existing: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT key_version, created_at FROM secret_metadata WHERE name = ?1",
+                    params![name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((v, c)) => Ok((v + 1, c)),
+                None => Ok((1_i64, now.clone())),
+            }
+        })?;
+        let (nonce, ciphertext) = self.vault.encrypt(name, key_version, plaintext)?;
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO secret_metadata (name, description, key_version, allowed_bindings_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(name) DO UPDATE SET
+                    description = excluded.description,
+                    key_version = excluded.key_version,
+                    allowed_bindings_json = excluded.allowed_bindings_json,
+                    updated_at = excluded.updated_at",
+                params![name, description, key_version, allowed_json, created_at, now],
+            )?;
+            tx.execute(
+                "INSERT INTO encrypted_secret_blobs (name, key_version, nonce, ciphertext, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(name) DO UPDATE SET
+                    key_version = excluded.key_version,
+                    nonce = excluded.nonce,
+                    ciphertext = excluded.ciphertext,
+                    updated_at = excluded.updated_at",
+                params![name, key_version, nonce, ciphertext, now],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(SecretMetadata {
+            name: name.to_string(),
+            description: description.to_string(),
+            key_version,
+            allowed_bindings: allowed_bindings.to_vec(),
+            created_at,
+            updated_at: now,
+        })
+    }
+
+    pub fn list_secrets(&self) -> Result<Vec<SecretMetadata>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, description, key_version, allowed_bindings_json, created_at, updated_at
+                 FROM secret_metadata ORDER BY name ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let allowed_raw: String = r.get(3)?;
+                let allowed: Vec<String> = serde_json::from_str(&allowed_raw).unwrap_or_default();
+                Ok(SecretMetadata {
+                    name: r.get(0)?,
+                    description: r.get(1)?,
+                    key_version: r.get(2)?,
+                    allowed_bindings: allowed,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn resolve_secret_plaintext(&self, name: &str) -> Result<(SecretMetadata, String), StoreError> {
+        self.with_conn_sync(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT m.name, m.description, m.key_version, m.allowed_bindings_json, m.created_at, m.updated_at,
+                            b.nonce, b.ciphertext
+                     FROM secret_metadata m
+                     JOIN encrypted_secret_blobs b ON m.name = b.name
+                     WHERE m.name = ?1",
+                    params![name],
+                    |r| {
+                        let allowed_raw: String = r.get(3)?;
+                        let allowed: Vec<String> =
+                            serde_json::from_str(&allowed_raw).unwrap_or_default();
+                        Ok((
+                            SecretMetadata {
+                                name: r.get(0)?,
+                                description: r.get(1)?,
+                                key_version: r.get(2)?,
+                                allowed_bindings: allowed,
+                                created_at: r.get(4)?,
+                                updated_at: r.get(5)?,
+                            },
+                            r.get::<_, Vec<u8>>(6)?,
+                            r.get::<_, Vec<u8>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::NotFound(format!("secret '{name}'")))?;
+            let plaintext = self
+                .vault
+                .decrypt(&row.0.name, row.0.key_version, &row.1, &row.2)?;
+            Ok((row.0, plaintext))
+        })
+    }
+
+    // ---- State (CAS versioned) ----
+
+    pub fn get_state(
+        &self,
+        scope: &str,
+        owner: &str,
+        state_key: &str,
+    ) -> Result<Option<StateRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT scope, owner, state_key, schema_version, version, generation_id, encoded_value, updated_at
+                 FROM state_values WHERE scope = ?1 AND owner = ?2 AND state_key = ?3",
+                params![scope, owner, state_key],
+                |r| {
+                    let raw: String = r.get(6)?;
+                    Ok(StateRecord {
+                        scope: r.get(0)?,
+                        owner: r.get(1)?,
+                        state_key: r.get(2)?,
+                        schema_version: r.get(3)?,
+                        version: r.get(4)?,
+                        generation_id: r.get(5)?,
+                        value: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                        updated_at: r.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn list_state_for_owner(
+        &self,
+        scope: &str,
+        owner: &str,
+    ) -> Result<Vec<StateRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT scope, owner, state_key, schema_version, version, generation_id, encoded_value, updated_at
+                 FROM state_values WHERE scope = ?1 AND owner = ?2 ORDER BY state_key ASC",
+            )?;
+            let rows = stmt.query_map(params![scope, owner], |r| {
+                let raw: String = r.get(6)?;
+                Ok(StateRecord {
+                    scope: r.get(0)?,
+                    owner: r.get(1)?,
+                    state_key: r.get(2)?,
+                    schema_version: r.get(3)?,
+                    version: r.get(4)?,
+                    generation_id: r.get(5)?,
+                    value: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Compare-and-swap state update. Pass `expected_version: None` to upsert unconditionally.
+    pub fn set_state(
+        &self,
+        scope: &str,
+        owner: &str,
+        state_key: &str,
+        schema_version: i64,
+        generation_id: i64,
+        value: serde_json::Value,
+        expected_version: Option<i64>,
+    ) -> Result<StateRecord, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let encoded = serde_json::to_string(&value)?;
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM state_values WHERE scope = ?1 AND owner = ?2 AND state_key = ?3",
+                    params![scope, owner, state_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            let next_version = match (current, expected_version) {
+                (None, Some(exp)) if exp != 0 => {
+                    return Err(StoreError::CasConflict {
+                        expected: exp,
+                        actual: 0,
+                    });
+                }
+                (Some(actual), Some(exp)) if actual != exp => {
+                    return Err(StoreError::CasConflict {
+                        expected: exp,
+                        actual,
+                    });
+                }
+                (Some(actual), _) => actual + 1,
+                (None, _) => 1,
+            };
+
+            tx.execute(
+                "INSERT INTO state_values (scope, owner, state_key, schema_version, version, generation_id, encoded_value, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(scope, owner, state_key) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    version = excluded.version,
+                    generation_id = excluded.generation_id,
+                    encoded_value = excluded.encoded_value,
+                    updated_at = excluded.updated_at",
+                params![
+                    scope,
+                    owner,
+                    state_key,
+                    schema_version,
+                    next_version,
+                    generation_id,
+                    encoded,
+                    now
+                ],
+            )?;
+            tx.commit()?;
+            Ok(StateRecord {
+                scope: scope.to_string(),
+                owner: owner.to_string(),
+                state_key: state_key.to_string(),
+                schema_version,
+                version: next_version,
+                generation_id,
+                value,
+                updated_at: now,
+            })
+        })
+    }
+
+    // ---- Events, Checkpoints, DLQ ----
+
+    pub fn append_event(
+        &self,
+        source_instance: &str,
+        semantic_type: &str,
+        schema_version: &str,
+        trace_id: &str,
+        durable: bool,
+        payload: serde_json::Value,
+    ) -> Result<DurableEventRecord, StoreError> {
+        let safe_payload = self.redactor().redact_json(&payload);
+        let payload_json = serde_json::to_string(&safe_payload)?;
+        let event_id = format!("evt_{}", Uuid::now_v7().simple());
+        let emitted_at = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let max_seq: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE source_instance = ?1",
+                params![source_instance],
+                |r| r.get(0),
+            )?;
+            let next_seq = max_seq + 1;
+            tx.execute(
+                "INSERT INTO events (event_id, source_instance, sequence, emitted_at, semantic_type, schema_version, trace_id, durable, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    event_id,
+                    source_instance,
+                    next_seq,
+                    emitted_at,
+                    semantic_type,
+                    schema_version,
+                    trace_id,
+                    if durable { 1_i64 } else { 0_i64 },
+                    payload_json
+                ],
+            )?;
+            tx.commit()?;
+            Ok(DurableEventRecord {
+                event_id,
+                source_instance: source_instance.to_string(),
+                sequence: next_seq,
+                emitted_at,
+                semantic_type: semantic_type.to_string(),
+                schema_version: schema_version.to_string(),
+                trace_id: trace_id.to_string(),
+                durable,
+                payload: safe_payload,
+            })
+        })
+    }
+
+    pub fn list_events_since(
+        &self,
+        source_instance: &str,
+        after_sequence: i64,
+    ) -> Result<Vec<DurableEventRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, source_instance, sequence, emitted_at, semantic_type, schema_version, trace_id, durable, payload_json
+                 FROM events WHERE source_instance = ?1 AND sequence > ?2 ORDER BY sequence ASC",
+            )?;
+            let rows = stmt.query_map(params![source_instance, after_sequence], |r| {
+                let raw: String = r.get(8)?;
+                Ok(DurableEventRecord {
+                    event_id: r.get(0)?,
+                    source_instance: r.get(1)?,
+                    sequence: r.get(2)?,
+                    emitted_at: r.get(3)?,
+                    semantic_type: r.get(4)?,
+                    schema_version: r.get(5)?,
+                    trace_id: r.get(6)?,
+                    durable: r.get::<_, i64>(7)? != 0,
+                    payload: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get_consumer_checkpoint(
+        &self,
+        consumer_id: &str,
+        source_instance: &str,
+    ) -> Result<i64, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT last_sequence FROM event_consumer_checkpoints
+                 WHERE consumer_id = ?1 AND source_instance = ?2",
+                params![consumer_id, source_instance],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0))
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn set_consumer_checkpoint(
+        &self,
+        consumer_id: &str,
+        source_instance: &str,
+        last_sequence: i64,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO event_consumer_checkpoints (consumer_id, source_instance, last_sequence, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(consumer_id, source_instance) DO UPDATE SET
+                    last_sequence = excluded.last_sequence,
+                    updated_at = excluded.updated_at",
+                params![consumer_id, source_instance, last_sequence, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn record_dead_letter(
+        &self,
+        consumer_id: &str,
+        event_id: &str,
+        attempts: i64,
+        last_error: &str,
+    ) -> Result<String, StoreError> {
+        let dlq_id = format!("dlq_{}", Uuid::now_v7().simple());
+        let failed_at = Utc::now().to_rfc3339();
+        let safe_err = self.redactor().redact_str(last_error);
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO dead_letters (dlq_id, consumer_id, event_id, attempts, last_error, failed_at, resolved)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![dlq_id, consumer_id, event_id, attempts, safe_err, failed_at],
+            )?;
+            Ok(dlq_id)
+        })
+    }
+
+    // ---- Action executions & idempotency ----
+
+    pub fn lookup_action_idempotency(
+        &self,
+        action_instance: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<ActionExecutionRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let exec_id: Option<String> = conn
+                .query_row(
+                    "SELECT execution_id FROM action_idempotency
+                     WHERE idempotency_key = ?1 AND action_instance = ?2",
+                    params![idempotency_key, action_instance],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match exec_id {
+                Some(id) => Self::get_action_execution_conn(conn, &id),
+                None => Ok(None),
+            }
+        })
+    }
+
+    pub fn insert_action_execution(
+        &self,
+        rec: &ActionExecutionRecord,
+    ) -> Result<(), StoreError> {
+        let safe_args = self.redactor().redact_json(&rec.args);
+        let safe_res = rec.result.as_ref().map(|v| self.redactor().redact_json(v));
+        let safe_reason = rec.reason.as_ref().map(|r| self.redactor().redact_str(r));
+        let args_json = serde_json::to_string(&safe_args)?;
+        let res_json = safe_res.as_ref().map(serde_json::to_string).transpose()?;
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO action_executions
+                 (execution_id, action_instance, parent_execution_id, principal_id, principal_kind, status,
+                  idempotency_key, args_json, result_json, reason, retry_safe, reconcile_attempts, trace_id,
+                  started_at, finished_at, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    rec.execution_id,
+                    rec.action_instance,
+                    rec.parent_execution_id,
+                    rec.principal_id,
+                    rec.principal_kind,
+                    rec.status,
+                    rec.idempotency_key,
+                    args_json,
+                    res_json,
+                    safe_reason,
+                    if rec.retry_safe { 1_i64 } else { 0_i64 },
+                    rec.reconcile_attempts,
+                    rec.trace_id,
+                    rec.started_at,
+                    rec.finished_at,
+                    rec.duration_ms
+                ],
+            )?;
+            if let Some(ref key) = rec.idempotency_key {
+                tx.execute(
+                    "INSERT OR IGNORE INTO action_idempotency (idempotency_key, action_instance, execution_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![key, rec.action_instance, rec.execution_id, rec.started_at],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn update_action_execution(
+        &self,
+        execution_id: &str,
+        status: &str,
+        result: Option<serde_json::Value>,
+        reason: Option<&str>,
+        retry_safe: bool,
+        reconcile_attempts: i64,
+        finished_at: Option<&str>,
+        duration_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let safe_res = result.map(|v| self.redactor().redact_json(&v));
+        let res_json = safe_res.as_ref().map(serde_json::to_string).transpose()?;
+        let safe_reason = reason.map(|r| self.redactor().redact_str(r));
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "UPDATE action_executions
+                 SET status = ?1, result_json = ?2, reason = ?3, retry_safe = ?4,
+                     reconcile_attempts = ?5, finished_at = ?6, duration_ms = ?7
+                 WHERE execution_id = ?8",
+                params![
+                    status,
+                    res_json,
+                    safe_reason,
+                    if retry_safe { 1_i64 } else { 0_i64 },
+                    reconcile_attempts,
+                    finished_at,
+                    duration_ms,
+                    execution_id
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn link_action_step(
+        &self,
+        parent_execution_id: &str,
+        child_execution_id: &str,
+        step_order: i64,
+    ) -> Result<(), StoreError> {
+        let step_id = format!("step_{}", Uuid::now_v7().simple());
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO action_steps (step_id, execution_id, child_execution_id, step_order, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![step_id, parent_execution_id, child_execution_id, step_order, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_action_execution(&self, execution_id: &str) -> Result<Option<ActionExecutionRecord>, StoreError> {
+        self.with_conn_sync(|conn| Self::get_action_execution_conn(conn, execution_id))
+    }
+
+    pub fn list_action_executions(&self, limit: usize) -> Result<Vec<ActionExecutionRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT execution_id, action_instance, parent_execution_id, principal_id, principal_kind,
+                        status, idempotency_key, args_json, result_json, reason, retry_safe,
+                        reconcile_attempts, trace_id, started_at, finished_at, duration_ms
+                 FROM action_executions ORDER BY started_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], Self::map_action_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn mark_inflight_actions_unknown(&self, reason: &str) -> Result<usize, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let n = conn.execute(
+                "UPDATE action_executions SET status = 'unknown', retry_safe = 0, reason = ?1, finished_at = ?2
+                 WHERE status IN ('queued', 'running')",
+                params![reason, now],
+            )?;
+            Ok(n)
+        })
+    }
+
+    fn get_action_execution_conn(
+        conn: &Connection,
+        execution_id: &str,
+    ) -> Result<Option<ActionExecutionRecord>, StoreError> {
+        conn.query_row(
+            "SELECT execution_id, action_instance, parent_execution_id, principal_id, principal_kind,
+                    status, idempotency_key, args_json, result_json, reason, retry_safe,
+                    reconcile_attempts, trace_id, started_at, finished_at, duration_ms
+             FROM action_executions WHERE execution_id = ?1",
+            params![execution_id],
+            Self::map_action_row,
+        )
+        .optional()
+        .map_err(StoreError::from)
+    }
+
+    fn map_action_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ActionExecutionRecord> {
+        let args_raw: String = r.get(7)?;
+        let res_raw: Option<String> = r.get(8)?;
+        Ok(ActionExecutionRecord {
+            execution_id: r.get(0)?,
+            action_instance: r.get(1)?,
+            parent_execution_id: r.get(2)?,
+            principal_id: r.get(3)?,
+            principal_kind: r.get(4)?,
+            status: r.get(5)?,
+            idempotency_key: r.get(6)?,
+            args: serde_json::from_str(&args_raw).unwrap_or(serde_json::Value::Null),
+            result: res_raw.and_then(|s| serde_json::from_str(&s).ok()),
+            reason: r.get(9)?,
+            retry_safe: r.get::<_, i64>(10)? != 0,
+            reconcile_attempts: r.get(11)?,
+            trace_id: r.get(12)?,
+            started_at: r.get(13)?,
+            finished_at: r.get(14)?,
+            duration_ms: r.get(15)?,
+        })
+    }
+
+    // ---- Audit & Telemetry ----
+
+    pub fn append_audit(
+        &self,
+        principal_id: &str,
+        principal_kind: &str,
+        operation: &str,
+        target: &str,
+        outcome: &str,
+        detail: serde_json::Value,
+    ) -> Result<String, StoreError> {
+        let audit_id = format!("aud_{}", Uuid::now_v7().simple());
+        let ts = Utc::now().to_rfc3339();
+        let safe_detail = self.redactor().redact_json(&detail);
+        let detail_json = serde_json::to_string(&safe_detail)?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO audit_records (audit_id, timestamp, principal_id, principal_kind, operation, target, outcome, detail_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![audit_id, ts, principal_id, principal_kind, operation, target, outcome, detail_json],
+            )?;
+            Ok(audit_id)
+        })
+    }
+
+    pub fn list_audits(&self, limit: usize) -> Result<Vec<AuditRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT audit_id, timestamp, principal_id, principal_kind, operation, target, outcome, detail_json
+                 FROM audit_records ORDER BY timestamp DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| {
+                let raw: String = r.get(7)?;
+                Ok(AuditRecord {
+                    audit_id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    principal_id: r.get(2)?,
+                    principal_kind: r.get(3)?,
+                    operation: r.get(4)?,
+                    target: r.get(5)?,
+                    outcome: r.get(6)?,
+                    detail: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn record_trace_span(&self, span: &TraceSpanRecord) -> Result<(), StoreError> {
+        let safe_attrs = self.redactor().redact_json(&span.attributes);
+        let attrs_json = serde_json::to_string(&safe_attrs)?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO trace_spans (span_id, trace_id, parent_span_id, name, principal_id, attributes_json, status, started_at, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    span.span_id,
+                    span.trace_id,
+                    span.parent_span_id,
+                    span.name,
+                    span.principal_id,
+                    attrs_json,
+                    span.status,
+                    span.started_at,
+                    span.duration_ms
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_trace_spans(&self, limit: usize) -> Result<Vec<TraceSpanRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT span_id, trace_id, parent_span_id, name, principal_id, attributes_json, status, started_at, duration_ms
+                 FROM trace_spans ORDER BY started_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| {
+                let raw: String = r.get(5)?;
+                Ok(TraceSpanRecord {
+                    span_id: r.get(0)?,
+                    trace_id: r.get(1)?,
+                    parent_span_id: r.get(2)?,
+                    name: r.get(3)?,
+                    principal_id: r.get(4)?,
+                    attributes: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                    status: r.get(6)?,
+                    started_at: r.get(7)?,
+                    duration_ms: r.get(8)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    // ---- Principals, Agents, Service Principals, Admin ----
+
+    pub fn set_service_principal_grant(
+        &self,
+        principal_id: &str,
+        granted_ceiling: serde_json::Value,
+        granted_by: &str,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&granted_ceiling)?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO service_principal_grants (principal_id, granted_ceiling_json, granted_by, granted_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(principal_id) DO UPDATE SET
+                    granted_ceiling_json = excluded.granted_ceiling_json,
+                    granted_by = excluded.granted_by,
+                    granted_at = excluded.granted_at",
+                params![principal_id, json, granted_by, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_service_principal_grant(
+        &self,
+        principal_id: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT granted_ceiling_json FROM service_principal_grants WHERE principal_id = ?1",
+                    params![principal_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+        })
+    }
+
+    pub fn list_service_principal_grants(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value, String, String)>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT principal_id, granted_ceiling_json, granted_by, granted_at
+                 FROM service_principal_grants ORDER BY principal_id ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let raw: String = r.get(1)?;
+                Ok((
+                    r.get(0)?,
+                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                    r.get(2)?,
+                    r.get(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn create_agent_principal(
+        &self,
+        name: &str,
+        token_plaintext: &str,
+        ceiling: serde_json::Value,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<AgentPrincipalRecord, StoreError> {
+        self.redactor().register_secret(token_plaintext);
+        let agent_id = format!("agt_{}", Uuid::now_v7().simple());
+        let token_hash = hash_token(token_plaintext);
+        let ceiling_json = serde_json::to_string(&ceiling)?;
+        let created_at = Utc::now().to_rfc3339();
+        let exp = expires_at.map(|d| d.to_rfc3339());
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO agent_principals (agent_id, name, token_hash, ceiling_json, expires_at, revoked_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                params![agent_id, name, token_hash, ceiling_json, exp, created_at],
+            )?;
+            Ok(AgentPrincipalRecord {
+                agent_id,
+                name: name.to_string(),
+                ceiling,
+                expires_at: exp,
+                revoked_at: None,
+                created_at,
+            })
+        })
+    }
+
+    pub fn authenticate_agent_token(
+        &self,
+        token_plaintext: &str,
+    ) -> Result<Option<AgentPrincipalRecord>, StoreError> {
+        self.redactor().register_secret(token_plaintext);
+        let token_hash = hash_token(token_plaintext);
+        self.with_conn_sync(|conn| {
+            let rec = conn
+                .query_row(
+                    "SELECT agent_id, name, ceiling_json, expires_at, revoked_at, created_at
+                     FROM agent_principals WHERE token_hash = ?1",
+                    params![token_hash],
+                    |r| {
+                        let raw: String = r.get(2)?;
+                        Ok(AgentPrincipalRecord {
+                            agent_id: r.get(0)?,
+                            name: r.get(1)?,
+                            ceiling: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                            expires_at: r.get(3)?,
+                            revoked_at: r.get(4)?,
+                            created_at: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ref a) = rec {
+                if a.revoked_at.is_some() {
+                    return Ok(None);
+                }
+                if let Some(ref exp) = a.expires_at {
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(exp) {
+                        if dt.with_timezone(&Utc) <= Utc::now() {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            Ok(rec)
+        })
+    }
+
+    pub fn revoke_agent_principal(&self, agent_id: &str) -> Result<bool, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let n = conn.execute(
+                "UPDATE agent_principals SET revoked_at = ?1 WHERE agent_id = ?2 AND revoked_at IS NULL",
+                params![now, agent_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    pub fn list_agent_principals(&self) -> Result<Vec<AgentPrincipalRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT agent_id, name, ceiling_json, expires_at, revoked_at, created_at
+                 FROM agent_principals ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let raw: String = r.get(2)?;
+                Ok(AgentPrincipalRecord {
+                    agent_id: r.get(0)?,
+                    name: r.get(1)?,
+                    ceiling: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                    expires_at: r.get(3)?,
+                    revoked_at: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    // ---- Admin Credentials & Sessions ----
+
+    pub fn set_admin_credentials(&self, username: &str, password_hash: &str) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO admin_credentials (id, username, password_hash, updated_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    username = excluded.username,
+                    password_hash = excluded.password_hash,
+                    updated_at = excluded.updated_at",
+                params![username, password_hash, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_admin_credentials(&self) -> Result<Option<(String, String)>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT username, password_hash FROM admin_credentials WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn create_session(
+        &self,
+        token_plaintext: &str,
+        csrf_token: &str,
+        principal_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<String, StoreError> {
+        self.redactor().register_secret(token_plaintext);
+        let session_id = format!("ses_{}", Uuid::now_v7().simple());
+        let token_hash = hash_token(token_plaintext);
+        let created_at = Utc::now().to_rfc3339();
+        let exp = expires_at.to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (session_id, token_hash, csrf_token, principal_id, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session_id, token_hash, csrf_token, principal_id, exp, created_at],
+            )?;
+            Ok(session_id)
+        })
+    }
+
+    pub fn validate_session(
+        &self,
+        token_plaintext: &str,
+    ) -> Result<Option<(String, String, String)>, StoreError> {
+        self.redactor().register_secret(token_plaintext);
+        let token_hash = hash_token(token_plaintext);
+        self.with_conn_sync(|conn| {
+            let row: Option<(String, String, String, String)> = conn
+                .query_row(
+                    "SELECT session_id, csrf_token, principal_id, expires_at
+                     FROM sessions WHERE token_hash = ?1",
+                    params![token_hash],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((sid, csrf, pid, exp)) = row {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(&exp) {
+                    if dt.with_timezone(&Utc) > Utc::now() {
+                        return Ok(Some((sid, csrf, pid)));
+                    }
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    pub fn delete_session(&self, token_plaintext: &str) -> Result<(), StoreError> {
+        let token_hash = hash_token(token_plaintext);
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "DELETE FROM sessions WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+            Ok(())
+        })
+    }
+
+    // ---- History Series & Samples ----
+
+    pub fn upsert_history_series(&self, spec: &HistorySeriesSpec) -> Result<(), StoreError> {
+        let params_json = serde_json::to_string(&spec.params)?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO history_series (series_id, instance_id, params_json, aggregator, cadence_secs, retention_days, service_principal, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(series_id) DO UPDATE SET
+                    cadence_secs = excluded.cadence_secs,
+                    retention_days = excluded.retention_days,
+                    service_principal = excluded.service_principal",
+                params![
+                    spec.series_id,
+                    spec.instance_id,
+                    params_json,
+                    spec.aggregator,
+                    spec.cadence_secs,
+                    spec.retention_days,
+                    spec.service_principal,
+                    spec.created_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn append_history_sample(
+        &self,
+        series_id: &str,
+        sampled_at: &str,
+        value_num: f64,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        let meta_json = metadata.as_ref().map(serde_json::to_string).transpose()?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO history_samples (series_id, sampled_at, value_num, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![series_id, sampled_at, value_num, meta_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn compact_history_series(&self, series_id: &str, retention_days: i64) -> Result<usize, StoreError> {
+        let cutoff = (Utc::now() - chrono::Duration::days(retention_days.max(1))).to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let n = conn.execute(
+                "DELETE FROM history_samples WHERE series_id = ?1 AND sampled_at < ?2",
+                params![series_id, cutoff],
+            )?;
+            Ok(n)
+        })
+    }
+
+    pub fn query_history_samples(
+        &self,
+        series_id: &str,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistorySampleRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut out = Vec::new();
+            if let Some(since_ts) = since {
+                let mut stmt = conn.prepare(
+                    "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
+                     FROM history_samples
+                     WHERE series_id = ?1 AND sampled_at >= ?2
+                     ORDER BY sampled_at ASC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![series_id, since_ts, limit as i64], |r| {
+                    let meta_raw: Option<String> = r.get(4)?;
+                    Ok(HistorySampleRecord {
+                        sample_id: r.get(0)?,
+                        series_id: r.get(1)?,
+                        sampled_at: r.get(2)?,
+                        value_num: r.get(3)?,
+                        metadata: meta_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                    })
+                })?;
+                for row in rows {
+                    out.push(row?);
+                }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
+                     FROM history_samples
+                     WHERE series_id = ?1
+                     ORDER BY sampled_at ASC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![series_id, limit as i64], |r| {
+                    let meta_raw: Option<String> = r.get(4)?;
+                    Ok(HistorySampleRecord {
+                        sample_id: r.get(0)?,
+                        series_id: r.get(1)?,
+                        sampled_at: r.get(2)?,
+                        value_num: r.get(3)?,
+                        metadata: meta_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                    })
+                })?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    // ---- Revisions, Generations, Drafts, Activation Journal, Git Sync ----
+
+    pub fn record_revision(
+        &self,
+        commit_hash: &str,
+        parent_commit: Option<&str>,
+        principal_id: &str,
+        principal_kind: &str,
+        summary: &str,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO revisions (commit_hash, parent_commit, principal_id, principal_kind, summary, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![commit_hash, parent_commit, principal_id, principal_kind, summary, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn record_generation(
+        &self,
+        revision_commit: &str,
+        graph_digest: &str,
+    ) -> Result<i64, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE generations SET status = 'drained' WHERE status = 'active'",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO generations (revision_commit, activated_at, status, graph_digest)
+                 VALUES (?1, ?2, 'active', ?3)",
+                params![revision_commit, now, graph_digest],
+            )?;
+            let gen_id = tx.last_insert_rowid();
+            tx.commit()?;
+            Ok(gen_id)
+        })
+    }
+
+    pub fn upsert_draft(&self, draft: &DraftRecord) -> Result<(), StoreError> {
+        let changes_json = serde_json::to_string(&draft.changes)?;
+        let val_json = draft
+            .validation_report
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let test_json = draft
+            .test_report
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO draft_transactions
+                 (draft_id, base_revision, worktree_path, created_by, status, changes_json,
+                  validation_report_json, test_report_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(draft_id) DO UPDATE SET
+                    base_revision = excluded.base_revision,
+                    worktree_path = excluded.worktree_path,
+                    status = excluded.status,
+                    changes_json = excluded.changes_json,
+                    validation_report_json = excluded.validation_report_json,
+                    test_report_json = excluded.test_report_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    draft.draft_id,
+                    draft.base_revision,
+                    draft.worktree_path,
+                    draft.created_by,
+                    draft.status,
+                    changes_json,
+                    val_json,
+                    test_json,
+                    draft.created_at,
+                    draft.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_draft(&self, draft_id: &str) -> Result<Option<DraftRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT draft_id, base_revision, worktree_path, created_by, status, changes_json,
+                        validation_report_json, test_report_json, created_at, updated_at
+                 FROM draft_transactions WHERE draft_id = ?1",
+                params![draft_id],
+                |r| {
+                    let ch_raw: String = r.get(5)?;
+                    let val_raw: Option<String> = r.get(6)?;
+                    let test_raw: Option<String> = r.get(7)?;
+                    Ok(DraftRecord {
+                        draft_id: r.get(0)?,
+                        base_revision: r.get(1)?,
+                        worktree_path: r.get(2)?,
+                        created_by: r.get(3)?,
+                        status: r.get(4)?,
+                        changes: serde_json::from_str(&ch_raw).unwrap_or_default(),
+                        validation_report: val_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                        test_report: test_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                        created_at: r.get(8)?,
+                        updated_at: r.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn list_drafts(&self) -> Result<Vec<DraftRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT draft_id, base_revision, worktree_path, created_by, status, changes_json,
+                        validation_report_json, test_report_json, created_at, updated_at
+                 FROM draft_transactions ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let ch_raw: String = r.get(5)?;
+                let val_raw: Option<String> = r.get(6)?;
+                let test_raw: Option<String> = r.get(7)?;
+                Ok(DraftRecord {
+                    draft_id: r.get(0)?,
+                    base_revision: r.get(1)?,
+                    worktree_path: r.get(2)?,
+                    created_by: r.get(3)?,
+                    status: r.get(4)?,
+                    changes: serde_json::from_str(&ch_raw).unwrap_or_default(),
+                    validation_report: val_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                    test_report: test_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn upsert_activation_journal(&self, rec: &ActivationJournalRecord) -> Result<(), StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO activation_journal
+                 (journal_id, draft_id, base_revision, target_revision, generation_id, phase, error_message, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(journal_id) DO UPDATE SET
+                    target_revision = excluded.target_revision,
+                    generation_id = excluded.generation_id,
+                    phase = excluded.phase,
+                    error_message = excluded.error_message,
+                    updated_at = excluded.updated_at",
+                params![
+                    rec.journal_id,
+                    rec.draft_id,
+                    rec.base_revision,
+                    rec.target_revision,
+                    rec.generation_id,
+                    rec.phase,
+                    rec.error_message,
+                    rec.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_incomplete_activation_journals(&self) -> Result<Vec<ActivationJournalRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT journal_id, draft_id, base_revision, target_revision, generation_id, phase, error_message, updated_at
+                 FROM activation_journal
+                 WHERE phase IN ('started', 'committed')
+                 ORDER BY updated_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(ActivationJournalRecord {
+                    journal_id: r.get(0)?,
+                    draft_id: r.get(1)?,
+                    base_revision: r.get(2)?,
+                    target_revision: r.get(3)?,
+                    generation_id: r.get(4)?,
+                    phase: r.get(5)?,
+                    error_message: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_git_sync_state(&self, rec: &GitSyncRecord) -> Result<(), StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.execute(
+                "INSERT INTO git_sync_state (id, active_revision, remote_name, remote_url, sync_status, last_error, updated_at)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    active_revision = excluded.active_revision,
+                    remote_name = excluded.remote_name,
+                    remote_url = excluded.remote_url,
+                    sync_status = excluded.sync_status,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at",
+                params![
+                    rec.active_revision,
+                    rec.remote_name,
+                    rec.remote_url,
+                    rec.sync_status,
+                    rec.last_error,
+                    rec.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_git_sync_state(&self) -> Result<Option<GitSyncRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT active_revision, remote_name, remote_url, sync_status, last_error, updated_at
+                 FROM git_sync_state WHERE id = 1",
+                [],
+                |r| {
+                    Ok(GitSyncRecord {
+                        active_revision: r.get(0)?,
+                        remote_name: r.get(1)?,
+                        remote_url: r.get(2)?,
+                        sync_status: r.get(3)?,
+                        last_error: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+}
+
+pub fn hash_token(token_plaintext: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token_plaintext.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_wal_mode_and_idempotent_migrations() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(dir.path()).unwrap();
+        let mode: String = store
+            .with_conn_sync(|c| {
+                c.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                    .map_err(StoreError::from)
+            })
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        // Re-running migrations on the same database is idempotent.
+        store
+            .with_conn_sync(|c| migrations::run_migrations(c).map_err(StoreError::from))
+            .unwrap();
+        drop(store);
+        let reopened = SqliteStore::open(dir.path()).unwrap();
+        assert!(reopened.list_secrets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_state_cas_prevents_lost_updates() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let r1 = store
+            .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/a"), Some(0))
+            .unwrap();
+        assert_eq!(r1.version, 1);
+
+        let r2 = store
+            .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/b"), Some(1))
+            .unwrap();
+        assert_eq!(r2.version, 2);
+
+        let err = store
+            .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/stale"), Some(1))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::CasConflict { expected: 1, actual: 2 }));
+    }
+
+    #[test]
+    fn test_secret_encryption_redaction_and_backup() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let store = SqliteStore::open(&data_dir).unwrap();
+        let secret_val = "ghp_super_secret_token_987654321";
+        store
+            .set_secret("github-work", "Work GitHub PAT", secret_val, &["github_reader".into()])
+            .unwrap();
+
+        let (meta, decrypted) = store.resolve_secret_plaintext("github-work").unwrap();
+        assert_eq!(meta.key_version, 1);
+        assert_eq!(decrypted, secret_val);
+
+        let redacted = store
+            .redactor()
+            .redact_str(&format!("Authorization: Bearer {secret_val} failed"));
+        assert!(!redacted.contains(secret_val));
+        assert!(redacted.contains("[REDACTED]"));
+
+        // Backup and restore preserve encrypted secret blobs
+        let backup_path = dir.path().join("backup.db");
+        store.backup_to(&backup_path).unwrap();
+        assert!(backup_path.exists());
+    }
+
+    #[test]
+    fn test_events_checkpoints_dlq_and_activation_journal() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let e1 = store
+            .append_event("merge_pr", "github.pr_merged", "1", "tr_1", true, json!({"pr": 42}))
+            .unwrap();
+        let e2 = store
+            .append_event("merge_pr", "github.pr_merged", "1", "tr_2", true, json!({"pr": 43}))
+            .unwrap();
+        assert_eq!(e1.sequence, 1);
+        assert_eq!(e2.sequence, 2);
+
+        let replay = store.list_events_since("merge_pr", 1).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_id, e2.event_id);
+
+        store.set_consumer_checkpoint("complete_work", "merge_pr", 1).unwrap();
+        assert_eq!(store.get_consumer_checkpoint("complete_work", "merge_pr").unwrap(), 1);
+
+        let dlq_id = store.record_dead_letter("complete_work", &e2.event_id, 3, "jira 503").unwrap();
+        assert!(dlq_id.starts_with("dlq_"));
+
+        store
+            .upsert_activation_journal(&ActivationJournalRecord {
+                journal_id: "j1".into(),
+                draft_id: "d1".into(),
+                base_revision: "abc".into(),
+                target_revision: Some("def".into()),
+                generation_id: None,
+                phase: "committed".into(),
+                error_message: None,
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let pending = store.list_incomplete_activation_journals().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, "committed");
+    }
+}

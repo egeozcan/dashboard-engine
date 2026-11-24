@@ -36,7 +36,7 @@ mime_guess = "2"
 mlua = { version = "0.12.3", features = ["luau", "async", "serialize", "send"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
