@@ -177,27 +177,212 @@ pub async fn git_history(dir: &Path, limit: usize) -> Result<Vec<GitCommitInfo>,
     Ok(commits)
 }
 
+/// URL of `remote` with any embedded credentials removed (see [`sanitize_remote_url`]). The
+/// result is safe to return from APIs and to persist.
 pub async fn git_remote_url(dir: &Path, remote: &str) -> Option<String> {
+    git_remote_url_raw(dir, remote)
+        .await
+        .map(|u| sanitize_remote_url(&u).url)
+}
+
+/// URL of `remote` exactly as configured, possibly including credentials. Never return or
+/// persist it; use [`git_remote_url`] or [`sanitize_remote_url`].
+pub async fn git_remote_url_raw(dir: &Path, remote: &str) -> Option<String> {
     run_git(dir, &["remote", "get-url", remote]).await.ok()
 }
 
+/// A remote URL stripped of credentials, plus the credential strings that were removed (so a
+/// caller can register them with a redactor and mask Git error output that echoes them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedRemoteUrl {
+    pub url: String,
+    pub removed_secrets: Vec<String>,
+}
+
+/// Remove credentials from a Git remote URL (§5.2, §12.1: remote credentials are host secrets
+/// and never appear in API responses).
+///
+/// - `scheme://user:password@host/path?query#fragment` becomes `scheme://host/path`: the whole
+///   userinfo is dropped (a lone user component of an HTTPS URL is commonly a token), and so are
+///   the query string and fragment, which can carry tokens too.
+/// - scp-like `user@host:path` is kept as is: the user there is an SSH login, not a secret.
+/// - local paths are returned unchanged.
+pub fn sanitize_remote_url(raw: &str) -> SanitizedRemoteUrl {
+    let raw = raw.trim();
+    let Some(scheme_end) = raw.find("://") else {
+        return SanitizedRemoteUrl {
+            url: raw.to_string(),
+            removed_secrets: vec![],
+        };
+    };
+    let (scheme, rest) = (&raw[..scheme_end], &raw[scheme_end + 3..]);
+    let mut removed = Vec::new();
+    let (rest, tail) = match rest.find(['?', '#']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    for part in tail.split(['?', '&', '#']).filter(|p| !p.is_empty()) {
+        let value = part.split_once('=').map(|(_, v)| v).unwrap_or(part);
+        removed.push(value.to_string());
+    }
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = (&rest[..authority_end], &rest[authority_end..]);
+    let host = match authority.rfind('@') {
+        Some(at) => {
+            match authority[..at].split_once(':') {
+                // `user:password@`: the password is the secret
+                Some((_, password)) => removed.push(password.to_string()),
+                // `token@`: a lone user component is commonly an access token
+                None => removed.push(authority[..at].to_string()),
+            }
+            &authority[at + 1..]
+        }
+        None => authority,
+    };
+    // Git messages can show either the percent-encoded or the decoded form; mask both.
+    let decoded: Vec<String> = removed
+        .iter()
+        .filter_map(|s| percent_decode(s).filter(|d| d != s))
+        .collect();
+    removed.extend(decoded);
+    // Very short fragments are not credentials, and redacting them would mangle other output.
+    removed.retain(|s| s.len() >= 4);
+    removed.sort();
+    removed.dedup();
+    SanitizedRemoteUrl {
+        url: format!("{scheme}://{host}{path}"),
+        removed_secrets: removed,
+    }
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Default upper bound for one `git push`. A push failure leaves the Revision active and
+/// `unsynced` (§12.2 step 8); a hung remote must never stall the daemon indefinitely.
+pub const DEFAULT_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Push `HEAD` to `<remote>/<branch>` (bounded by [`DEFAULT_PUSH_TIMEOUT`]).
 pub async fn git_push(dir: &Path, remote: &str, branch: &str) -> Result<(), GitError> {
-    run_git(dir, &["push", remote, &format!("HEAD:{branch}")]).await?;
+    git_push_commit(dir, remote, "HEAD", branch, DEFAULT_PUSH_TIMEOUT).await
+}
+
+/// Push exactly `commit` to `refs/heads/<branch>` on `remote`, non-interactively and within
+/// `timeout`. SSH runs in batch mode with a connect timeout (unless the operator configured
+/// an SSH command), stalled HTTP transfers abort, and the git process is killed when the
+/// timeout expires or the caller's future is dropped.
+pub async fn git_push_commit(
+    dir: &Path,
+    remote: &str,
+    commit: &str,
+    branch: &str,
+    timeout: std::time::Duration,
+) -> Result<(), GitError> {
+    if remote.starts_with('-') || commit.starts_with('-') || branch.starts_with('-') {
+        return Err(GitError::Workspace(format!(
+            "refusing option-like push arguments '{remote}' '{commit}' '{branch}'"
+        )));
+    }
+    let refspec = format!("{commit}:refs/heads/{branch}");
+    let ssh_configured = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || run_git(dir, &["config", "--get", "core.sshCommand"])
+            .await
+            .is_ok_and(|v| !v.is_empty());
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "http.lowSpeedLimit=1000",
+            "-c",
+            "http.lowSpeedTime=30",
+            "push",
+            remote,
+            &refspec,
+        ])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if !ssh_configured {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=15",
+        );
+    }
+    let cmd_label = format!("git push {remote} {refspec}");
+    let output = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(out) => out?,
+        Err(_) => {
+            return Err(GitError::Command {
+                cmd: cmd_label,
+                stderr: format!("push timed out after {}s", timeout.as_secs()),
+            })
+        }
+    };
+    if !output.status.success() {
+        return Err(GitError::Command {
+            cmd: cmd_label,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
     Ok(())
 }
 
+/// Paths changed between two revisions (NUL-separated, so paths are never C-quoted).
 pub async fn git_changed_files_between(
     dir: &Path,
     from_rev: &str,
     to_rev: &str,
 ) -> Result<Vec<String>, GitError> {
     let range = format!("{from_rev}..{to_rev}");
-    let out = run_git(dir, &["diff", "--name-only", &range]).await?;
-    Ok(out
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|s| s.to_string())
-        .collect())
+    let out = run_git_raw(dir, &["diff", "--name-only", "-z", &range]).await?;
+    out.split(|b| *b == 0)
+        .filter(|r| !r.is_empty())
+        .map(utf8_path)
+        .collect()
+}
+
+/// Run git and return its raw, untrimmed stdout, failing on a non-zero exit.
+pub async fn run_git_raw(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(GitError::Command {
+            cmd: format!("git {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output.stdout)
+}
+
+fn utf8_path(raw: &[u8]) -> Result<String, GitError> {
+    String::from_utf8(raw.to_vec()).map_err(|_| {
+        GitError::Workspace(format!(
+            "Workspace path {:?} is not valid UTF-8; rename it so Dash can address it",
+            String::from_utf8_lossy(raw)
+        ))
+    })
 }
 
 pub async fn git_show_file(dir: &Path, rev: &str, rel_path: &str) -> Option<Vec<u8>> {
@@ -456,16 +641,29 @@ pub async fn git_diff_name_status(
     from: &str,
     to: &str,
 ) -> Result<Vec<(char, String)>, GitError> {
-    let out = run_git(dir, &["diff", "--no-renames", "--name-status", from, to]).await?;
-    Ok(out
-        .lines()
-        .filter_map(|l| {
-            let mut parts = l.splitn(2, '\t');
-            let st = parts.next()?.chars().next()?;
-            let path = parts.next()?.to_string();
-            Some((st, path))
-        })
-        .collect())
+    // `-z`: records are `<status>NUL<path>NUL` with paths verbatim. Without it Git C-quotes
+    // paths with non-ASCII bytes, quotes, backslashes or control characters (core.quotePath),
+    // and the quoted form would then be used as if it were the real file name.
+    let out = run_git_raw(
+        dir,
+        &["diff", "--no-renames", "--name-status", "-z", from, to],
+    )
+    .await?;
+    let mut fields = out.split(|b| *b == 0);
+    let mut entries = Vec::new();
+    while let Some(status) = fields.next() {
+        let Some(&st) = status.first() else {
+            continue;
+        };
+        let path = fields.next().filter(|p| !p.is_empty()).ok_or_else(|| {
+            GitError::Workspace(format!(
+                "malformed `git diff --name-status -z` output: status {:?} without a path",
+                String::from_utf8_lossy(status)
+            ))
+        })?;
+        entries.push((st as char, utf8_path(path)?));
+    }
+    Ok(entries)
 }
 
 /// Full commit message of `rev`.
@@ -582,6 +780,116 @@ mod plumbing_tests {
         );
         let hist = git_history(&ws, 1).await.unwrap();
         assert_eq!(hist[0].author, "agt_1");
+    }
+
+    #[tokio::test]
+    async fn diffs_report_real_paths_for_names_git_would_quote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let head = repo_with_commit(tmp.path()).await;
+        let names = [
+            "übersicht.yaml",
+            "tab\there.txt",
+            "quote\"d.txt",
+            "back\\slash.txt",
+        ];
+        for n in names {
+            std::fs::write(tmp.path().join(n), "x\n").unwrap();
+        }
+        let snap = git_snapshot_worktree_tree(tmp.path()).await.unwrap();
+        let head_tree = git_tree_of(tmp.path(), &head).await.unwrap();
+        let mut diff = git_diff_name_status(tmp.path(), &head_tree, &snap)
+            .await
+            .unwrap();
+        diff.sort();
+        let mut expected: Vec<(char, String)> =
+            names.iter().map(|n| ('A', n.to_string())).collect();
+        expected.sort();
+        assert_eq!(diff, expected);
+        run_git(tmp.path(), &["add", "-A"]).await.unwrap();
+        run_git(tmp.path(), &["commit", "-m", "names"])
+            .await
+            .unwrap();
+        let mut changed = git_changed_files_between(tmp.path(), &head, "HEAD")
+            .await
+            .unwrap();
+        changed.sort();
+        let mut expected: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        assert_eq!(changed, expected);
+        assert_eq!(
+            git_show_file(tmp.path(), "HEAD", "übersicht.yaml").await,
+            Some(b"x\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn remote_urls_are_stripped_of_credentials() {
+        let s = sanitize_remote_url("https://x-access-token:ghp_abc123XYZ@github.com/acme/ws.git");
+        assert_eq!(s.url, "https://github.com/acme/ws.git");
+        assert_eq!(s.removed_secrets, vec!["ghp_abc123XYZ".to_string()]);
+
+        let s = sanitize_remote_url("https://ghp_tokenonly@github.com/acme/ws.git");
+        assert_eq!(s.url, "https://github.com/acme/ws.git");
+        assert_eq!(s.removed_secrets, vec!["ghp_tokenonly".to_string()]);
+
+        let s = sanitize_remote_url(
+            "https://user:p%40ss%2Fword@host:8443/r.git?private_token=tok_123#frag",
+        );
+        assert_eq!(s.url, "https://host:8443/r.git");
+        assert!(s.removed_secrets.contains(&"p%40ss%2Fword".to_string()));
+        assert!(s.removed_secrets.contains(&"p@ss/word".to_string()));
+        assert!(s.removed_secrets.contains(&"tok_123".to_string()));
+
+        for kept in [
+            "git@github.com:acme/ws.git",
+            "ssh://github.com/acme/ws.git",
+            "/srv/git/ws.git",
+            "file:///srv/git/ws.git",
+        ] {
+            let s = sanitize_remote_url(kept);
+            assert_eq!(s.url, kept);
+            assert!(s.removed_secrets.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn push_is_bounded_by_its_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        repo_with_commit(&ws).await;
+        let hang = tmp.path().join("hang.sh");
+        std::fs::write(&hang, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x", &hang.to_string_lossy()])
+            .status()
+            .unwrap();
+        run_git(
+            &ws,
+            &["remote", "add", "origin", "ssh://git@example.invalid/r.git"],
+        )
+        .await
+        .unwrap();
+        run_git(&ws, &["config", "core.sshCommand", &hang.to_string_lossy()])
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = git_push_commit(
+            &ws,
+            "origin",
+            "HEAD",
+            "main",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            git_push_commit(&ws, "--upload-pack=x", "HEAD", "main", DEFAULT_PUSH_TIMEOUT)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

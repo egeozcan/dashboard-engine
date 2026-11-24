@@ -21,11 +21,11 @@
 use crate::git_cli::{
     commit_trailer, create_worktree, ensure_git_repo, git_commit_message, git_commit_tree,
     git_diff_name_status, git_export_tree, git_head, git_history, git_index_tree, git_is_ancestor,
-    git_push, git_read_tree_fast_forward, git_read_tree_index_only, git_read_tree_reset,
-    git_remote_tracking_commit, git_remote_url, git_resolve_commit, git_show_file,
-    git_snapshot_worktree_tree, git_stage_all_tree, git_tracked_changes, git_tree_of,
-    git_update_head, remove_worktree, run_git, run_git_bytes, GitCommitInfo, GitError,
-    GitStatusReport,
+    git_push_commit, git_read_tree_fast_forward, git_read_tree_index_only, git_read_tree_reset,
+    git_remote_tracking_commit, git_remote_url, git_remote_url_raw, git_resolve_commit,
+    git_show_file, git_snapshot_worktree_tree, git_stage_all_tree, git_tracked_changes,
+    git_tree_of, git_update_head, remove_worktree, run_git, run_git_bytes, sanitize_remote_url,
+    GitCommitInfo, GitError, GitStatusReport,
 };
 use crate::packages::{
     fetch_locked_packages, missing_locked_packages, read_packages_lock, read_packages_toml,
@@ -47,6 +47,7 @@ use dash_core::{
 use dash_luau::CompiledInstanceBundle;
 use dash_store::{ActivationJournalRecord, DraftRecord, GitSyncRecord, SqliteStore};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +94,66 @@ impl Drop for BusyGuard {
     }
 }
 
+/// A draft checked out for one mutation: holds the draft's busy slot until dropped, so an
+/// activation, rebase or abort can never interleave with the file writes and the change-log
+/// entry of the mutation (and vice versa). Derefs to the [`DraftRecord`] read after the slot
+/// was taken.
+struct MutationGuard {
+    draft: DraftRecord,
+    _busy: BusyGuard,
+}
+
+impl std::ops::Deref for MutationGuard {
+    type Target = DraftRecord;
+    fn deref(&self) -> &DraftRecord {
+        &self.draft
+    }
+}
+
+/// An activation whose Generation is live and whose draft is final, still to be pushed. The
+/// push runs after the activation lock and the draft's busy slot are released (§12.2 step 8).
+struct PendingPush {
+    result: ActivationResult,
+    journal: ActivationJournalRecord,
+    draft_author: String,
+    trace: SpanCtx,
+}
+
+/// Trace context of one Git transaction (§15.1: draft validation, migrations, activation and
+/// sync spans). Root spans link under the current request span automatically.
+#[derive(Clone)]
+struct SpanCtx {
+    trace_id: String,
+    parent: Option<String>,
+}
+
+impl SpanCtx {
+    fn child(&self, parent_span_id: &str) -> SpanCtx {
+        SpanCtx {
+            trace_id: self.trace_id.clone(),
+            parent: Some(parent_span_id.to_string()),
+        }
+    }
+}
+
+/// Record `span` with status `ok`/`error` from `res` (the error message is added to `attrs`).
+fn finish_span<T, E: std::fmt::Display>(
+    span: dash_core::telemetry::SpanGuard,
+    res: &Result<T, E>,
+    mut attrs: serde_json::Value,
+) {
+    let status = match res {
+        Ok(_) => "ok",
+        Err(e) => {
+            if let Some(obj) = attrs.as_object_mut() {
+                obj.insert("error".into(), serde_json::Value::String(e.to_string()));
+            }
+            "error"
+        }
+    };
+    span.finish(status, attrs);
+}
+
 #[derive(Clone)]
 pub struct DraftManager {
     workspace_dir: PathBuf,
@@ -101,6 +162,11 @@ pub struct DraftManager {
     engine: RuntimeEngine,
     use_mocks: bool,
     activate_lock: Arc<Mutex<()>>,
+    /// Serializes pushes (never held together with `activate_lock`), so concurrent pushes of
+    /// successive activations cannot race each other or overwrite each other's sync state.
+    push_lock: Arc<Mutex<()>>,
+    /// Upper bound of one push (see [`crate::git_cli::DEFAULT_PUSH_TIMEOUT`]).
+    push_timeout: Arc<std::sync::Mutex<std::time::Duration>>,
     /// Serializes read-modify-write updates of DraftRecords (never held across `.await`).
     record_lock: Arc<std::sync::Mutex<()>>,
     /// Drafts with an activation, rebase or abort in progress (draft id -> operation).
@@ -175,14 +241,58 @@ impl DraftManager {
         }
 
         // Crash recovery on startup from activation_journal (§12.2, §15.2, ADR-0004)
-        reconcile_activation_journals(&workspace_dir, &store, &mut warnings).await;
-        let head = git_head(&workspace_dir).await?;
+        let landed = reconcile_activation_journals(&workspace_dir, &store, &mut warnings).await;
+        let mut head = git_head(&workspace_dir).await?;
 
         // The active Generation is built exactly from its Revision: uncommitted external
         // modifications are never silently activated (§12.3). `--use-mocks` substitutes Mock
         // connectors but keeps live authority (SQLite grants).
         let mut graph =
             load_revision_graph(&workspace_dir, &data_dir, &head, use_mocks, &mut warnings).await?;
+
+        // §8: the Generation that starts serving must have its Dashboard State migrated, exactly
+        // as an activation would. An activation interrupted before its migration ran is either
+        // completed below or, if its State can no longer migrate, rolled back to its base.
+        let mut rolled_back: Option<String> = None;
+        let precheck = dash_core::StateManager::new(store.clone(), dash_core::SignalHub::new(64));
+        if let Err(e) = precheck.check_generation_state(&graph.dashboards) {
+            let Some(l) = landed.iter().find(|l| l.target == head) else {
+                return Err(GitError::Workspace(format!(
+                    "Workspace HEAD {} declares Dashboard State that cannot be migrated from the stored State: {e}. Dash refuses to serve it unmigrated (§8). Move HEAD back to the previous Revision or fix the state_schema migration in a new commit, then restart.",
+                    short(&head)
+                )));
+            };
+            let msg = format!(
+                "reconciled_on_startup: interrupted activation {} of {} rolled back to {}: its Dashboard State cannot be migrated ({e})",
+                l.journal.journal_id,
+                short(&l.target),
+                short(&l.journal.base_revision)
+            );
+            git_update_head(
+                &workspace_dir,
+                &l.journal.base_revision,
+                &l.target,
+                "dash: roll back interrupted activation (State migration failed)",
+            )
+            .await?;
+            repair_index(&workspace_dir, &l.target, &l.journal.base_revision, l.mode).await;
+            let mut failed = l.journal.clone();
+            failed.phase = "failed".into();
+            failed.error_message = Some(msg.clone());
+            failed.updated_at = Utc::now().to_rfc3339();
+            let _ = store.upsert_activation_journal(&failed);
+            warnings.push(msg);
+            rolled_back = Some(l.journal.journal_id.clone());
+            head = l.journal.base_revision.clone();
+            graph = load_revision_graph(&workspace_dir, &data_dir, &head, use_mocks, &mut warnings)
+                .await?;
+            if let Err(e) = precheck.check_generation_state(&graph.dashboards) {
+                return Err(GitError::Workspace(format!(
+                    "Revision {} declares Dashboard State that cannot be migrated from the stored State: {e}. Dash refuses to serve it unmigrated (§8).",
+                    short(&head)
+                )));
+            }
+        }
         let gen_id = store
             .record_generation(&head, &graph.graph_digest())
             .map_err(|e| GitError::Workspace(e.to_string()))?;
@@ -209,8 +319,30 @@ impl DraftManager {
         let _ = engine.history.sync_series_configs(&graph.workspace.history);
         // Durable consumers start at this Generation's activation point (§7.2).
         engine.automations.register_consumers();
-        for dash in graph.dashboards.values() {
-            let _ = engine.state.seed_dashboard_defaults(dash, gen_id);
+        // Migrate stored Dashboard State to the declared schema versions (one transaction,
+        // audited), then seed missing defaults (§8). Only records whose schema_version differs
+        // are touched, so this is a no-op when the previous run already migrated them.
+        let report = engine
+            .state
+            .apply_generation_state(&graph.dashboards, gen_id, &admin)
+            .map_err(|e| {
+                GitError::Workspace(format!(
+                    "Dashboard State migration for Revision {} failed at startup: {e}; Dash refuses to serve unmigrated State (§8)",
+                    short(&head)
+                ))
+            })?;
+        if report.applied > 0 {
+            tracing::info!(
+                "migrated {} Dashboard State record(s) to Revision {} at startup",
+                report.applied,
+                short(&head)
+            );
+        }
+        // Only now, with the Generation's State migrated, are interrupted activations complete.
+        for l in &landed {
+            if rolled_back.as_deref() != Some(l.journal.journal_id.as_str()) {
+                finalize_landed_activation(&workspace_dir, &store, l).await;
+            }
         }
 
         Ok(Self {
@@ -220,6 +352,8 @@ impl DraftManager {
             engine,
             use_mocks,
             activate_lock: Arc::new(Mutex::new(())),
+            push_lock: Arc::new(Mutex::new(())),
+            push_timeout: Arc::new(std::sync::Mutex::new(crate::git_cli::DEFAULT_PUSH_TIMEOUT)),
             record_lock: Arc::new(std::sync::Mutex::new(())),
             busy: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             startup_warnings: Arc::new(warnings),
@@ -335,10 +469,6 @@ impl DraftManager {
             ));
         }
         Ok(())
-    }
-
-    fn busy_op(&self, draft_id: &str) -> Option<String> {
-        self.busy.lock().ok().and_then(|s| s.get(draft_id).cloned())
     }
 
     fn acquire_busy(&self, draft_id: &str, op: &str) -> Result<BusyGuard, GitError> {
@@ -684,6 +814,22 @@ impl DraftManager {
     ) -> Result<ValidationReport, GitError> {
         let draft = self.draft_status(draft_id)?;
         self.authorize(&draft, principal, "validate", true)?;
+        let span = self.start_span(&self.span_ctx(), "draft.validate", principal);
+        let res = self.validate_inner(draft).await;
+        let attrs = match &res {
+            Ok(r) => json!({
+                "draft_id": draft_id,
+                "valid": r.valid,
+                "issues": r.issues.len(),
+            }),
+            Err(_) => json!({ "draft_id": draft_id }),
+        };
+        finish_span(span, &res, attrs);
+        res
+    }
+
+    async fn validate_inner(&self, draft: DraftRecord) -> Result<ValidationReport, GitError> {
+        let draft_id = draft.draft_id.as_str();
         let changes_before = draft.changes.len();
         let wt = Path::new(&draft.worktree_path);
         let graph =
@@ -759,10 +905,31 @@ impl DraftManager {
                 draft.status
             )));
         }
-        self.preview_inner(&draft).await
+        self.preview_inner(&draft, principal, &self.span_ctx())
+            .await
     }
 
-    async fn preview_inner(&self, draft: &DraftRecord) -> Result<PreviewTestReport, GitError> {
+    async fn preview_inner(
+        &self,
+        draft: &DraftRecord,
+        principal: &Principal,
+        trace: &SpanCtx,
+    ) -> Result<PreviewTestReport, GitError> {
+        let span = self.start_span(trace, "draft.preview", principal);
+        let res = self.preview_body(draft).await;
+        let attrs = match &res {
+            Ok(r) => json!({
+                "draft_id": draft.draft_id,
+                "all_passed": r.all_passed,
+                "tested_tree": r.tested_tree,
+            }),
+            Err(_) => json!({ "draft_id": draft.draft_id }),
+        };
+        finish_span(span, &res, attrs);
+        res
+    }
+
+    async fn preview_body(&self, draft: &DraftRecord) -> Result<PreviewTestReport, GitError> {
         let draft_id = draft.draft_id.as_str();
         let wt = Path::new(&draft.worktree_path);
         let changes_before = draft.changes.len();
@@ -863,11 +1030,31 @@ impl DraftManager {
         draft_id: &str,
         principal: &Principal,
     ) -> Result<DraftRecord, GitError> {
+        let ctx = self.span_ctx();
+        let span = self.start_span(&ctx, "draft.rebase", principal);
+        let res = self.rebase_inner(draft_id, principal).await;
+        let attrs = match &res {
+            Ok(r) => json!({ "draft_id": draft_id, "base_revision": r.base_revision }),
+            Err(GitError::MergeConflict(files)) => {
+                json!({ "draft_id": draft_id, "conflicts": files })
+            }
+            Err(_) => json!({ "draft_id": draft_id }),
+        };
+        finish_span(span, &res, attrs);
+        res
+    }
+
+    async fn rebase_inner(
+        &self,
+        draft_id: &str,
+        principal: &Principal,
+    ) -> Result<DraftRecord, GitError> {
+        // Holds the busy slot for the whole rebase: no mutation can write into the worktree
+        // between the draft tree snapshot and the application of the merge plan.
         let draft = self.begin_mutation(draft_id, principal, "rebase")?;
-        let _busy = self.acquire_busy(draft_id, "rebase")?;
         let active_rev = self.active_revision().await?;
         if draft.base_revision == active_rev {
-            return Ok(draft);
+            return Ok(draft.draft.clone());
         }
 
         let wt = Path::new(&draft.worktree_path);
@@ -882,8 +1069,15 @@ impl DraftManager {
 
         let mut plan: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         let mut conflicts = Vec::new();
-        for (_, rel) in &upstream {
+        for (status, rel) in &upstream {
             let theirs = git_show_file(&self.workspace_dir, &active_rev, rel).await;
+            if *status != 'D' && theirs.is_none() {
+                // Never turn an unreadable upstream file into a silent delete / no-op (§12.3)
+                return Err(GitError::Workspace(format!(
+                    "rebase refused: upstream file '{rel}' (status {status}) could not be read from {}",
+                    short(&active_rev)
+                )));
+            }
             if !draft_changed.contains(rel) {
                 plan.push((rel.clone(), theirs));
                 continue;
@@ -987,11 +1181,30 @@ impl DraftManager {
         let draft = self.draft_status(draft_id)?;
         self.authorize(&draft, principal, "activate", false)?;
 
-        let _guard = self.activate_lock.lock().await;
-        let _busy = self.acquire_busy(draft_id, "activate")?;
-        let draft = self.require_mutable_status(draft_id)?;
-        self.activate_locked(draft, principal, ActivationMode::Draft)
-            .await
+        let ctx = self.span_ctx();
+        let span = self.start_span(&ctx, "draft.activate", principal);
+        let child = ctx.child(&span.span_id);
+        let staged = {
+            let _guard = self.activate_lock.lock().await;
+            match self.acquire_busy(draft_id, "activate") {
+                Ok(_busy) => match self.require_mutable_status(draft_id) {
+                    Ok(draft) => {
+                        self.activate_locked(draft, principal, ActivationMode::Draft, &child)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        };
+        finish_span(
+            span,
+            &staged,
+            json!({ "draft_id": draft_id, "mode": "draft" }),
+        );
+        // The activation lock and the busy slot are released: a slow remote never blocks
+        // other activations or reloads (§12.2 step 8).
+        self.push_activation(staged?, principal).await
     }
 
     async fn activate_locked(
@@ -999,7 +1212,8 @@ impl DraftManager {
         draft: DraftRecord,
         principal: &Principal,
         mode: ActivationMode,
-    ) -> Result<ActivationResult, GitError> {
+        trace: &SpanCtx,
+    ) -> Result<PendingPush, GitError> {
         let draft_id = draft.draft_id.clone();
         let active_rev = self.active_revision().await?;
         if draft.base_revision != active_rev {
@@ -1029,7 +1243,7 @@ impl DraftManager {
             .and_then(|v| serde_json::from_value(v).ok());
         let report = match cached {
             Some(r) if r.all_passed && r.tested_tree.as_deref() == Some(current_tree.as_str()) => r,
-            _ => self.preview_inner(&draft).await?,
+            _ => self.preview_inner(&draft, principal, trace).await?,
         };
         if !report.all_passed {
             return Err(GitError::Workspace(format!(
@@ -1225,11 +1439,22 @@ impl DraftManager {
 
         // Migrate State transactionally and seed defaults before touching the live runtime; a
         // failed migration rolls back and leaves the live Generation and its State untouched (§8).
-        if let Err(e) =
+        let migrate_span = self.start_span(trace, "state.migrate", principal);
+        let migrated =
             self.engine
                 .state
-                .apply_generation_state(&live_graph.dashboards, new_gen_id, principal)
-        {
+                .apply_generation_state(&live_graph.dashboards, new_gen_id, principal);
+        let migrate_attrs = match &migrated {
+            Ok(r) => json!({
+                "generation_id": new_gen_id,
+                "applied": r.applied,
+                "seeded": r.seeded,
+                "migrations": r.migrations,
+            }),
+            Err(e) => json!({ "generation_id": new_gen_id, "error": e.to_string() }),
+        };
+        finish_span(migrate_span, &migrated, migrate_attrs);
+        if let Err(e) = migrated {
             self.rollback_workspace(&active_rev, &new_commit, mode)
                 .await;
             let _ = self.store.upsert_activation_journal(&journal(
@@ -1252,6 +1477,7 @@ impl DraftManager {
         );
 
         // Atomic Generation swap first; side effects keyed on the new Generation follow (§12.2 step 7)
+        let swap_span = self.start_span(trace, "generation.swap", principal);
         let history_cfg = live_graph.workspace.history.clone();
         self.engine.graph.store(Arc::new(live_graph));
         let rebuilt_installed = self.engine.pool.install_prepared(prepared);
@@ -1262,12 +1488,31 @@ impl DraftManager {
         // Dashboard State defaults were seeded by apply_generation_state above.
         let _ = self.engine.history.sync_series_configs(&history_cfg);
         self.engine.automations.register_consumers();
+        swap_span.finish(
+            "ok",
+            json!({
+                "generation_id": new_gen_id,
+                "revision": new_commit,
+                "rebuilt": rebuilt.len(),
+                "carried_over": carried_over.len(),
+            }),
+        );
         self.simulated_crash("after_swap")?;
         // Mark the draft activated before the journal leaves `committed`: a crash in between is
         // then still reconciled at startup, and a draft whose content is live never stays open
         // (e.g. after a crash before the push).
         remove_worktree(&self.workspace_dir, &wt).await;
+        let activated_changes = draft.changes.len();
         self.update_record(&draft_id, |r| {
+            if r.changes.len() != activated_changes {
+                // Mutations hold the busy slot, so this cannot happen; never hide it if it does.
+                tracing::error!(
+                    "draft '{}' recorded {} change(s) during its activation that are not in commit {}",
+                    r.draft_id,
+                    r.changes.len().saturating_sub(activated_changes),
+                    short(&new_commit)
+                );
+            }
             r.status = "activated".into();
             Ok(())
         })?;
@@ -1292,41 +1537,63 @@ impl DraftManager {
             });
         }
 
-        self.simulated_crash("before_push")?;
-        // Attempt push to configured remote; push failure leaves active/committed/unsynced (§12.2 step 8)
-        let (sync_status, sync_error) = self.attempt_push(&new_commit).await;
-        if sync_status == "synced" {
-            let _ = self.store.upsert_activation_journal(&journal(
-                "pushed",
-                Some(&new_commit),
-                Some(new_gen_id),
-                None,
-            ));
-        }
+        let activated_journal = journal("activated", Some(&new_commit), Some(new_gen_id), None);
+        Ok(PendingPush {
+            result: ActivationResult {
+                revision_commit: new_commit,
+                generation_id: new_gen_id,
+                carried_over_instances: carried_over,
+                rebuilt_instances: rebuilt,
+                sync_status: "unsynced".into(),
+                sync_error: None,
+                stale_instances,
+            },
+            journal: activated_journal,
+            draft_author: draft.created_by.clone(),
+            trace: trace.clone(),
+        })
+    }
 
+    /// Push an activation that is already live and final, then audit it. Runs without the
+    /// activation lock or the draft's busy slot; a push failure or timeout leaves the Revision
+    /// active and `unsynced` (§12.2 step 8).
+    async fn push_activation(
+        &self,
+        pending: PendingPush,
+        principal: &Principal,
+    ) -> Result<ActivationResult, GitError> {
+        let PendingPush {
+            mut result,
+            journal,
+            draft_author,
+            trace,
+        } = pending;
+        self.simulated_crash("before_push")?;
+        let (sync_status, sync_error) = self
+            .attempt_push_traced(&result.revision_commit, principal, &trace)
+            .await;
+        if sync_status == "synced" {
+            let mut pushed = journal.clone();
+            pushed.phase = "pushed".into();
+            pushed.updated_at = Utc::now().to_rfc3339();
+            let _ = self.store.upsert_activation_journal(&pushed);
+        }
         let _ = self.store.append_audit(
             &principal.id,
             principal.kind.as_str(),
             "draft.activate",
-            &draft_id,
+            &journal.draft_id,
             "activated",
             serde_json::json!({
-                "revision": new_commit,
-                "generation": new_gen_id,
+                "revision": result.revision_commit,
+                "generation": result.generation_id,
                 "sync_status": sync_status,
-                "author": draft.created_by,
+                "author": draft_author,
             }),
         );
-
-        Ok(ActivationResult {
-            revision_commit: new_commit,
-            generation_id: new_gen_id,
-            carried_over_instances: carried_over,
-            rebuilt_instances: rebuilt,
-            sync_status,
-            sync_error,
-            stale_instances,
-        })
+        result.sync_status = sync_status;
+        result.sync_error = sync_error;
+        Ok(result)
     }
 
     async fn check_workspace_precondition(
@@ -1425,21 +1692,72 @@ impl DraftManager {
                 "principal lacks authority to author and activate drafts".into(),
             ));
         }
-        let _guard = self.activate_lock.lock().await;
-        let snapshot = git_snapshot_worktree_tree(&self.workspace_dir).await?;
-        let draft = self.draft_begin(principal).await?;
-        let wt = PathBuf::from(&draft.worktree_path);
-        // Mirror the Workspace exactly, deletions included
-        run_git(&wt, &["read-tree", "--reset", "-u", &snapshot]).await?;
-        self.record_draft_mutation(
-            &draft.draft_id,
-            principal,
-            "reload:workspace_changes".into(),
-        )?;
-        let _busy = self.acquire_busy(&draft.draft_id, "activate")?;
-        let draft = self.require_mutable_status(&draft.draft_id)?;
-        self.activate_locked(draft, principal, ActivationMode::Reload)
-            .await
+        let ctx = self.span_ctx();
+        let span = self.start_span(&ctx, "draft.activate", principal);
+        let child = ctx.child(&span.span_id);
+        let mut reload_draft_id = None;
+        let staged = {
+            let _guard = self.activate_lock.lock().await;
+            let staged = async {
+                let snapshot = git_snapshot_worktree_tree(&self.workspace_dir).await?;
+                let draft = self.draft_begin(principal).await?;
+                reload_draft_id = Some(draft.draft_id.clone());
+                let _busy = self.acquire_busy(&draft.draft_id, "activate")?;
+                let wt = PathBuf::from(&draft.worktree_path);
+                // Mirror the Workspace exactly, deletions included
+                run_git(&wt, &["read-tree", "--reset", "-u", &snapshot]).await?;
+                self.record_draft_mutation(&draft.draft_id, principal, RELOAD_CHANGE.into())?;
+                let draft = self.require_mutable_status(&draft.draft_id)?;
+                self.activate_locked(draft, principal, ActivationMode::Reload, &child)
+                    .await
+            }
+            .await;
+            if let (Err(e), Some(id)) = (&staged, &reload_draft_id) {
+                // A reload draft is never reused (each reload proposes a fresh one), so a failed
+                // reload must not leave an open draft and a Git worktree behind. A simulated
+                // crash leaves everything as a killed process would.
+                if !is_simulated_crash(e) {
+                    self.discard_failed_reload(id, principal, e).await;
+                }
+            }
+            staged
+        };
+        finish_span(
+            span,
+            &staged,
+            json!({ "draft_id": reload_draft_id, "mode": "reload" }),
+        );
+        self.push_activation(staged?, principal).await
+    }
+
+    /// Abort the draft of a failed `dash reload` and remove its worktree, unless its content
+    /// went live after all.
+    async fn discard_failed_reload(&self, draft_id: &str, principal: &Principal, err: &GitError) {
+        let Ok(draft) = self.draft_status(draft_id) else {
+            return;
+        };
+        if DRAFT_STATUSES_FINAL.contains(&draft.status.as_str()) {
+            return;
+        }
+        remove_worktree(&self.workspace_dir, Path::new(&draft.worktree_path)).await;
+        let aborted = self.update_record(draft_id, |r| {
+            if r.status != "activated" {
+                r.status = "aborted".into();
+            }
+            Ok(())
+        });
+        if let Err(e) = aborted {
+            tracing::warn!("could not abort failed reload draft '{draft_id}': {e}");
+            return;
+        }
+        let _ = self.store.append_audit(
+            &principal.id,
+            principal.kind.as_str(),
+            "draft.abort",
+            draft_id,
+            "aborted",
+            serde_json::json!({ "reason": "reload failed", "error": err.to_string() }),
+        );
     }
 
     pub async fn git_status(&self) -> Result<GitStatusReport, GitError> {
@@ -1453,7 +1771,7 @@ impl DraftManager {
         let branch = run_git(&self.workspace_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
             .await
             .unwrap_or_else(|_| "main".into());
-        let remote_url = git_remote_url(&self.workspace_dir, "origin").await;
+        let remote_url = self.sanitized_origin_url().await;
         let push_branch = self.engine.graph.load().workspace.git_branch.clone();
         let sync = derive_sync_state(&self.workspace_dir, &self.store, &push_branch).await;
         let active_gen_rev = self.active_generation_revision();
@@ -1477,7 +1795,19 @@ impl DraftManager {
 
     pub async fn git_sync(&self, principal: &Principal) -> Result<GitSyncRecord, GitError> {
         let head = self.active_revision().await?;
-        let (sync_status, last_error) = self.attempt_push(&head).await;
+        let ctx = self.span_ctx();
+        let span = self.start_span(&ctx, "git.sync", principal);
+        let (sync_status, last_error) = self
+            .attempt_push_traced(&head, principal, &ctx.child(&span.span_id))
+            .await;
+        span.finish(
+            if sync_status == "unsynced" {
+                "error"
+            } else {
+                "ok"
+            },
+            json!({ "revision": head, "sync_status": sync_status }),
+        );
         let _ = self.store.append_audit(
             &principal.id,
             principal.kind.as_str(),
@@ -1492,8 +1822,61 @@ impl DraftManager {
             .ok_or_else(|| GitError::Workspace("git sync state missing".into()))
     }
 
+    /// Test hook: bound every push by `timeout` instead of [`crate::git_cli::DEFAULT_PUSH_TIMEOUT`].
+    #[doc(hidden)]
+    pub fn set_push_timeout_for_tests(&self, timeout: std::time::Duration) {
+        *self
+            .push_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = timeout;
+    }
+
+    /// The `origin` URL without credentials. Removed credentials are registered with the
+    /// redactor, so Git output that echoes them is masked too (§5.2, §12.1).
+    async fn sanitized_origin_url(&self) -> Option<String> {
+        let raw = git_remote_url_raw(&self.workspace_dir, "origin").await?;
+        let clean = sanitize_remote_url(&raw);
+        for secret in &clean.removed_secrets {
+            self.store.redactor().register_secret(secret);
+        }
+        Some(clean.url)
+    }
+
+    async fn attempt_push_traced(
+        &self,
+        commit: &str,
+        principal: &Principal,
+        trace: &SpanCtx,
+    ) -> (String, Option<String>) {
+        let span = self.start_span(trace, "git.push", principal);
+        let started = std::time::Instant::now();
+        let (status, error) = self.attempt_push(commit).await;
+        span.finish(
+            if status == "unsynced" { "error" } else { "ok" },
+            json!({
+                "revision": commit,
+                "sync_status": status,
+                "error": error,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }),
+        );
+        (status, error)
+    }
+
+    /// Push `commit` (or the running Generation's Revision, when that already contains it) to
+    /// `origin`. Pushes are serialized by `push_lock`, so successive activations whose pushes
+    /// overlap never race: a later push of a descendant supersedes an earlier one.
     async fn attempt_push(&self, commit: &str) -> (String, Option<String>) {
-        let remote_url = git_remote_url(&self.workspace_dir, "origin").await;
+        let _push = self.push_lock.lock().await;
+        let remote_url = self.sanitized_origin_url().await;
+        let live = self.active_generation_revision();
+        let commit = if live != commit && git_is_ancestor(&self.workspace_dir, commit, &live).await
+        {
+            live
+        } else {
+            commit.to_string()
+        };
+        let commit = commit.as_str();
         let Some(ref url) = remote_url else {
             let rec = GitSyncRecord {
                 active_revision: Some(commit.to_string()),
@@ -1508,7 +1891,11 @@ impl DraftManager {
         };
 
         let branch = push_branch(&self.engine.graph.load().workspace.git_branch);
-        match git_push(&self.workspace_dir, "origin", &branch).await {
+        let timeout = *self
+            .push_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match git_push_commit(&self.workspace_dir, "origin", commit, &branch, timeout).await {
             Ok(()) => {
                 let rec = GitSyncRecord {
                     active_revision: Some(commit.to_string()),
@@ -1522,7 +1909,7 @@ impl DraftManager {
                 ("synced".into(), None)
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = self.store.redactor().redact_str(&e.to_string());
                 let rec = GitSyncRecord {
                     active_revision: Some(commit.to_string()),
                     remote_name: "origin".into(),
@@ -1548,22 +1935,45 @@ impl DraftManager {
         Ok(draft)
     }
 
-    /// Mutable, not busy, and accessible to `principal` with `can_author_drafts`.
+    /// Check out a draft for one mutation: accessible to `principal` with `can_author_drafts`,
+    /// not busy, and still mutable once its busy slot is held. The slot stays taken until the
+    /// returned guard is dropped, i.e. across the file writes and the change-log entry, so an
+    /// activation, rebase or abort cannot interleave with the mutation.
     fn begin_mutation(
         &self,
         draft_id: &str,
         principal: &Principal,
         op: &str,
-    ) -> Result<DraftRecord, GitError> {
+    ) -> Result<MutationGuard, GitError> {
         let draft = self.draft_status(draft_id)?;
         self.authorize(&draft, principal, op, true)?;
+        let busy = self.acquire_busy(draft_id, op)?;
+        // Re-read under the slot: an activation may have finished just before we took it
         let draft = self.require_mutable_status(draft_id)?;
-        if let Some(cur) = self.busy_op(draft_id) {
-            return Err(GitError::Workspace(format!(
-                "draft '{draft_id}' is busy ({cur} in progress)"
-            )));
+        Ok(MutationGuard { draft, _busy: busy })
+    }
+
+    /// Trace context for a new Git transaction: inside a request it joins the request's trace
+    /// (root spans link under the request span), otherwise it starts a fresh trace.
+    fn span_ctx(&self) -> SpanCtx {
+        let trace_id = dash_core::telemetry::current_request_trace()
+            .map(|c| c.trace_id)
+            .unwrap_or_else(dash_core::telemetry::Telemetry::new_trace_id);
+        SpanCtx {
+            trace_id,
+            parent: None,
         }
-        Ok(draft)
+    }
+
+    fn start_span(
+        &self,
+        ctx: &SpanCtx,
+        name: &str,
+        principal: &Principal,
+    ) -> dash_core::telemetry::SpanGuard {
+        self.engine
+            .telemetry
+            .start_span(&ctx.trace_id, ctx.parent.as_deref(), name, &principal.id)
     }
 
     fn record_draft_mutation(
@@ -1863,7 +2273,8 @@ async fn derive_sync_state(
                 .map(|r| {
                     r.sync_status == "synced"
                         && r.active_revision.as_deref() == Some(h.as_str())
-                        && r.remote_url.as_deref() == Some(url.as_str())
+                        && r.remote_url.as_deref().map(|u| sanitize_remote_url(u).url)
+                            == Some(url.clone())
                 })
                 .unwrap_or(false);
         }
@@ -1888,18 +2299,88 @@ async fn derive_sync_state(
     }
 }
 
+/// An interrupted activation whose commit is HEAD. Its index/working-tree switch has been
+/// finished; completing it (Revision record, draft final, journal `activated`) waits until the
+/// Generation's State is migrated at startup (§8).
+struct LandedActivation {
+    journal: ActivationJournalRecord,
+    target: String,
+    mode: ActivationMode,
+}
+
+/// Mode an activation ran in, from its draft: `dash reload` drafts carry the
+/// `reload:workspace_changes` change entry, which no other path records.
+fn journal_mode(store: &SqliteStore, draft_id: &str) -> ActivationMode {
+    let is_reload = store
+        .get_draft(draft_id)
+        .ok()
+        .flatten()
+        .is_some_and(|d| d.changes.iter().any(|c| c.starts_with(RELOAD_CHANGE)));
+    if is_reload {
+        ActivationMode::Reload
+    } else {
+        ActivationMode::Draft
+    }
+}
+
+/// Change-log entry of a `dash reload` draft (see [`DraftManager::reload_workspace`]).
+const RELOAD_CHANGE: &str = "reload:workspace_changes";
+
+/// Complete an interrupted activation that landed: record the Revision, discard the draft's
+/// worktree, mark the draft activated and the journal `activated` (sync is re-derived, so an
+/// unconfirmed push shows `unsynced`).
+async fn finalize_landed_activation(ws: &Path, store: &SqliteStore, l: &LandedActivation) {
+    let j = &l.journal;
+    let draft = store.get_draft(&j.draft_id).ok().flatten();
+    let msg = git_commit_message(ws, &l.target).await.unwrap_or_default();
+    let principal_id = commit_trailer(&msg, "Dash-Principal")
+        .or_else(|| draft.as_ref().map(|d| d.created_by.clone()))
+        .unwrap_or_else(|| Principal::administrator().id);
+    let principal_kind =
+        commit_trailer(&msg, "Dash-Principal-Kind").unwrap_or_else(|| "administrator".into());
+    let _ = store.record_revision(
+        &l.target,
+        Some(&j.base_revision),
+        &principal_id,
+        &principal_kind,
+        "Activation completed by crash recovery",
+    );
+    if let Some(mut d) = draft {
+        remove_worktree(ws, Path::new(&d.worktree_path)).await;
+        d.status = "activated".into();
+        d.updated_at = Utc::now().to_rfc3339();
+        let _ = store.upsert_draft(&d);
+    }
+    let mut repaired = j.clone();
+    repaired.phase = "activated".into();
+    repaired.updated_at = Utc::now().to_rfc3339();
+    repaired.error_message = Some(format!(
+        "reconciled_on_startup: commit {} is HEAD and was activated by crash recovery",
+        short(&l.target)
+    ));
+    let _ = store.upsert_activation_journal(&repaired);
+}
+
 /// Deterministically reconcile activations interrupted by a crash (ADR-0004 §2):
 /// - target commit is HEAD: the commit landed; finish the index/working-tree switch Dash was
-///   performing, record the Revision, mark the draft activated (sync is re-derived, so an
-///   unconfirmed push shows `unsynced`);
+///   performing and return it, so startup completes it once State is migrated (§8);
 /// - HEAD is still the base: the activation never landed; undo any partial switch;
 /// - anything else: external divergence; mark `failed` and leave the Workspace alone.
-async fn reconcile_activation_journals(ws: &Path, store: &SqliteStore, warnings: &mut Vec<String>) {
+///
+/// Index/working-tree repairs follow the activation's mode: a `dash reload` never touches the
+/// Workspace working tree (it holds the user's uncommitted edits), only the index.
+async fn reconcile_activation_journals(
+    ws: &Path,
+    store: &SqliteStore,
+    warnings: &mut Vec<String>,
+) -> Vec<LandedActivation> {
     let incomplete = store
         .list_incomplete_activation_journals()
         .unwrap_or_default();
+    let mut landed_activations = Vec::new();
     for j in incomplete {
         let head = git_head(ws).await.ok();
+        let mode = journal_mode(store, &j.draft_id);
         let mut repaired = j.clone();
         repaired.updated_at = Utc::now().to_rfc3339();
         let landed = match (&j.target_revision, &head) {
@@ -1909,37 +2390,18 @@ async fn reconcile_activation_journals(ws: &Path, store: &SqliteStore, warnings:
         if landed {
             let target = j.target_revision.clone().unwrap_or_default();
             if target != j.base_revision {
-                repair_index(ws, &j.base_revision, &target).await;
+                repair_index(ws, &j.base_revision, &target, mode).await;
             }
-            let draft = store.get_draft(&j.draft_id).ok().flatten();
-            let msg = git_commit_message(ws, &target).await.unwrap_or_default();
-            let principal_id = commit_trailer(&msg, "Dash-Principal")
-                .or_else(|| draft.as_ref().map(|d| d.created_by.clone()))
-                .unwrap_or_else(|| Principal::administrator().id);
-            let principal_kind = commit_trailer(&msg, "Dash-Principal-Kind")
-                .unwrap_or_else(|| "administrator".into());
-            let _ = store.record_revision(
-                &target,
-                Some(&j.base_revision),
-                &principal_id,
-                &principal_kind,
-                "Activation completed by crash recovery",
-            );
-            if let Some(mut d) = draft {
-                remove_worktree(ws, Path::new(&d.worktree_path)).await;
-                d.status = "activated".into();
-                d.updated_at = Utc::now().to_rfc3339();
-                let _ = store.upsert_draft(&d);
-            }
-            repaired.phase = "activated".into();
-            repaired.error_message = Some(format!(
-                "reconciled_on_startup: commit {} is HEAD and was activated by crash recovery",
-                short(&target)
-            ));
+            landed_activations.push(LandedActivation {
+                journal: j,
+                target,
+                mode,
+            });
+            continue;
         } else if head.as_deref() == Some(j.base_revision.as_str()) {
             if let Some(ref t) = j.target_revision {
                 if *t != j.base_revision {
-                    repair_index(ws, t, &j.base_revision).await;
+                    repair_index(ws, t, &j.base_revision, mode).await;
                 }
             }
             repaired.phase = "rolled_back".into();
@@ -1960,12 +2422,15 @@ async fn reconcile_activation_journals(ws: &Path, store: &SqliteStore, warnings:
         }
         let _ = store.upsert_activation_journal(&repaired);
     }
+    landed_activations
 }
 
 /// Finish an interrupted index/working-tree switch from `from` to `to` (HEAD already at `to`).
 /// Only acts when the index still holds exactly `from`'s tree, i.e. Dash's own switch was
-/// interrupted; any other state is left for the operator.
-async fn repair_index(ws: &Path, from: &str, to: &str) {
+/// interrupted; any other state is left for the operator. A `Draft` activation switches index
+/// and working tree; a `Reload` activation only ever moves the index, because the working tree
+/// holds the user's uncommitted edits that the reload proposed (§12.3).
+async fn repair_index(ws: &Path, from: &str, to: &str, mode: ActivationMode) {
     let (Ok(idx), Ok(from_tree), Ok(to_tree)) = (
         git_index_tree(ws).await,
         git_tree_of(ws, from).await,
@@ -1976,7 +2441,11 @@ async fn repair_index(ws: &Path, from: &str, to: &str) {
     if idx == to_tree || idx != from_tree {
         return;
     }
-    if let Err(e) = git_read_tree_reset(ws, to).await {
+    let res = match mode {
+        ActivationMode::Draft => git_read_tree_reset(ws, to).await,
+        ActivationMode::Reload => git_read_tree_index_only(ws, to).await,
+    };
+    if let Err(e) = res {
         tracing::error!("crash repair of the Workspace index to {to} failed: {e}");
     }
 }
@@ -2120,3 +2589,7 @@ mod tests {
         assert_eq!(commit_trailer(&msg, "Dash-Draft").as_deref(), Some("dft_1"));
     }
 }
+
+#[cfg(test)]
+#[path = "drafts_tx_tests.rs"]
+mod tx_tests;
