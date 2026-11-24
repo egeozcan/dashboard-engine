@@ -230,13 +230,15 @@ pub fn validate_origin(
     if origin_host != exp_host || origin_port != exp_port {
         return Err((StatusCode::FORBIDDEN, "cross-origin request rejected"));
     }
-    // Scheme: an https page behind a TLS-terminating trusted proxy talks to us over http;
-    // otherwise the scheme must match what this hop observed.
+    // Scheme: the Origin's scheme must equal the request's effective scheme. This daemon
+    // serves plain HTTP, so an `https` Origin only matches when a trusted proxy reports
+    // `X-Forwarded-Proto: https` (TLS terminated in front of us); a bare trusted peer is not
+    // enough, and an untrusted peer's `X-Forwarded-Proto` is ignored.
     let request_https = is_request_https(headers, peer_ip, trusted_proxies);
     let scheme_ok = if request_https {
         scheme == "https"
     } else {
-        scheme == "http" || trusted_peer
+        scheme == "http"
     };
     if !scheme_ok {
         return Err((StatusCode::FORBIDDEN, "cross-origin request rejected"));

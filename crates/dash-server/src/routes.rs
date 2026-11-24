@@ -897,10 +897,15 @@ async fn logs_handler(
     headers: HeaderMap,
     Query(p): Query<SearchParams>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
-        return r;
-    }
-    Json(st.services.logs_query(p.limit.unwrap_or(100))).into_response()
+    let principal = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    Json(
+        st.services
+            .logs_query_for(p.limit.unwrap_or(100), &principal),
+    )
+    .into_response()
 }
 
 async fn traces_handler(
@@ -909,10 +914,15 @@ async fn traces_handler(
     headers: HeaderMap,
     Query(p): Query<SearchParams>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
-        return r;
-    }
-    Json(st.services.graph_trace(p.limit.unwrap_or(100))).into_response()
+    let principal = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    Json(
+        st.services
+            .graph_trace_for(p.limit.unwrap_or(100), &principal),
+    )
+    .into_response()
 }
 
 async fn metrics_handler(
@@ -1019,11 +1029,14 @@ async fn secrets_list_handler(
 #[derive(Deserialize)]
 struct SetSecretReq {
     name: String,
+    /// Omitted = keep the current description (empty for a new secret).
     #[serde(default)]
-    description: String,
+    description: Option<String>,
     plaintext: String,
+    /// Omitted = keep the current binding policy (unrestricted for a new secret); an explicit
+    /// `[]` deliberately clears it so any Instance may bind the secret.
     #[serde(default)]
-    allowed_bindings: Vec<String>,
+    allowed_bindings: Option<Vec<String>>,
     /// Optional destination-host policy for the credential (omitted = keep current).
     #[serde(default)]
     allowed_hosts: Option<Vec<String>>,
@@ -1042,13 +1055,15 @@ async fn secrets_set_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    match st.services.secret_set_with_policy(
+    match st.services.secret_update(
         &req.name,
-        &req.description,
         &req.plaintext,
-        &req.allowed_bindings,
-        req.allowed_hosts.as_deref(),
-        req.credential_scheme.as_deref(),
+        dash_store::SecretPolicyUpdate {
+            description: req.description.as_deref(),
+            allowed_bindings: req.allowed_bindings.as_deref(),
+            allowed_hosts: req.allowed_hosts.as_deref(),
+            credential_scheme: req.credential_scheme.as_deref(),
+        },
         &p,
     ) {
         Ok(m) => Json(m).into_response(),
@@ -1096,16 +1111,20 @@ async fn agents_list_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
-        return r;
-    }
-    match st.services.agent_list() {
+    let principal = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.agent_list_for(&principal) {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+        Err(e) => {
+            let status = if principal.ceiling.unrestricted {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            (status, Json(json!({ "error": e }))).into_response()
+        }
     }
 }
 
@@ -1195,10 +1214,14 @@ async fn sp_list_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::GET, peer) {
-        return r;
+    let principal = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match st.services.service_principal_list_for(&principal) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
     }
-    Json(st.services.service_principal_list()).into_response()
 }
 
 async fn sp_grant_handler(

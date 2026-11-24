@@ -37,6 +37,8 @@ pub struct AppServices {
 
 /// Background worker tick (seconds); also the minimum polling interval.
 const BACKGROUND_TICK_SECS: u64 = 5;
+/// How many recent spans/logs are scanned when filtering diagnostics for a non-Administrator.
+const DIAGNOSTICS_SCAN_LIMIT: usize = 2000;
 /// How often durable Event retention runs.
 const EVENT_RETENTION_INTERVAL_SECS: i64 = 3600;
 const EVENT_RETENTION_KEY: &str = "__dash.event_retention";
@@ -816,24 +818,7 @@ impl AppServices {
     /// permit are masked so secret names do not leak (§5.2, §11.1).
     pub fn graph_inspect_for(&self, principal: &Principal) -> serde_json::Value {
         let mut val = self.graph_inspect();
-        if principal.ceiling.unrestricted {
-            return val;
-        }
-        if let Some(instances) = val.get_mut("instances").and_then(|v| v.as_object_mut()) {
-            for inst in instances.values_mut() {
-                if let Some(secrets) = inst.get_mut("secrets").and_then(|v| v.as_object_mut()) {
-                    for v in secrets.values_mut() {
-                        let name = v
-                            .as_str()
-                            .map(|s| s.trim_start_matches("secret://").to_string())
-                            .unwrap_or_default();
-                        if !principal.ceiling.allows_secret(&name) {
-                            *v = serde_json::Value::String("secret://[hidden]".into());
-                        }
-                    }
-                }
-            }
-        }
+        mask_graph_view_for(principal, &mut val);
         val
     }
 
@@ -1566,6 +1551,62 @@ impl AppServices {
         })
     }
 
+    /// Trace ids attributable to `principal` among the given spans: a trace belongs to the
+    /// Principal when any of its spans names it (span principal or the request root span's
+    /// `principal_id` attribute).
+    fn traces_owned_by(
+        spans: &[TraceSpanRecord],
+        principal: &Principal,
+    ) -> std::collections::HashSet<String> {
+        spans
+            .iter()
+            .filter(|s| {
+                s.principal_id == principal.id
+                    || s.attributes.get("principal_id").and_then(|v| v.as_str())
+                        == Some(principal.id.as_str())
+            })
+            .map(|s| s.trace_id.clone())
+            .collect()
+    }
+
+    /// Trace inspection as seen by `principal` (§11.1, §15.1): the Administrator sees every
+    /// span; any other Principal only the spans of its own traces, so it never sees another
+    /// Principal's activity or client addresses.
+    pub fn graph_trace_for(&self, limit: usize, principal: &Principal) -> serde_json::Value {
+        if principal.ceiling.unrestricted {
+            return self.graph_trace(limit);
+        }
+        let exec_graph: ExecutionGraphSnapshot = self.engine().queries.execution_graph_snapshot();
+        let all = self.engine().telemetry.recent_spans(DIAGNOSTICS_SCAN_LIMIT);
+        let owned = Self::traces_owned_by(&all, principal);
+        let spans: Vec<TraceSpanRecord> = all
+            .into_iter()
+            .filter(|s| owned.contains(&s.trace_id))
+            .take(limit)
+            .collect();
+        serde_json::json!({
+            "execution_graph": exec_graph,
+            "spans": spans,
+        })
+    }
+
+    /// Logs visible to `principal`: everything for the Administrator, otherwise only entries
+    /// attributed to the Principal or belonging to one of its traces.
+    pub fn logs_query_for(&self, limit: usize, principal: &Principal) -> Vec<SanitizedLogEntry> {
+        if principal.ceiling.unrestricted {
+            return self.logs_query(limit);
+        }
+        let telemetry = &self.engine().telemetry;
+        let owned =
+            Self::traces_owned_by(&telemetry.recent_spans(DIAGNOSTICS_SCAN_LIMIT), principal);
+        telemetry
+            .recent_logs(DIAGNOSTICS_SCAN_LIMIT)
+            .into_iter()
+            .filter(|l| l.principal_id == principal.id || owned.contains(&l.trace_id))
+            .take(limit)
+            .collect()
+    }
+
     pub fn metrics_query(&self) -> RuntimeMetricsSnapshot {
         self.engine().metrics_snapshot()
     }
@@ -1591,8 +1632,15 @@ impl AppServices {
 
     // ---- Git ----
 
+    /// Workspace Git status. Credentials embedded in the remote URL (e.g. a push PAT in
+    /// `https://user:token@host/...`) are never returned: they are not vault secrets, so the
+    /// redactor does not know them (§5.2, §14.3).
     pub async fn git_status(&self) -> Result<GitStatusReport, String> {
-        self.drafts.git_status().await.map_err(|e| e.to_string())
+        self.drafts
+            .git_status()
+            .await
+            .map(redact_git_status)
+            .map_err(|e| redact_url_credentials_in_text(&e.to_string()))
     }
 
     pub async fn git_history(&self, limit: usize) -> Result<Vec<GitCommitInfo>, String> {
@@ -1614,7 +1662,8 @@ impl AppServices {
         self.drafts
             .git_sync(principal)
             .await
-            .map_err(|e| e.to_string())
+            .map(redact_git_sync)
+            .map_err(|e| redact_url_credentials_in_text(&e.to_string()))
     }
 
     pub async fn dependency_update(
@@ -1708,6 +1757,29 @@ impl AppServices {
         credential_scheme: Option<&str>,
         principal: &Principal,
     ) -> Result<SecretMetadata, String> {
+        self.secret_update(
+            name,
+            plaintext,
+            dash_store::SecretPolicyUpdate {
+                description: Some(description),
+                allowed_bindings: Some(allowed_bindings),
+                allowed_hosts,
+                credential_scheme,
+            },
+            principal,
+        )
+    }
+
+    /// Set or rotate a secret value, changing only the policy fields `update` names. A plain
+    /// rotation (every field `None`) keeps the description, `allowed_bindings`, destination
+    /// hosts and credential scheme, so it never silently widens the binding policy (§5.2).
+    pub fn secret_update(
+        &self,
+        name: &str,
+        plaintext: &str,
+        update: dash_store::SecretPolicyUpdate<'_>,
+        principal: &Principal,
+    ) -> Result<SecretMetadata, String> {
         self.require_administrator(
             principal,
             "secret.set",
@@ -1716,14 +1788,7 @@ impl AppServices {
         )?;
         let meta = self
             .store()
-            .set_secret_with_policy(
-                name,
-                description,
-                plaintext,
-                allowed_bindings,
-                allowed_hosts,
-                credential_scheme,
-            )
+            .set_secret_value(name, plaintext, update)
             .map_err(|e| e.to_string())?;
         let _ = self.store().append_audit(
             &principal.id,
@@ -1941,6 +2006,32 @@ impl AppServices {
             .map_err(|e| e.to_string())
     }
 
+    /// Agent inventory (every Agent and its ceiling) is Administrator data (§5.1 deny by
+    /// default): other Principals are refused.
+    pub fn agent_list_for(&self, actor: &Principal) -> Result<Vec<AgentPrincipalRecord>, String> {
+        self.require_administrator(
+            actor,
+            "agent.list",
+            "agents",
+            "only the Administrator can list Agent principals",
+        )?;
+        self.agent_list()
+    }
+
+    /// Service principal requests and grants, Administrator only (§5.1, §7.4).
+    pub fn service_principal_list_for(
+        &self,
+        actor: &Principal,
+    ) -> Result<Vec<ServicePrincipalStatus>, String> {
+        self.require_administrator(
+            actor,
+            "service_principal.list",
+            "service_principals",
+            "only the Administrator can list Service principal grants",
+        )?;
+        Ok(self.service_principal_list())
+    }
+
     pub fn agent_revoke(&self, agent_id: &str, actor: &Principal) -> Result<bool, String> {
         self.require_administrator(
             actor,
@@ -2003,7 +2094,12 @@ impl AppServices {
             Ok(n) => serde_json::json!({ "name": "activation_journal", "ok": false, "detail": format!("{n} incomplete activation journal entr(y/ies); restart the daemon to reconcile") }),
             Err(e) => serde_json::json!({ "name": "activation_journal", "ok": false, "detail": e }),
         });
-        let sync = self.store().get_git_sync_state().ok().flatten();
+        let sync = self
+            .store()
+            .get_git_sync_state()
+            .ok()
+            .flatten()
+            .map(redact_git_sync);
         checks.push(serde_json::json!({
             "name": "git_sync",
             "ok": sync.as_ref().map(|s| s.sync_status != "unsynced").unwrap_or(true),
@@ -2042,6 +2138,111 @@ impl AppServices {
             "startup_warnings": self.drafts.startup_warnings(),
         }))
     }
+}
+
+/// Mask, in a serialized `instances` map, every `secret://<name>` reference the Principal's
+/// ceiling does not permit, so secret names and existence do not leak (§5.2, §11.1).
+pub fn mask_instance_secrets(principal: &Principal, instances: &mut serde_json::Value) {
+    if principal.ceiling.unrestricted {
+        return;
+    }
+    let Some(instances) = instances.as_object_mut() else {
+        return;
+    };
+    for inst in instances.values_mut() {
+        if let Some(secrets) = inst.get_mut("secrets").and_then(|v| v.as_object_mut()) {
+            for v in secrets.values_mut() {
+                let name = v
+                    .as_str()
+                    .map(|s| s.trim_start_matches("secret://").to_string())
+                    .unwrap_or_default();
+                if !principal.ceiling.allows_secret(&name) {
+                    *v = serde_json::Value::String("secret://[hidden]".into());
+                }
+            }
+        }
+    }
+}
+
+/// Per-Principal view of a graph document (`graph_inspect`, Draft graph): masks secret
+/// references outside the ceiling and, for non-Administrators, drops who granted a Service
+/// principal ceiling and when (Administrator audit data).
+fn mask_graph_view_for(principal: &Principal, val: &mut serde_json::Value) {
+    if principal.ceiling.unrestricted {
+        return;
+    }
+    if let Some(instances) = val.get_mut("instances") {
+        mask_instance_secrets(principal, instances);
+    }
+    if let Some(sps) = val
+        .get_mut("service_principals")
+        .and_then(|v| v.as_array_mut())
+    {
+        for sp in sps.iter_mut().filter_map(|v| v.as_object_mut()) {
+            sp.remove("granted_by");
+            sp.remove("granted_at");
+        }
+    }
+}
+
+/// Strip userinfo credentials from a Git remote URL before it is shown anywhere
+/// (`https://x-access-token:ghp_…@github.com/o/r.git` -> `https://github.com/o/r.git`,
+/// `git@github.com:o/r.git` -> `github.com:o/r.git`). Local paths are returned unchanged.
+pub fn redact_remote_url(raw: &str) -> String {
+    if raw.contains("://") {
+        if let Ok(mut u) = url::Url::parse(raw) {
+            if u.username().is_empty() && u.password().is_none() {
+                return raw.to_string();
+            }
+            if u.set_password(None).is_ok() && u.set_username("").is_ok() {
+                return u.to_string();
+            }
+        }
+        return redact_url_credentials_in_text(raw);
+    }
+    // scp-like syntax `[user@]host:path` (no scheme).
+    if let Some((user_host, path)) = raw.split_once(':') {
+        if !user_host.contains('/') {
+            if let Some((_, host)) = user_host.rsplit_once('@') {
+                return format!("{host}:{path}");
+            }
+        }
+    }
+    raw.to_string()
+}
+
+/// Remove `user[:password]@` from every `scheme://` URL embedded in free text (e.g. a Git error
+/// message that echoes the remote URL).
+pub fn redact_url_credentials_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("://") {
+        let (head, tail) = rest.split_at(idx + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | '>'))
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_git_status(mut s: GitStatusReport) -> GitStatusReport {
+    s.remote_url = s.remote_url.as_deref().map(redact_remote_url);
+    s.last_error = s.last_error.as_deref().map(redact_url_credentials_in_text);
+    s
+}
+
+fn redact_git_sync(mut s: GitSyncRecord) -> GitSyncRecord {
+    s.remote_url = s.remote_url.as_deref().map(redact_remote_url);
+    s.last_error = s.last_error.as_deref().map(redact_url_credentials_in_text);
+    s
 }
 
 fn draft_definition_exists(draft: &DraftRecord, package: &str, def_name: &str) -> bool {
@@ -2341,7 +2542,7 @@ impl AppServices {
     ) -> Result<serde_json::Value, String> {
         let (draft, g) = self.load_draft_graph(draft_id, principal)?;
         let validation = validate_configured_graph(&g, self.store(), false);
-        Ok(serde_json::json!({
+        let mut val = serde_json::json!({
             "draft_id": draft.draft_id,
             "base_revision": draft.base_revision,
             "revision_commit": draft.base_revision,
@@ -2352,7 +2553,11 @@ impl AppServices {
             "definitions": definition_contract_summaries(&g),
             "service_principals": self.service_principal_list(),
             "validation": validation,
-        }))
+        });
+        // A Draft is a full copy of the Workspace: apply the same per-Principal secret-name
+        // masking as `graph_inspect_for` (§5.2).
+        mask_graph_view_for(principal, &mut val);
+        Ok(val)
     }
 
     /// Contract summaries of every Definition in the active Generation.

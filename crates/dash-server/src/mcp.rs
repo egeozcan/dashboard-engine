@@ -667,11 +667,11 @@ pub async fn call_mcp_tool(
         // Diagnostics
         "logs_query" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            Ok(json!(services.logs_query(limit)))
+            Ok(json!(services.logs_query_for(limit, principal)))
         }
         "graph_trace" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            Ok(services.graph_trace(limit))
+            Ok(services.graph_trace_for(limit, principal))
         }
         "metrics_query" => Ok(json!(services.metrics_query())),
 
@@ -883,8 +883,8 @@ pub fn read_mcp_resource(
         }
         "dash://graph" => Ok(J(services.graph_inspect_for(principal))),
         "dash://graph/dependencies" => Ok(J(dependency_graph(services))),
-        "dash://traces" => Ok(J(services.graph_trace(100))),
-        "dash://logs" => Ok(J(json!(services.logs_query(100)))),
+        "dash://traces" => Ok(J(services.graph_trace_for(100, principal))),
+        "dash://logs" => Ok(J(json!(services.logs_query_for(100, principal)))),
         "dash://metrics" => Ok(J(json!(services.metrics_query()))),
         "dash://docs/mcp-tools" => Ok(M(tool_reference_markdown())),
         other if other.starts_with("dash://docs/") => {
