@@ -260,6 +260,17 @@ pub struct LoadedDefinition {
     pub widget_assets: BTreeMap<String, Vec<u8>>,
 }
 
+impl LoadedDefinition {
+    /// `sha256:<hex>` digest of a bundled widget asset, for integrity headers and audits.
+    pub fn widget_asset_sha256(&self, rel_path: &str) -> Option<String> {
+        self.widget_assets.get(rel_path).map(|bytes| {
+            let mut h = Sha256::new();
+            h.update(bytes);
+            format!("sha256:{}", hex::encode(h.finalize()))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfiguredGraph {
     pub revision_commit: String,
@@ -292,11 +303,53 @@ impl ConfiguredGraph {
     }
 
     /// Find the Mock definition targeting `connector_def_id`, if any.
+    ///
+    /// The Workspace loader admits at most one Mock per connector; should a hand-built graph hold
+    /// several, the Mock from the connector's own Package wins, then the lowest Definition ID.
     pub fn find_mock_for(&self, connector_def_id: &str) -> Option<&LoadedDefinition> {
-        self.definitions.values().find(|d| {
+        let target_pkg = self
+            .definitions
+            .get(connector_def_id)
+            .map(|d| d.package_name.as_str());
+        let mut candidates = self.definitions.values().filter(|d| {
             d.manifest.category == DefinitionCategory::Mock
                 && d.manifest.target_connector.as_deref() == Some(connector_def_id)
-        })
+        });
+        let first = candidates.next()?;
+        if Some(first.package_name.as_str()) == target_pkg {
+            return Some(first);
+        }
+        Some(
+            candidates
+                .find(|d| Some(d.package_name.as_str()) == target_pkg)
+                .unwrap_or(first),
+        )
+    }
+
+    /// Validate a generated Widget node against the Generation: `widget_type` must name a
+    /// widget provider Definition, and `props` must satisfy its declared `props` schema (§4.2
+    /// widget messages, §10.1).
+    pub fn check_widget_node(
+        &self,
+        widget_type: &str,
+        props: &serde_json::Value,
+    ) -> Result<(), String> {
+        let def = self
+            .definitions
+            .get(widget_type)
+            .ok_or_else(|| format!("unknown widget type '{widget_type}'"))?;
+        if def.manifest.category != DefinitionCategory::WidgetProvider {
+            return Err(format!(
+                "'{widget_type}' is a {} Definition, not a widget provider",
+                def.manifest.category.as_str()
+            ));
+        }
+        if let Some(schema) = &def.manifest.widget_props {
+            schema
+                .validate_value(props)
+                .map_err(|e| format!("widget '{widget_type}' props: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Resolve all library sources available to a definition within the workspace.
@@ -321,5 +374,65 @@ impl ConfiguredGraph {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dash_luau::evaluate_declaration;
+
+    fn def(pkg: &str, decl: &str) -> LoadedDefinition {
+        let manifest = evaluate_declaration(decl, &BTreeMap::new()).unwrap();
+        LoadedDefinition {
+            package_name: pkg.into(),
+            manifest,
+            definition_source: decl.into(),
+            runtime_source: String::new(),
+            tests_source: None,
+            fixtures: BTreeMap::new(),
+            widget_assets: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn find_mock_prefers_connector_package() {
+        let mut g = ConfiguredGraph::default();
+        g.definitions.insert(
+            "gh.connector".into(),
+            def("gh", r#"local dash = require("dash"); return dash.connector { id = "gh.connector" }"#),
+        );
+        // `aaa.mock` sorts first but lives in another package.
+        g.definitions.insert(
+            "aaa.mock".into(),
+            def("aaa", r#"local dash = require("dash"); return dash.mock { id = "aaa.mock", ["for"] = "gh.connector" }"#),
+        );
+        g.definitions.insert(
+            "gh.mock".into(),
+            def("gh", r#"local dash = require("dash"); return dash.mock { id = "gh.mock", ["for"] = "gh.connector" }"#),
+        );
+        assert_eq!(g.find_mock_for("gh.connector").unwrap().manifest.id, "gh.mock");
+        assert!(g.find_mock_for("other.connector").is_none());
+    }
+
+    #[test]
+    fn widget_nodes_are_checked_against_provider_contracts() {
+        let mut g = ConfiguredGraph::default();
+        let mut w = def(
+            "eng",
+            r#"local dash = require("dash"); return dash.widget_provider { id = "eng.badge", asset = "assets/index.html", props = dash.object { count = dash.integer() } }"#,
+        );
+        w.widget_assets.insert("assets/index.html".into(), b"<p>hi</p>".to_vec());
+        g.definitions.insert("eng.badge".into(), w);
+        g.definitions.insert(
+            "eng.data".into(),
+            def("eng", r#"local dash = require("dash"); return dash.data_provider { id = "eng.data" }"#),
+        );
+        assert!(g.check_widget_node("eng.badge", &serde_json::json!({ "count": 3 })).is_ok());
+        assert!(g.check_widget_node("eng.badge", &serde_json::json!({ "count": "x" })).is_err());
+        assert!(g.check_widget_node("eng.data", &serde_json::json!({})).is_err());
+        assert!(g.check_widget_node("nope.widget", &serde_json::json!({})).is_err());
+        let digest = g.definitions["eng.badge"].widget_asset_sha256("assets/index.html").unwrap();
+        assert!(digest.starts_with("sha256:") && digest.len() == 71);
     }
 }

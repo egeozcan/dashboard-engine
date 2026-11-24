@@ -350,13 +350,14 @@ impl AppServices {
             Some(id) => (PathBuf::from(self.draft_status(id)?.worktree_path), true),
             None => (self.drafts.workspace_dir().to_path_buf(), true),
         };
-        let graph = dash_git::load_workspace_graph(
+        let graph = dash_git::workspace::load_workspace_graph_async(
             &ws_dir,
             self.drafts.data_dir(),
             "test",
             0,
             is_preview,
         )
+        .await
         .map_err(|e| e.to_string())?;
         let def = graph
             .definitions
@@ -587,6 +588,9 @@ impl AppServices {
         if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
             return Err("principal lacks can_author_drafts".into());
         }
+        // Only unrestricted (Administrator) principals may point dependencies at local paths.
+        dash_git::packages::validate_dependency_spec(package_name, &spec, principal.ceiling.unrestricted)
+            .map_err(|e| e.to_string())?;
         self.drafts
             .draft_update_dependency(draft_id, package_name, spec)
             .await

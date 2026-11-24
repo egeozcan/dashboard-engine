@@ -73,6 +73,81 @@ impl SchemaSpec {
         }
     }
 
+    /// Visit every semantic reference (including nested ones) as `(name, declared shape)`.
+    pub fn visit_semantics<'a>(&'a self, f: &mut dyn FnMut(&'a str, Option<&'a SchemaSpec>)) {
+        match self {
+            Self::List { item } => item.visit_semantics(f),
+            Self::Optional { inner } => inner.visit_semantics(f),
+            Self::Map { value } => value.visit_semantics(f),
+            Self::Object { fields } => {
+                for v in fields.values() {
+                    v.visit_semantics(f);
+                }
+            }
+            Self::Semantic {
+                semantic_type,
+                shape,
+            } => {
+                f(semantic_type.as_str(), shape.as_deref());
+                if let Some(s) = shape {
+                    s.visit_semantics(f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fill shapeless semantic references from `registry` (semantic id -> structural schema).
+    /// Records each semantic id that was resolved into `used`. Recursive semantic definitions are
+    /// left shapeless at the point of recursion.
+    pub fn resolve_semantic_shapes(
+        &mut self,
+        registry: &BTreeMap<String, SchemaSpec>,
+        used: &mut std::collections::BTreeSet<String>,
+    ) {
+        self.resolve_semantic_shapes_inner(registry, used, &mut Vec::new());
+    }
+
+    fn resolve_semantic_shapes_inner(
+        &mut self,
+        registry: &BTreeMap<String, SchemaSpec>,
+        used: &mut std::collections::BTreeSet<String>,
+        stack: &mut Vec<String>,
+    ) {
+        match self {
+            Self::List { item } => item.resolve_semantic_shapes_inner(registry, used, stack),
+            Self::Optional { inner } => inner.resolve_semantic_shapes_inner(registry, used, stack),
+            Self::Map { value } => value.resolve_semantic_shapes_inner(registry, used, stack),
+            Self::Object { fields } => {
+                for v in fields.values_mut() {
+                    v.resolve_semantic_shapes_inner(registry, used, stack);
+                }
+            }
+            Self::Semantic {
+                semantic_type,
+                shape,
+            } => {
+                if stack.iter().any(|s| s == semantic_type) {
+                    return;
+                }
+                stack.push(semantic_type.clone());
+                match shape {
+                    Some(s) => s.resolve_semantic_shapes_inner(registry, used, stack),
+                    None => {
+                        if let Some(reg) = registry.get(semantic_type.as_str()) {
+                            used.insert(semantic_type.clone());
+                            let mut filled = reg.clone();
+                            filled.resolve_semantic_shapes_inner(registry, used, stack);
+                            *shape = Some(Box::new(filled));
+                        }
+                    }
+                }
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+
     pub fn to_json_schema(&self) -> serde_json::Value {
         match self {
             Self::String => serde_json::json!({ "type": "string" }),
@@ -88,13 +163,10 @@ impl SchemaSpec {
                 "type": "array",
                 "items": item.to_json_schema()
             }),
-            Self::Optional { inner } => {
-                let mut s = inner.to_json_schema();
-                if let Some(obj) = s.as_object_mut() {
-                    obj.insert("nullable".into(), serde_json::Value::Bool(true));
-                }
-                s
-            }
+            // Standard JSON Schema has no `nullable`; express optionality as a union with null.
+            Self::Optional { inner } => serde_json::json!({
+                "anyOf": [inner.to_json_schema(), { "type": "null" }]
+            }),
             Self::Map { value } => serde_json::json!({
                 "type": "object",
                 "additionalProperties": value.to_json_schema()
@@ -118,10 +190,12 @@ impl SchemaSpec {
                 semantic_type,
                 shape,
             } => {
+                // A shapeless semantic reference carries no structural constraint of its own
+                // (the runtime validator does not restrict it to objects either).
                 let mut base = shape
                     .as_ref()
                     .map(|s| s.to_json_schema())
-                    .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+                    .unwrap_or_else(|| serde_json::json!({}));
                 if let Some(obj) = base.as_object_mut() {
                     obj.insert(
                         "x-semantic-type".into(),
@@ -271,11 +345,17 @@ impl SchemaSpec {
                 SchemaSpec::List { item: c },
             ) => Self::is_compatible(p, c),
             (
-                SchemaSpec::Semantic { semantic_type: p_sem, .. },
-                SchemaSpec::Semantic { semantic_type: c_sem, .. },
+                SchemaSpec::Semantic { semantic_type: p_sem, shape: p_shape },
+                SchemaSpec::Semantic { semantic_type: c_sem, shape: c_shape },
             ) => {
                 if p_sem == c_sem {
-                    Ok(())
+                    // Same semantic name must also agree structurally when both sides carry shapes.
+                    match (p_shape, c_shape) {
+                        (Some(p), Some(c)) => Self::is_compatible(p, c).map_err(|e| {
+                            format!("semantic type '{p_sem}' structural mismatch: {e}")
+                        }),
+                        _ => Ok(()),
+                    }
                 } else {
                     Err(format!(
                         "semantic type mismatch: producer '{p_sem}' != consumer '{c_sem}'"
@@ -285,7 +365,11 @@ impl SchemaSpec {
             (SchemaSpec::Semantic { shape: Some(p_shape), .. }, c) => {
                 Self::is_compatible(p_shape, c)
             }
-            (SchemaSpec::Semantic { shape: None, .. }, SchemaSpec::Object { .. }) => Ok(()),
+            (SchemaSpec::Semantic { semantic_type, shape: None }, SchemaSpec::Object { .. }) => {
+                Err(format!(
+                    "semantic type '{semantic_type}' has no structural schema; cannot verify it satisfies the consumer object"
+                ))
+            }
             (
                 SchemaSpec::Object { fields: p_fields },
                 SchemaSpec::Object { fields: c_fields },
@@ -441,6 +525,81 @@ pub struct DefinitionManifest {
 }
 
 impl DefinitionManifest {
+    /// Every schema declared by this manifest (contract fields, input expectations, operation
+    /// schemas and event payloads), in a deterministic order.
+    pub fn schemas(&self) -> Vec<&SchemaSpec> {
+        let mut out: Vec<&SchemaSpec> = Vec::new();
+        for s in [
+            &self.config,
+            &self.query,
+            &self.args,
+            &self.output,
+            &self.result,
+            &self.widget_props,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(s);
+        }
+        for spec in self.inputs.values() {
+            if let InputRefSpec::Data {
+                expected_output: Some(s),
+                ..
+            } = spec
+            {
+                out.push(s);
+            }
+        }
+        for op in self.operations.values() {
+            out.push(&op.args);
+            out.push(&op.result);
+        }
+        for e in &self.emits {
+            if let Some(p) = &e.payload {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// Mutable counterpart of [`DefinitionManifest::schemas`].
+    pub fn schemas_mut(&mut self) -> Vec<&mut SchemaSpec> {
+        let mut out: Vec<&mut SchemaSpec> = Vec::new();
+        for s in [
+            &mut self.config,
+            &mut self.query,
+            &mut self.args,
+            &mut self.output,
+            &mut self.result,
+            &mut self.widget_props,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(s);
+        }
+        for spec in self.inputs.values_mut() {
+            if let InputRefSpec::Data {
+                expected_output: Some(s),
+                ..
+            } = spec
+            {
+                out.push(s);
+            }
+        }
+        for op in self.operations.values_mut() {
+            out.push(&mut op.args);
+            out.push(&mut op.result);
+        }
+        for e in &mut self.emits {
+            if let Some(p) = &mut e.payload {
+                out.push(p);
+            }
+        }
+        out
+    }
+
     /// Deterministic canonical JSON representation of the manifest.
     pub fn canonical_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
@@ -478,4 +637,164 @@ pub fn compute_sources_digest(files: &BTreeMap<String, Vec<u8>>) -> String {
         hasher.update(b"\0");
     }
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// Build the Workspace semantic type registry (§4.2: a semantic contract is a named, versioned
+/// type *paired with a structural schema*). Each semantic id maps to exactly one structural
+/// schema taken from the Definitions that declare it with a shape. Two different shapes for the
+/// same id are an error, as is a semantic id used anywhere without any declared shape.
+///
+/// `manifests` yields `(definition id, manifest)` pairs.
+pub fn build_semantic_registry<'a>(
+    manifests: impl IntoIterator<Item = (&'a str, &'a DefinitionManifest)>,
+) -> Result<BTreeMap<String, SchemaSpec>, String> {
+    let mut registry: BTreeMap<String, (SchemaSpec, String)> = BTreeMap::new();
+    let mut used_by: BTreeMap<String, String> = BTreeMap::new();
+    let mut conflict: Option<String> = None;
+    for (def_id, m) in manifests {
+        for schema in m.schemas() {
+            schema.visit_semantics(&mut |name, shape| {
+                used_by
+                    .entry(name.to_string())
+                    .or_insert_with(|| def_id.to_string());
+                let Some(shape) = shape else { return };
+                match registry.get(name) {
+                    Some((existing, owner)) if existing != shape => {
+                        if conflict.is_none() {
+                            conflict = Some(format!(
+                                "semantic type '{name}' has conflicting structural schemas in '{owner}' and '{def_id}'"
+                            ));
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        registry.insert(name.to_string(), (shape.clone(), def_id.to_string()));
+                    }
+                }
+            });
+        }
+    }
+    if let Some(c) = conflict {
+        return Err(c);
+    }
+    for (name, def_id) in &used_by {
+        if !registry.contains_key(name) {
+            return Err(format!(
+                "semantic type '{name}' (used by '{def_id}') has no structural schema; declare it once with dash.semantic(\"{name}\", <schema>)"
+            ));
+        }
+    }
+    Ok(registry.into_iter().map(|(k, (v, _))| (k, v)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(fields: &[(&str, SchemaSpec)]) -> SchemaSpec {
+        SchemaSpec::Object {
+            fields: fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        }
+    }
+
+    fn sem(name: &str, shape: Option<SchemaSpec>) -> SchemaSpec {
+        SchemaSpec::Semantic {
+            semantic_type: name.into(),
+            shape: shape.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn json_schema_uses_standard_keywords() {
+        let opt = SchemaSpec::Optional {
+            inner: Box::new(SchemaSpec::String),
+        };
+        assert_eq!(
+            opt.to_json_schema(),
+            serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] })
+        );
+        assert_eq!(
+            sem("dev.pr@1", None).to_json_schema(),
+            serde_json::json!({ "x-semantic-type": "dev.pr@1" })
+        );
+    }
+
+    #[test]
+    fn semantic_compatibility_compares_shapes() {
+        let a = sem("dev.pr@1", Some(obj(&[("id", SchemaSpec::String)])));
+        let b = sem("dev.pr@1", Some(obj(&[("id", SchemaSpec::Integer)])));
+        assert!(SchemaSpec::is_compatible(&a, &a).is_ok());
+        assert!(SchemaSpec::is_compatible(&a, &b).is_err());
+        assert!(SchemaSpec::is_compatible(&sem("dev.pr@1", None), &obj(&[])).is_err());
+        assert!(SchemaSpec::is_compatible(&sem("dev.pr@1", None), &sem("dev.pr@1", None)).is_ok());
+        assert!(SchemaSpec::is_compatible(&sem("dev.pr@1", None), &sem("dev.pr@2", None)).is_err());
+    }
+
+    fn manifest_with_output(id: &str, output: SchemaSpec) -> DefinitionManifest {
+        DefinitionManifest {
+            id: id.into(),
+            category: DefinitionCategory::DataProvider,
+            identity_version: String::new(),
+            description: String::new(),
+            runtime: String::new(),
+            handler: String::new(),
+            dry_run_handler: None,
+            reconcile_handler: None,
+            request_handler: None,
+            target_connector: None,
+            fixtures: BTreeMap::new(),
+            capabilities: vec![],
+            required_capabilities: vec![],
+            optional_capabilities: vec![],
+            credentials: vec![],
+            operations: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            config: None,
+            query: None,
+            args: None,
+            output: Some(output),
+            result: None,
+            emits: vec![],
+            invalidates: vec![],
+            dashboard_state_reads: vec![],
+            accepts_requests: vec![],
+            widget_props: None,
+            widget_asset: None,
+            updates: UpdateModes::default(),
+            triggers: vec![],
+            libraries: vec![],
+            generated_luau_types: String::new(),
+        }
+    }
+
+    #[test]
+    fn registry_pairs_each_semantic_type_with_one_schema() {
+        let shape = obj(&[("id", SchemaSpec::String)]);
+        let producer = manifest_with_output("a.p", sem("dev.pr@1", Some(shape.clone())));
+        let mut user = manifest_with_output(
+            "a.u",
+            SchemaSpec::List {
+                item: Box::new(sem("dev.pr@1", None)),
+            },
+        );
+        let reg = build_semantic_registry([("a.p", &producer), ("a.u", &user)]).unwrap();
+        assert_eq!(reg["dev.pr@1"], shape);
+
+        let mut used = std::collections::BTreeSet::new();
+        for s in user.schemas_mut() {
+            s.resolve_semantic_shapes(&reg, &mut used);
+        }
+        assert!(used.contains("dev.pr@1"));
+        assert!(user
+            .output
+            .as_ref()
+            .unwrap()
+            .validate_value(&serde_json::json!([{ "id": 5 }]))
+            .is_err());
+
+        let other = manifest_with_output("a.o", sem("dev.pr@1", Some(obj(&[("id", SchemaSpec::Integer)]))));
+        assert!(build_semantic_registry([("a.p", &producer), ("a.o", &other)]).is_err());
+        let orphan = manifest_with_output("a.x", sem("dev.none@1", None));
+        assert!(build_semantic_registry([("a.x", &orphan)]).is_err());
+    }
 }

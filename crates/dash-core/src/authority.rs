@@ -418,6 +418,16 @@ pub fn validate_configured_graph(
                                         message: format!("input '{slot}': {msg}"),
                                     });
                                 }
+                            } else if !matches!(exp_schema, SchemaSpec::Any) {
+                                issues.push(ValidationIssue {
+                                    severity: "error".into(),
+                                    code: "SCHEMA_INCOMPATIBLE".into(),
+                                    target: inst_id.clone(),
+                                    message: format!(
+                                        "input '{slot}' expects a typed output but '{}' declares no output schema",
+                                        target.definition
+                                    ),
+                                });
                             }
                         }
                     }
@@ -442,6 +452,30 @@ pub fn validate_configured_graph(
                         }
                     }
                 }
+            } else {
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    code: "UNDECLARED_INPUT".into(),
+                    target: inst_id.clone(),
+                    message: format!(
+                        "input '{slot}' is not declared by definition '{}'",
+                        def.manifest.id
+                    ),
+                });
+            }
+        }
+        // Every declared input must be bound (§4.2: compatibility is checked during wiring).
+        for slot in def.manifest.inputs.keys() {
+            if !inst.inputs.contains_key(slot) {
+                issues.push(ValidationIssue {
+                    severity: "error".into(),
+                    code: "UNBOUND_INPUT".into(),
+                    target: inst_id.clone(),
+                    message: format!(
+                        "declared input '{slot}' of definition '{}' is not bound",
+                        def.manifest.id
+                    ),
+                });
             }
         }
 
