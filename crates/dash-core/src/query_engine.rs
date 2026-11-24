@@ -455,6 +455,27 @@ impl QueryEngine {
         self.cache.lock().unwrap().len()
     }
 
+    /// Mediated State access shared with background workers (automations write State through it
+    /// so State Signals are published).
+    pub fn state_manager(&self) -> &StateManager {
+        &self.state
+    }
+
+    /// Snapshot of cached query entries for one Instance (used by scheduled polling, §6.2).
+    pub fn cached_entries_for_instance(&self, instance_id: &str) -> Vec<(String, CachedQueryEntry)> {
+        let cache = self.cache.lock().unwrap();
+        cache
+            .iter()
+            .filter(|(_, e)| e.instance_id == instance_id)
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect()
+    }
+
+    /// Peek one cached entry without promoting it in the LRU.
+    pub fn cached_entry(&self, query_key: &str) -> Option<CachedQueryEntry> {
+        self.cache.lock().unwrap().peek(query_key).cloned()
+    }
+
     /// Canonical, collision-resistant query key partitioned by authorization fingerprint (§6.1, A.1).
     pub fn compute_query_key(
         &self,
@@ -2943,10 +2964,10 @@ impl HostBridge for EngineHostBridge {
     ) -> Result<(), String> {
         self.engine
             .events
-            .emit(
+            .emit_declared(
                 &self.caller_inst.id,
+                &self.caller_def.manifest.emits,
                 event_type,
-                "1",
                 &self.trace_id,
                 durable,
                 payload,

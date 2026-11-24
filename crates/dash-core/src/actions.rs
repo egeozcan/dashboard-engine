@@ -872,7 +872,7 @@ impl ActionManager {
 
         let rec = fetch(&execution_id)?;
         match classified.status {
-            "succeeded" => self.finalize_terminal(&rec, &g, "invoke", &principal).await,
+            "succeeded" | "failed" => self.finalize_terminal(&rec, &g, "invoke", &principal).await,
             "unknown" if def.manifest.reconcile_handler.is_some() => {
                 // Immediate read-only reconcile attempt under the (original) invoking Principal;
                 // further attempts are scheduled with backoff.
@@ -1012,9 +1012,19 @@ impl ActionManager {
         source: &str,
         actor: &Principal,
     ) {
-        if rec.status != "succeeded" {
+        // §7.2: action executions emit durable completion Events automatically, for every
+        // terminal outcome, including ones that became known later through `reconcile` or
+        // audited manual resolution.
+        let terminal = matches!(rec.status.as_str(), "succeeded" | "failed")
+            || (source == "manual_resolution" && rec.status == "cancelled");
+        if !terminal {
             return;
         }
+        let resolution = match source {
+            "reconcile" => Some("reconciled"),
+            "manual_resolution" => Some("manual"),
+            _ => None,
+        };
         let _ = self.events.emit(
             &rec.action_instance,
             "dash.action_completed",
@@ -1024,11 +1034,16 @@ impl ActionManager {
             serde_json::json!({
                 "execution_id": rec.execution_id,
                 "action_instance": rec.action_instance,
-                "status": "succeeded",
+                "status": rec.status,
+                "reason": rec.reason,
+                "resolution": resolution,
                 "resolved_by": source,
                 "resolved_by_principal": actor.id,
             }),
         );
+        if rec.status != "succeeded" {
+            return;
+        }
         if let Some(inst) = g.instances.get(&rec.action_instance) {
             if let Some(def) = g.definitions.get(&inst.definition) {
                 let to_invalidate = resolve_invalidations(inst, def, g);
@@ -2398,12 +2413,13 @@ impl HostBridge for ActionHostBridge {
         if self.is_read_only {
             return Ok(());
         }
+        // Schema version and durability come from the executing Definition's declaration.
         self.manager
             .events
-            .emit(
+            .emit_declared(
                 &self.caller_inst.id,
+                &self.caller_def.manifest.emits,
                 event_type,
-                "1",
                 &self.trace_id,
                 durable,
                 payload,

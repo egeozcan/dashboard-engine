@@ -34,6 +34,21 @@ pub struct AppServices {
     last_poll_run: Arc<Mutex<HashMap<String, i64>>>,
 }
 
+/// Background worker tick (seconds); also the minimum polling interval.
+const BACKGROUND_TICK_SECS: u64 = 5;
+/// How often durable Event retention runs.
+const EVENT_RETENTION_INTERVAL_SECS: i64 = 3600;
+const EVENT_RETENTION_KEY: &str = "__dash.event_retention";
+
+/// Aborts a spawned task when dropped (ties the consumer task to the worker handle).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEntry {
     pub id: String,
@@ -192,31 +207,80 @@ impl AppServices {
         Ok(g.instances.get(instance_id).cloned())
     }
 
-    /// Spawn background maintenance loops: idle VM reclamation, durable Event automation consumer,
-    /// provider polling, and History sampling under Administrator-granted Service principals.
+
+    /// Spawn background workers (§7.2, §7.3, §7.4, ADR-0002), all under explicit Service
+    /// principals:
+    /// - a durable Event consumer task that drains the Event log from each automation's
+    ///   checkpoint at startup, on every live Event or broadcast lag, and periodically;
+    /// - a maintenance ticker for idle VM reclamation, history sampling, scheduled polling,
+    ///   cron and Signal triggers, and durable Event retention.
+    ///
+    /// Aborting the returned handle also stops the consumer task.
     pub fn spawn_background_workers(&self) -> tokio::task::JoinHandle<()> {
-        let services = self.clone();
-        let mut event_rx = services.engine().events.subscribe();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let consumer = self.clone();
+        let mut event_rx = consumer.engine().events.subscribe();
+        let consumer_task = tokio::spawn(async move {
+            // Startup catch-up: redeliver durable Events appended before a crash/restart.
+            consumer.drain_durable_events().await;
+            let mut tick = tokio::time::interval(Duration::from_secs(BACKGROUND_TICK_SECS));
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {
-                        services.engine().pool.reclaim_idle(None);
-                        services.engine().queries.prune_idle();
-                        // Host retry of `reconcile` with backoff for `unknown` executions (§9.1)
-                        services.engine().actions.run_due_reconciles(16).await;
-                        services.run_due_history_samples().await;
-                        services.run_due_polls().await;
-                    }
-                    Ok(ev) = event_rx.recv() => {
-                        if !ev.is_replay {
-                            let _ = services.engine().automations.dispatch_event(&ev).await;
+                    _ = tick.tick() => {}
+                    msg = event_rx.recv() => match msg {
+                        Ok(ev) => {
+                            // Ephemeral Events have no log: deliver them live (best effort).
+                            if !ev.durable && !ev.is_replay {
+                                let _ = consumer.engine().automations.dispatch_event(&ev).await;
+                                continue;
+                            }
                         }
-                    }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            consumer.engine().telemetry.log(
+                                "warn",
+                                "events",
+                                "",
+                                "",
+                                &format!("durable consumer lagged by {n} live Events; catching up from the log"),
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
                 }
+                consumer.drain_durable_events().await;
+            }
+        });
+
+        let services = self.clone();
+        tokio::spawn(async move {
+            let _consumer = AbortOnDrop(consumer_task);
+            let mut ticker = tokio::time::interval(Duration::from_secs(BACKGROUND_TICK_SECS));
+            loop {
+                ticker.tick().await;
+                services.engine().pool.reclaim_idle(None);
+                services.engine().queries.prune_idle();
+                // Host retry of `reconcile` with backoff for `unknown` executions (§9.1)
+                services.engine().actions.run_due_reconciles(16).await;
+                services.run_due_history_samples().await;
+                services.run_due_polls().await;
+                services.run_due_automation_triggers().await;
+                services.run_due_event_retention().await;
             }
         })
+    }
+
+    /// One durable-consumer pass over the Event log (also used at startup).
+    pub async fn drain_durable_events(&self) -> dash_core::automations::DrainReport {
+        let report = self.engine().automations.drain_durable_events().await;
+        if report.failed > 0 {
+            self.engine().telemetry.log(
+                "error",
+                "events",
+                "",
+                "",
+                &format!("{} durable Event deliveries failed and were dead-lettered", report.failed),
+            );
+        }
+        report
     }
 
     async fn run_due_history_samples(&self) {
@@ -234,14 +298,76 @@ impl AppServices {
                 }
             };
             if due {
-                let _ = self.engine().history.sample_series(series, None).await;
+                if let Err(e) = self.engine().history.sample_series(series, None).await {
+                    self.engine().telemetry.log(
+                        "warn",
+                        "history",
+                        &series.service_principal,
+                        "",
+                        &format!("history series '{}' not sampled: {e}", series.series_id),
+                    );
+                }
             }
         }
     }
 
-    async fn run_due_polls(&self) {
-        let g = self.graph();
+    async fn run_due_automation_triggers(&self) {
+        let automations = &self.engine().automations;
+        let fired = automations.run_due_schedules(Utc::now()).await;
+        let signalled = automations.run_due_signal_triggers().await;
+        for (auto_id, res) in fired.into_iter().chain(signalled) {
+            if let Err(e) = res {
+                self.engine().telemetry.log(
+                    "error",
+                    "automation",
+                    "",
+                    "",
+                    &format!("automation '{auto_id}' trigger run failed: {e}"),
+                );
+            }
+        }
+    }
+
+    async fn run_due_event_retention(&self) {
         let now_ts = Utc::now().timestamp();
+        {
+            let mut guard = self.last_poll_run.lock().await;
+            let last = guard.get(EVENT_RETENTION_KEY).copied().unwrap_or(0);
+            if now_ts - last < EVENT_RETENTION_INTERVAL_SECS {
+                return;
+            }
+            guard.insert(EVENT_RETENTION_KEY.to_string(), now_ts);
+        }
+        if let Err(e) = self
+            .engine()
+            .events
+            .prune_retained(dash_core::events::DEFAULT_EVENT_RETENTION_DAYS)
+        {
+            self.engine()
+                .telemetry
+                .log("warn", "events", "", "", &format!("event retention failed: {e}"));
+        }
+    }
+
+    /// Scheduled refresh for data providers that declare `poll_interval_secs` (§6.2, §7.2,
+    /// ADR-0002), deduplicated per active query and run once per interval:
+    /// - every cached query of the Instance that has live subscribers, or that a subscribed
+    ///   query depends on, refreshed under that query's own Principal (so the subscribers'
+    ///   cache partition receives the Signal);
+    /// - background keep-warm queries: the parameter sets in the Instance's `config.keep_warm`
+    ///   under its `run_as` Service principal, and the parameterized queries of history series on
+    ///   the Instance under each series' Service principal.
+    ///
+    /// When a refreshed value changes, active downstream dependents are refreshed too.
+    /// Returns the number of queries refreshed.
+    pub async fn run_due_polls(&self) -> usize {
+        self.run_polls_at(Utc::now().timestamp()).await
+    }
+
+    /// [`Self::run_due_polls`] evaluated at an explicit Unix time (deterministic tests).
+    pub async fn run_polls_at(&self, now_ts: i64) -> usize {
+        let g = self.graph();
+        let mut refreshed = 0;
         for (inst_id, inst) in &g.instances {
             if inst.category != DefinitionCategory::DataProvider {
                 continue;
@@ -255,7 +381,7 @@ impl AppServices {
             let due = {
                 let mut guard = self.last_poll_run.lock().await;
                 let last = guard.get(inst_id).copied().unwrap_or(0);
-                if now_ts - last >= interval.max(5) as i64 {
+                if now_ts - last >= interval.max(BACKGROUND_TICK_SECS) as i64 {
                     guard.insert(inst_id.clone(), now_ts);
                     true
                 } else {
@@ -263,18 +389,160 @@ impl AppServices {
                 }
             };
             if due {
-                // Poll runs under matching Service principal if granted (e.g. pr_history_sampler), never implicit system!
-                if let Some(sp_id) = inst.run_as.as_deref() {
-                    if let Ok(sp) = self.engine().automations.resolve_service_principal(sp_id) {
-                        let _ = self
-                            .engine()
-                            .queries
-                            .query(inst_id, serde_json::json!({}), &sp, true)
-                            .await;
-                    }
-                }
+                refreshed += self.poll_instance(&g, inst_id, inst, def).await;
             }
         }
+        refreshed
+    }
+
+    async fn poll_instance(
+        &self,
+        g: &ConfiguredGraph,
+        inst_id: &str,
+        inst: &InstanceConfig,
+        def: &dash_core::LoadedDefinition,
+    ) -> usize {
+        let queries = &self.engine().queries;
+        let mut targets: BTreeMap<String, (serde_json::Value, Principal)> = BTreeMap::new();
+
+        for (qk, entry) in queries.cached_entries_for_instance(inst_id) {
+            if self.query_is_active(&qk) {
+                targets.insert(qk, (entry.params, entry.principal));
+            }
+        }
+
+        let mut keep_warm: Vec<(String, serde_json::Value)> = Vec::new();
+        if let Some(sp) = inst.run_as.as_deref() {
+            if let Some(sets) = inst.config.get("keep_warm").and_then(|v| v.as_array()) {
+                keep_warm.extend(sets.iter().map(|p| (sp.to_string(), p.clone())));
+            }
+        }
+        for series in g.workspace.history.iter().filter(|h| h.instance_id == inst_id) {
+            keep_warm.push((series.service_principal.clone(), series.params.clone()));
+        }
+        for (sp_id, params) in keep_warm {
+            match self.engine().automations.resolve_service_principal(&sp_id) {
+                Ok(sp) => {
+                    let qk = queries.compute_query_key(inst_id, &def.manifest.identity_version, &params, &sp);
+                    targets.entry(qk).or_insert((params, sp));
+                }
+                Err(e) => self.engine().telemetry.log(
+                    "warn",
+                    "polling",
+                    &sp_id,
+                    "",
+                    &format!("keep-warm poll of '{inst_id}' skipped: {e}"),
+                ),
+            }
+        }
+
+        let mut refreshed = 0;
+        for (qk, (params, principal)) in targets {
+            let before = queries.cached_entry(&qk).map(|e| e.value);
+            match queries.query(inst_id, params, &principal, true).await {
+                Ok(env) => {
+                    refreshed += 1;
+                    if env.status == dash_core::QueryStatus::Fresh && before != env.value {
+                        refreshed += self.refresh_active_dependents(&qk).await;
+                    }
+                }
+                Err(e) => self.engine().telemetry.log(
+                    "warn",
+                    "polling",
+                    &principal.id,
+                    "",
+                    &format!("scheduled poll of '{inst_id}' failed: {e}"),
+                ),
+            }
+        }
+        refreshed
+    }
+
+    /// A query is active when it has live Signal subscribers or a (transitive) dependent has.
+    fn query_is_active(&self, query_key: &str) -> bool {
+        let queries = &self.engine().queries;
+        let signals = &self.engine().signals;
+        let mut stack = vec![query_key.to_string()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(qk) = stack.pop() {
+            if !seen.insert(qk.clone()) {
+                continue;
+            }
+            if signals.subscriber_count(&qk) > 0 {
+                return true;
+            }
+            stack.extend(queries.reverse_subscribers(&qk));
+        }
+        false
+    }
+
+    async fn refresh_active_dependents(&self, query_key: &str) -> usize {
+        let queries = &self.engine().queries;
+        let mut refreshed = 0;
+        let mut frontier: Vec<String> = queries.reverse_subscribers(query_key).into_iter().collect();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(dep) = frontier.pop() {
+            if !seen.insert(dep.clone()) || !self.query_is_active(&dep) {
+                continue;
+            }
+            if let Some(entry) = queries.cached_entry(&dep) {
+                if queries
+                    .query(&entry.instance_id, entry.params.clone(), &entry.principal, true)
+                    .await
+                    .is_ok()
+                {
+                    refreshed += 1;
+                }
+            }
+            frontier.extend(queries.reverse_subscribers(&dep));
+        }
+        refreshed
+    }
+
+    // ---- Automations: execution records, dead letters, replay (§7.2, §7.3) ----
+
+    pub fn automation_executions(
+        &self,
+        automation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<dash_store::AutomationExecutionRecord>, String> {
+        self.engine().automations.list_executions(automation_id, limit)
+    }
+
+    pub fn dead_letters(
+        &self,
+        include_resolved: bool,
+        limit: usize,
+        principal: &Principal,
+    ) -> Result<Vec<dash_store::DeadLetterRecord>, String> {
+        if !principal.ceiling.unrestricted && !principal.ceiling.can_resolve_executions {
+            return Err("principal lacks authority to inspect dead letters".into());
+        }
+        self.engine().automations.list_dead_letters(include_resolved, limit)
+    }
+
+    pub async fn dead_letter_redrive(
+        &self,
+        dlq_id: &str,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
+        self.engine().automations.redrive_dead_letter(dlq_id, principal).await
+    }
+
+    pub async fn events_replay(
+        &self,
+        source_instance: &str,
+        after_sequence: i64,
+        reexecute: bool,
+        principal: &Principal,
+    ) -> Result<Vec<Result<serde_json::Value, String>>, String> {
+        if !principal.ceiling.unrestricted && !principal.ceiling.can_resolve_executions {
+            return Err("principal lacks authority to replay Events".into());
+        }
+        self.engine()
+            .automations
+            .replay_events(source_instance, after_sequence, reexecute.then_some(principal))
+            .await
     }
 
     // ---- Discover ----

@@ -621,6 +621,11 @@ fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
                 }
             }
         }
+        DefinitionCategory::Automation => {
+            for (idx, t) in m.triggers.iter().enumerate() {
+                validate_trigger_shape(m, idx, t)?;
+            }
+        }
         DefinitionCategory::WidgetProvider => {
             if m.widget_asset.as_deref().unwrap_or("").is_empty() {
                 return Err(DeclarationError::InvalidContract(format!(
@@ -630,6 +635,46 @@ fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Structural trigger checks (§7.3); cron expression syntax is checked at graph validation.
+fn validate_trigger_shape(
+    m: &DefinitionManifest,
+    idx: usize,
+    t: &TriggerDeclSpec,
+) -> Result<(), DeclarationError> {
+    let bad = |msg: String| {
+        Err(DeclarationError::InvalidContract(format!(
+            "automation '{}' trigger #{idx}: {msg}",
+            m.id
+        )))
+    };
+    let missing = |v: &Option<String>| v.as_deref().map(str::trim).unwrap_or("").is_empty();
+    match t.kind.as_str() {
+        "event" if missing(&t.event_type) => return bad("event trigger requires 'event_type'".into()),
+        "cron" if missing(&t.schedule) => return bad("cron trigger requires 'schedule'".into()),
+        "signal" if missing(&t.source_input) && missing(&t.state_key) => {
+            return bad("signal trigger requires 'source_input' or 'state_key'".into())
+        }
+        "event" | "cron" | "signal" => {}
+        other => return bad(format!("unknown trigger kind '{other}' (expected event | cron | signal)")),
+    }
+    if let Some(cu) = t.catch_up.as_deref() {
+        if cu != "skip" && cu != "catch_up" {
+            return bad(format!("unknown catch_up policy '{cu}' (expected skip | catch_up)"));
+        }
+    }
+    if let Some(slot) = t.source_input.as_deref() {
+        if !m.inputs.contains_key(slot) {
+            return bad(format!("source_input '{slot}' is not a declared input"));
+        }
+    }
+    if let Some(n) = t.max_attempts {
+        if !(1..=10).contains(&n) {
+            return bad(format!("max_attempts must be between 1 and 10, got {n}"));
+        }
     }
     Ok(())
 }
@@ -1063,7 +1108,10 @@ fn parse_triggers(tbl: &Table) -> Result<Vec<TriggerDeclSpec>, DeclarationError>
         let (_, t) = pair?;
         check_known_keys(
             &t,
-            &["kind", "schedule", "event_type", "source_input", "catch_up"],
+            &[
+                "kind", "schedule", "event_type", "source_input", "catch_up", "params",
+                "state_key", "predicate", "max_attempts",
+            ],
             "trigger",
         )?;
         out.push(TriggerDeclSpec {
@@ -1074,6 +1122,23 @@ fn parse_triggers(tbl: &Table) -> Result<Vec<TriggerDeclSpec>, DeclarationError>
             event_type: get_opt_string(&t, "event_type")?,
             source_input: get_opt_string(&t, "source_input")?,
             catch_up: get_opt_string(&t, "catch_up")?,
+            params: match t.get::<Value>("params")? {
+                Value::Nil => None,
+                v => Some(serde_json::to_value(&v).map_err(|e| {
+                    DeclarationError::InvalidContract(format!("trigger params: {e}"))
+                })?),
+            },
+            state_key: get_opt_string(&t, "state_key")?,
+            predicate: get_opt_string(&t, "predicate")?,
+            max_attempts: get_opt_u64(&t, "max_attempts")?
+                .map(|n| {
+                    u32::try_from(n).map_err(|_| {
+                        DeclarationError::InvalidContract(format!(
+                            "trigger max_attempts {n} is out of range"
+                        ))
+                    })
+                })
+                .transpose()?,
         });
     }
     Ok(out)
