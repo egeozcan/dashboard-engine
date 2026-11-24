@@ -51,19 +51,24 @@ fn transition_runs(services: &AppServices) -> usize {
         .count()
 }
 
+/// A merge made outside the dashboard: mutate the github Mock's state from the host (the Mock no
+/// longer exposes an undeclared `simulate_external_merge` connector operation, §20).
 async fn simulate_external_merge(services: &AppServices, number: i64) {
-    services
-        .engine()
-        .queries
-        .invoke_connector(
-            "github_reader",
-            "simulate_external_merge",
-            json!({"repository": "acme/platform", "number": number}),
-            &Principal::administrator(),
-            "external",
-        )
-        .await
-        .unwrap();
+    let queries = &services.engine().queries;
+    let mut prs = queries.mock_state_get("github.mock", "prs");
+    let rows = prs
+        .as_array_mut()
+        .expect("github Mock state is loaded by the first poll");
+    let mut found = false;
+    for pr in rows.iter_mut() {
+        if pr["repository"] == "acme/platform" && pr["number"] == number {
+            pr["state"] = json!("merged");
+            pr["merged"] = json!(true);
+            found = true;
+        }
+    }
+    assert!(found, "PR #{number} not in the github Mock fixture");
+    queries.mock_state_set("github.mock", "prs", prs);
 }
 
 #[tokio::test]

@@ -262,6 +262,7 @@ fn test_graph() -> ConfiguredGraph {
             adapters: vec![],
             initial_state: BTreeMap::new(),
             overrides: BTreeMap::new(),
+            state_schema: BTreeMap::new(),
         },
     );
     g.service_principals.insert(
@@ -591,7 +592,8 @@ async fn automation_state_uses_one_owner_and_publishes_signals_and_cannot_emit()
         .trigger_automation("emitter", json!({}))
         .await
         .unwrap_err();
-    assert!(emit.contains("do not emit Events"), "{emit}");
+    // Rejected in the Luau runtime before reaching the automation bridge (W6 ctx:emit contract).
+    assert!(emit.contains("'automation' cannot emit Events"), "{emit}");
     assert!(engine.events.replay_since("emitter", 0).unwrap().is_empty());
 }
 
