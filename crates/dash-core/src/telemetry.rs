@@ -31,6 +31,16 @@ pub struct ExecutionGraphNode {
     pub subscribers: usize,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// `query` for data-provider results, `adapter_render` for cached Adapter evaluations.
+    #[serde(default = "default_node_kind")]
+    pub kind: String,
+    /// Declared polling interval of the node's provider, if it is polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
+}
+
+fn default_node_kind() -> String {
+    "query".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -83,6 +83,11 @@ impl VmPool {
         }
     }
 
+    /// Resource budget applied to every execution in this pool.
+    pub fn budget(&self) -> &ResourceBudget {
+        &self.budget
+    }
+
     pub fn active_vm_count(&self) -> usize {
         self.vms.len()
     }

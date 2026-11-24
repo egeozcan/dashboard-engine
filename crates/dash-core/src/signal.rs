@@ -59,6 +59,21 @@ pub struct QueryEnvelope {
     pub operations: Option<Vec<DeltaOp>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Retry/backoff metadata attached to `stale` envelopes of failing queries (§6.1, §15.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInfo>,
+}
+
+/// Retry/backoff metadata for a failing query: the last failed attempt, when the engine retries
+/// next (scheduled only while the query has active subscribers) and whether the Instance's
+/// circuit breaker is open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryInfo {
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<String>,
+    #[serde(default)]
+    pub circuit_open: bool,
 }
 
 impl QueryEnvelope {
@@ -86,6 +101,7 @@ impl QueryEnvelope {
             value: Some(value),
             operations: None,
             error,
+            retry: None,
         }
     }
 
@@ -112,6 +128,7 @@ impl QueryEnvelope {
             value: None,
             operations: Some(operations),
             error: None,
+            retry: None,
         }
     }
 }
@@ -266,19 +283,49 @@ impl SignalHub {
 
     pub fn publish_query(&self, envelope: QueryEnvelope) {
         let key = envelope.query_key.clone();
+        // The watch entry stays locked for the whole publish, so concurrent publishers of one
+        // query_key are serialized. Envelopes older than the latest published snapshot are
+        // dropped so subscribers never see versions go backwards (Appendix A.2).
+        let watch_entry = self
+            .query_watches
+            .entry(key.clone())
+            .or_insert_with(|| watch::channel(None).0);
+        let latest = watch_entry.borrow().as_ref().map(|prev| prev.version);
+        if let Some(latest) = latest {
+            let out_of_order = match envelope.kind {
+                EnvelopeKind::Snapshot => envelope.version < latest,
+                EnvelopeKind::Delta => envelope.version <= latest,
+            };
+            if out_of_order {
+                return;
+            }
+        }
         // Watch always stores latest snapshot/envelope for fast coalescing consumers
         if envelope.kind == EnvelopeKind::Snapshot {
-            let entry = self
-                .query_watches
-                .entry(key.clone())
-                .or_insert_with(|| watch::channel(None).0);
-            let _ = entry.send(Some(envelope.clone()));
+            watch_entry.send_replace(Some(envelope.clone()));
         }
         let stream = self
             .query_streams
             .entry(key)
             .or_insert_with(|| broadcast::channel(self.channel_capacity).0);
         let _ = stream.send(envelope);
+        drop(stream);
+        drop(watch_entry);
+    }
+
+    /// Number of live subscribers (stream and watch receivers) for one `query_key`.
+    pub fn subscriber_count(&self, query_key: &str) -> usize {
+        let streams = self
+            .query_streams
+            .get(query_key)
+            .map(|s| s.receiver_count())
+            .unwrap_or(0);
+        let watches = self
+            .query_watches
+            .get(query_key)
+            .map(|w| w.receiver_count())
+            .unwrap_or(0);
+        streams + watches
     }
 
     /// Subscribe to coalesced latest-value Signals (never drops the latest value under slow consumers).

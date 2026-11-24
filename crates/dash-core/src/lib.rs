@@ -30,7 +30,7 @@ pub use model::{
 pub use query_engine::QueryEngine;
 pub use signal::{
     apply_delta_envelope, compute_keyed_delta, DeltaOp, EnvelopeKind, QueryEnvelope, QueryStatus,
-    SignalHub, StateSignalPayload,
+    RetryInfo, SignalHub, StateSignalPayload,
 };
 pub use state::StateManager;
 pub use telemetry::{
