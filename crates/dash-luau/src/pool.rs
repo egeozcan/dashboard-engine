@@ -7,7 +7,9 @@
 //! - **Concurrency**: one coroutine per Instance VM at a time; waiting requests queue on the VM
 //!   lock asynchronously (no blocking thread is held while queued). The queue per Instance is bounded
 //!   (`max_pending_per_instance`) and the wait is bounded (`queue_timeout`); top-level executions are
-//!   additionally bounded by a pool-wide semaphore (`max_concurrent_executions`).
+//!   additionally bounded by a pool-wide semaphore (`max_concurrent_executions`). Nested
+//!   executions (those started while an invocation's deadline scope is active, including detached
+//!   ones that carry it via [`inherit_execution_scope`]) ride on their caller's permit.
 //! - **Budgets** default to the pool's `ResourceBudget`, may be overridden per Instance via a budget
 //!   resolver (`ResourceOverrides`), and are always clamped to the pool's daemon-wide ceiling.
 
@@ -131,6 +133,12 @@ impl ResourceBudget {
         self
     }
 
+    /// True when a VM built under `self` can serve executions under `other`: the VM-defining
+    /// limits (memory, wall timeout, interrupt budget) are equal.
+    pub fn same_vm_limits(&self, other: &ResourceBudget) -> bool {
+        self.fingerprint() == other.fingerprint()
+    }
+
     fn fingerprint(&self) -> String {
         format!(
             "{}:{}:{}",
@@ -222,13 +230,37 @@ pub fn current_execution_deadline() -> Option<Instant> {
     EXECUTION_DEADLINE.try_with(|d| *d).ok()
 }
 
-/// Run `fut` with `deadline` as the inherited execution deadline (used by the test runner so
-/// Mock-backed nested executions share the per-test deadline).
-pub(crate) async fn with_execution_deadline<F: std::future::Future>(
+/// Run `fut` with `deadline` as the inherited execution deadline: every execution `fut` starts
+/// is admitted as a nested execution (no pool-wide permit or per-Instance admission token, and
+/// a deadline clamped to `deadline`). Used by the test runner so Mock-backed nested executions
+/// share the per-test deadline.
+pub async fn with_execution_deadline<F: std::future::Future>(
     deadline: Instant,
     fut: F,
 ) -> F::Output {
     EXECUTION_DEADLINE.scope(deadline, fut).await
+}
+
+/// Carry the enclosing invocation's execution scope (captured *now*, at the call site) into
+/// `fut`, typically a nested computation that is driven on another task (e.g. a detached
+/// singleflight leader started from inside a host operation).
+///
+/// Task-locals do not cross `tokio::spawn`, so without this a dependency query issued by a
+/// running provider would be admitted as a top-level execution: it would need its own
+/// pool-wide permit while its caller holds one and waits for it (permit starvation under load),
+/// and it would get a fresh full wall timeout instead of the caller's remaining deadline. Outside
+/// an invocation this is a no-op wrapper.
+pub fn inherit_execution_scope<F>(fut: F) -> impl std::future::Future<Output = F::Output>
+where
+    F: std::future::Future,
+{
+    let inherited = current_execution_deadline();
+    async move {
+        match inherited {
+            Some(deadline) => EXECUTION_DEADLINE.scope(deadline, fut).await,
+            None => fut.await,
+        }
+    }
 }
 
 /// Source bundle needed to boot an Instance's Luau VM.
@@ -361,6 +393,15 @@ impl VmPool {
         }
     }
 
+    /// Budget an Instance gets under `overrides` (e.g. the `[resources]` of a candidate
+    /// Generation that is not live yet): pool default + overrides, clamped to the ceiling.
+    pub fn budget_with_overrides(&self, overrides: Option<&ResourceOverrides>) -> ResourceBudget {
+        match overrides {
+            Some(ov) => self.budget.with_overrides(ov, &self.ceiling),
+            None => self.budget.clone(),
+        }
+    }
+
     /// Resource budget applied to every execution in this pool.
     pub fn budget(&self) -> &ResourceBudget {
         &self.budget
@@ -467,19 +508,36 @@ impl VmPool {
         self.vms.remove(instance_id);
     }
 
-    /// Prepare replacement VMs for a pending Generation without installing them (§12.2 step 5):
-    /// each VM is built under this pool's `ResourceBudget` and its `runtime.luau` module is
-    /// evaluated (wall-time, interrupt and memory limits enforced). The first failing Instance
-    /// is returned so activation can be refused before anything is committed.
+    /// Prepare replacement VMs under the budgets the *live* resolver yields now. Activation must
+    /// use [`VmPool::prepare_replacements_with`] instead: before the Generation swap the live
+    /// resolver still reads the outgoing Generation's `[resources]`.
     pub async fn prepare_replacements(
         &self,
         bundles: &[CompiledInstanceBundle],
     ) -> Result<PreparedVms, (String, RuntimeError)> {
-        let mut vms = Vec::with_capacity(bundles.len());
-        for bundle in bundles {
+        let items: Vec<(CompiledInstanceBundle, ResourceBudget)> = bundles
+            .iter()
+            .map(|b| (b.clone(), self.effective_budget(&b.instance_id)))
+            .collect();
+        self.prepare_replacements_with(&items).await
+    }
+
+    /// Prepare replacement VMs for a pending Generation without installing them (§12.2 step 5):
+    /// each VM is built under the budget given with it (the candidate Generation's
+    /// `[resources]`, see [`VmPool::budget_with_overrides`]) and its `runtime.luau` module is
+    /// evaluated (wall-time, interrupt and memory limits enforced). The first failing Instance
+    /// is returned so activation can be refused before anything is committed. A prepared VM
+    /// carries its budget's fingerprint, so it is reused after the swap exactly when the live
+    /// resolver then yields the same limits.
+    pub async fn prepare_replacements_with(
+        &self,
+        items: &[(CompiledInstanceBundle, ResourceBudget)],
+    ) -> Result<PreparedVms, (String, RuntimeError)> {
+        let mut vms = Vec::with_capacity(items.len());
+        for (bundle, budget) in items {
             let inst_id = bundle.instance_id.clone();
-            // Per-Instance budget (`[resources]` overrides clamped to the ceiling), as at runtime.
-            let budget = self.effective_budget(&inst_id);
+            // Never exceed the daemon-wide ceiling, whatever the caller computed.
+            let budget = budget.clone().clamp_to(&self.ceiling);
             let lua = build_sandboxed_vm(bundle, &budget).map_err(|e| (inst_id.clone(), e))?;
             let fingerprint = budget.fingerprint();
             let idle_ttl = budget.idle_ttl;
@@ -1045,22 +1103,40 @@ pub(crate) fn new_sandbox_lua(memory_limit_bytes: usize) -> Result<Lua, mlua::Er
 /// - `require("dash")` returns the runtime SDK.
 /// - Pre-registered modules (e.g. `runtime` inside Definition tests) are always available.
 /// - Any other name must be a resolved package library. Definition code may only require
-///   libraries listed in its manifest `libraries`; while a library module is being loaded, it
-///   may require further resolved libraries (its own dependencies). A library that requires
-///   lazily (inside a function called later from Definition code) is checked against the
-///   Definition's declared list, i.e. the check fails closed.
+///   libraries listed in its manifest `libraries`. While a library module is being loaded, it
+///   may additionally require the libraries its own source names in a string-literal
+///   `require("...")` (its own dependencies); a computed name outside that set is denied. A
+///   library that requires lazily (inside a function called later from Definition code) is
+///   checked against the Definition's declared list, i.e. the check fails closed.
+///
+/// So every library a VM can load lies in the Definition's static library closure (declared
+/// libraries plus literal requires, transitively), which is exactly what the Definition's
+/// identity and `ConfiguredGraph::library_closure` cover: a library outside it can never run
+/// inside this Instance, and a library inside it is tracked as this Instance's code.
 pub(crate) struct ModuleLoader {
     libs: BTreeMap<String, String>,
     declared: BTreeSet<String>,
+    /// Statically required module names of each library source.
+    lib_requires: HashMap<String, BTreeSet<String>>,
     loaded: std::sync::Mutex<HashMap<String, mlua::RegistryKey>>,
     loading: std::sync::Mutex<Vec<String>>,
 }
 
 impl ModuleLoader {
     pub(crate) fn new(libs: BTreeMap<String, String>, declared: &[String]) -> Arc<Self> {
+        let lib_requires = libs
+            .iter()
+            .map(|(name, src)| {
+                let reqs = crate::declaration::scan_required_modules(src)
+                    .into_iter()
+                    .collect();
+                (name.clone(), reqs)
+            })
+            .collect();
         Arc::new(Self {
             libs,
             declared: declared.iter().cloned().collect(),
+            lib_requires,
             loaded: std::sync::Mutex::new(HashMap::new()),
             loading: std::sync::Mutex::new(Vec::new()),
         })
@@ -1074,6 +1150,9 @@ impl ModuleLoader {
     }
 
     pub(crate) fn install(self: &Arc<Self>, lua: &Lua, dash_sdk: Table) -> mlua::Result<()> {
+        // The SDK table is shared by every invocation in this VM: freeze it (and its nested
+        // tables) so Definition code cannot replace SDK functions for later invocations.
+        freeze_deep(&dash_sdk)?;
         let loader = Arc::clone(self);
         let require_fn = lua.create_function(move |lua, name: String| -> mlua::Result<Value> {
             if name == "dash" {
@@ -1087,11 +1166,28 @@ impl ModuleLoader {
                     "SANDBOX_DENIED: module '{name}' is not a resolved package library"
                 )));
             };
-            let inside_library_load = !loader.loading.lock().unwrap().is_empty();
-            if !inside_library_load && !loader.declared.contains(&name) {
-                return Err(mlua::Error::runtime(format!(
-                    "SANDBOX_DENIED: library '{name}' is not declared in this Definition's `libraries`"
-                )));
+            if !loader.declared.contains(&name) {
+                // Inside a library load, the library being loaded may require what its own
+                // source names literally; anything else is denied (fail closed).
+                let loading_lib = loader.loading.lock().unwrap().last().cloned();
+                match loading_lib {
+                    None => {
+                        return Err(mlua::Error::runtime(format!(
+                            "SANDBOX_DENIED: library '{name}' is not declared in this Definition's `libraries`"
+                        )))
+                    }
+                    Some(lib)
+                        if !loader
+                            .lib_requires
+                            .get(&lib)
+                            .is_some_and(|reqs| reqs.contains(&name)) =>
+                    {
+                        return Err(mlua::Error::runtime(format!(
+                            "SANDBOX_DENIED: library '{lib}' may only require libraries it names in a literal `require(\"...\")`, not '{name}'"
+                        )))
+                    }
+                    Some(_) => {}
+                }
             }
             if let Some(key) = loader.loaded.lock().unwrap().get(&name) {
                 return lua.registry_value(key);
@@ -1116,6 +1212,20 @@ impl ModuleLoader {
         })?;
         lua.globals().set("require", require_fn)
     }
+}
+
+/// Make `tbl` and every table reachable through its values read-only (Luau `table.freeze`).
+fn freeze_deep(tbl: &Table) -> mlua::Result<()> {
+    if tbl.is_readonly() {
+        return Ok(());
+    }
+    tbl.set_readonly(true);
+    for pair in tbl.pairs::<Value, Value>() {
+        if let (_, Value::Table(child)) = pair? {
+            freeze_deep(&child)?;
+        }
+    }
+    Ok(())
 }
 
 fn build_sandboxed_vm(
@@ -1641,6 +1751,290 @@ return R
         assert_eq!(stats[0].memory_limit_bytes, 32 * 1024 * 1024);
         assert_eq!(stats[0].outcome, "ok");
         assert_eq!(stats[0].trace_id, "tr");
+    }
+
+    /// T4: the `dash` SDK table is shared by every invocation of a VM; Definition code must not
+    /// be able to replace SDK functions for later invocations.
+    #[tokio::test]
+    async fn dash_sdk_table_is_frozen() {
+        let pool = VmPool::new(budget(2_000));
+        let rt = r#"
+local dash = require("dash")
+local R = {}
+function R.query(ctx)
+    local top = pcall(function() dash.uuid = function() return "spoofed" end end)
+    local raw = pcall(function() rawset(dash, "unknown_outcome", nil) end)
+    local nested = pcall(function() dash.json.encode = function() return "x" end end)
+    local added = pcall(function() dash.extra = 1 end)
+    return { top = top, raw = raw, nested = nested, added = added, uuid = dash.uuid() ~= "spoofed" }
+end
+return R
+"#;
+        let b = bundle(
+            "frozen",
+            "local dash = require(\"dash\")\nreturn dash.data_provider { id = \"t.frozen\" }",
+            rt,
+        );
+        for _ in 0..2 {
+            let v = pool
+                .execute_handler(
+                    &b,
+                    "query",
+                    cfg(DefinitionCategory::DataProvider, "frozen", &[], probe(0)),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                v,
+                json!({ "top": false, "raw": false, "nested": false, "added": false, "uuid": true })
+            );
+        }
+    }
+
+    /// Bridge whose `query_input` runs a child execution on a detached task, the way the query
+    /// engine's singleflight leaders do.
+    struct DetachedChildBridge {
+        pool: VmPool,
+        child: CompiledInstanceBundle,
+        inherit: bool,
+        child_deadline: Mutex<Option<Option<Instant>>>,
+    }
+
+    #[async_trait]
+    impl HostBridge for DetachedChildBridge {
+        async fn query_input(
+            &self,
+            _n: &str,
+            _p: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            let (pool, child) = (self.pool.clone(), self.child.clone());
+            let fut = async move {
+                let seen = current_execution_deadline();
+                let res = pool
+                    .execute_handler(
+                        &child,
+                        "query",
+                        cfg(DefinitionCategory::DataProvider, "child", &[], probe(0)),
+                        None,
+                    )
+                    .await;
+                (seen, res)
+            };
+            let (seen, res) = if self.inherit {
+                tokio::spawn(inherit_execution_scope(fut)).await.unwrap()
+            } else {
+                tokio::spawn(fut).await.unwrap()
+            };
+            *self.child_deadline.lock().unwrap() = Some(seen);
+            res.map_err(|e| e.to_string())
+        }
+        async fn call_input(
+            &self,
+            _n: &str,
+            _o: &str,
+            _a: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("none".into())
+        }
+        async fn invoke_action(
+            &self,
+            _n: &str,
+            _a: serde_json::Value,
+            _k: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            Err("none".into())
+        }
+        async fn http_request(&self, _r: HttpHostRequest) -> Result<HttpHostResponse, String> {
+            Err("blocked".into())
+        }
+        async fn emit_event(
+            &self,
+            _t: &str,
+            _p: serde_json::Value,
+            _d: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn emit_event_versioned(
+            &self,
+            _t: &str,
+            _v: &str,
+            _p: serde_json::Value,
+            _d: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn state_get(&self, _s: &str, _k: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn state_set(&self, _s: &str, _k: &str, _v: serde_json::Value) -> Result<(), String> {
+            Ok(())
+        }
+        async fn load_fixture(&self, _p: &str) -> Result<serde_json::Value, String> {
+            Err("none".into())
+        }
+    }
+
+    /// R3:luau-pool-nested-permit-starvation: a child execution driven on a detached task keeps
+    /// riding on the parent's permit (and inherits its deadline) when the scope is carried over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_nested_execution_inherits_permit_and_deadline() {
+        let pool = VmPool::new(ResourceBudget {
+            max_concurrent_executions: 1,
+            queue_timeout: Duration::from_secs(10),
+            ..budget(600)
+        });
+        let child = bundle(
+            "child",
+            "local dash = require(\"dash\")\nreturn dash.data_provider { id = \"t.child\" }",
+            "local R = {}\nfunction R.query(ctx) return 42 end\nreturn R",
+        );
+        let parent = bundle("parent", DP_DECL, AWAIT_RT);
+        for inherit in [true, false] {
+            let bridge = Arc::new(DetachedChildBridge {
+                pool: pool.clone(),
+                child: child.clone(),
+                inherit,
+                child_deadline: Mutex::new(None),
+            });
+            let t0 = Instant::now();
+            let res = pool
+                .execute_handler(
+                    &parent,
+                    "query",
+                    cfg(
+                        DefinitionCategory::DataProvider,
+                        "parent",
+                        &["up"],
+                        bridge.clone(),
+                    ),
+                    None,
+                )
+                .await;
+            if inherit {
+                assert_eq!(res.unwrap(), json!(42));
+                assert!(t0.elapsed() < Duration::from_millis(400));
+                let d = bridge.child_deadline.lock().unwrap().unwrap();
+                let d = d.expect("detached child sees the parent's deadline");
+                assert!(d <= t0 + Duration::from_millis(700));
+            } else {
+                // Without carrying the scope the child is admitted as top-level and starves on
+                // the permit its own parent holds (the pre-fix behaviour).
+                assert!(matches!(res, Err(RuntimeError::Timeout(_))), "{res:?}");
+            }
+        }
+    }
+
+    /// R3:pool-prepare-replacements-old-budget: replacement VMs are prepared under the budget of
+    /// the candidate Generation (not the live resolver's), and a VM prepared that way is reused
+    /// once the resolver yields the same limits after the swap.
+    #[tokio::test]
+    async fn replacements_are_prepared_under_the_candidate_budget() {
+        let pool = VmPool::new(budget(2_000));
+        // Live ("outgoing Generation") resolver: no overrides.
+        let live: Arc<RwLock<Option<ResourceOverrides>>> = Arc::default();
+        let l2 = Arc::clone(&live);
+        pool.set_budget_resolver(Arc::new(move |_id: &str| l2.read().unwrap().clone()));
+
+        let heavy_rt = "local blob = string.rep(\"x\", 4 * 1024 * 1024)\nlocal R = {}\nfunction R.query(ctx) return #blob end\nreturn R";
+        let heavy = bundle(
+            "heavy",
+            "local dash = require(\"dash\")\nreturn dash.data_provider { id = \"t.heavy\" }",
+            heavy_rt,
+        );
+        let tight = ResourceOverrides {
+            memory_limit_mib: Some(2),
+            ..Default::default()
+        };
+        // The candidate's 2 MiB limit is enforced although the live resolver still says 32 MiB.
+        let candidate = pool.budget_with_overrides(Some(&tight));
+        assert_eq!(candidate.memory_limit_bytes, 2 * 1024 * 1024);
+        assert!(!candidate.same_vm_limits(&pool.effective_budget("heavy")));
+        let err = pool
+            .prepare_replacements_with(&[(heavy.clone(), candidate)])
+            .await
+            .err()
+            .expect("module exceeding the candidate memory limit must fail preparation");
+        assert_eq!(err.0, "heavy");
+        assert!(
+            matches!(err.1, RuntimeError::MemoryExceeded(_)),
+            "{:?}",
+            err.1
+        );
+
+        // A module that fits: the prepared VM survives the swap and serves the first request.
+        let roomy = ResourceOverrides {
+            memory_limit_mib: Some(16),
+            timeout_ms: Some(1_500),
+            ..Default::default()
+        };
+        let prepared = pool
+            .prepare_replacements_with(&[(heavy.clone(), pool.budget_with_overrides(Some(&roomy)))])
+            .await
+            .map_err(|(_, e)| e)
+            .unwrap();
+        pool.install_prepared(prepared);
+        let uid = pool.vm_uid("heavy").unwrap();
+        *live.write().unwrap() = Some(roomy); // the Generation swap
+        let v = pool
+            .execute_handler(
+                &heavy,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "heavy", &[], probe(0)),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, json!(4 * 1024 * 1024));
+        assert_eq!(
+            pool.vm_uid("heavy").as_deref(),
+            Some(uid.as_str()),
+            "the prepared VM must be reused, not replaced by a cold one"
+        );
+    }
+
+    /// R3:model-effective-code-digest-all-libraries (runtime half): while a library loads it may
+    /// only require libraries its source names literally, so a computed name cannot reach a
+    /// library outside the Definition's static closure.
+    #[tokio::test]
+    async fn library_load_cannot_require_outside_its_static_closure() {
+        let pool = VmPool::new(budget(2_000));
+        let mut libs = BTreeMap::new();
+        libs.insert(
+            "pkg.sneaky".to_string(),
+            "local n = \"pkg.\" .. \"secret\"\nreturn { v = require(n).v }".to_string(),
+        );
+        libs.insert("pkg.secret".to_string(), "return { v = 7 }".to_string());
+        libs.insert(
+            "pkg.honest".to_string(),
+            "local s = require(\"pkg.secret\")\nreturn { v = s.v }".to_string(),
+        );
+        for (lib, expect_ok) in [("pkg.sneaky", false), ("pkg.honest", true)] {
+            let decl = format!(
+                "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"t.l\", libraries = {{ \"{lib}\" }} }}"
+            );
+            let rt = format!(
+                "local l = require(\"{lib}\")\nlocal R = {{}}\nfunction R.query(ctx) return l.v end\nreturn R"
+            );
+            let id = lib.replace('.', "_");
+            let mut b = bundle(&id, &decl, &rt);
+            b.resolved_libraries = libs.clone();
+            let res = pool
+                .execute_handler(
+                    &b,
+                    "query",
+                    cfg(DefinitionCategory::DataProvider, &id, &[], probe(0)),
+                    None,
+                )
+                .await;
+            if expect_ok {
+                assert_eq!(res.unwrap(), json!(7));
+            } else {
+                let err = res.unwrap_err().to_string();
+                assert!(err.contains("SANDBOX_DENIED"), "{err}");
+            }
+        }
     }
 
     #[tokio::test]

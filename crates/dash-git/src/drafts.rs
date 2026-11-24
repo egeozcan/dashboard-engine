@@ -28,8 +28,8 @@ use crate::git_cli::{
     GitStatusReport,
 };
 use crate::packages::{
-    fetch_locked_packages, missing_locked_packages, read_packages_lock, read_packages_toml,
-    update_package_lock, write_packages_toml, PackageDependencySpec, PackagesLock, PackagesToml,
+    fetch_locked_packages, read_packages_lock, read_packages_toml, resolve_package_update,
+    write_packages_lock, write_packages_toml, PackageDependencySpec, PackagesLock, PackagesToml,
 };
 use crate::preview::{
     run_preview_and_scenarios, run_workspace_definition_tests, validate_graph_with_contracts,
@@ -168,12 +168,6 @@ impl DraftManager {
         if let Err(msg) = check_lock_matches_manifest(&workspace_dir) {
             warnings.push(msg);
         }
-        // A committed packages.lock on a fresh Installation: materialize the pinned commits.
-        let lock = read_packages_lock(&workspace_dir)?;
-        if !missing_locked_packages(&data_dir, &lock).is_empty() {
-            fetch_locked_packages(&data_dir, &lock).await?;
-        }
-
         // Crash recovery on startup from activation_journal (§12.2, §15.2, ADR-0004)
         reconcile_activation_journals(&workspace_dir, &store, &mut warnings).await;
         let head = git_head(&workspace_dir).await?;
@@ -662,8 +656,29 @@ impl DraftManager {
         let wt = Path::new(&draft.worktree_path);
         let mut cfg = read_packages_toml(wt)?;
         cfg.dependencies.insert(pkg_name.to_string(), spec);
-        write_packages_toml(wt, &cfg)?;
-        let lock = update_package_lock(wt, &self.data_dir, pkg_name).await?;
+        // Resolve the candidate requirement set in memory first: a failed resolution (unknown
+        // ref, clone failure, conflict, cycle) leaves the draft's packages.toml and packages.lock
+        // exactly as they were, so it cannot poison later updates.
+        let lock = resolve_package_update(wt, &self.data_dir, &cfg, pkg_name).await?;
+        // Persist both files, restoring the originals if either write fails.
+        let originals: Vec<(PathBuf, Option<Vec<u8>>)> = ["packages.toml", "packages.lock"]
+            .iter()
+            .map(|f| {
+                let p = wt.join(f);
+                let bytes = std::fs::read(&p).ok();
+                (p, bytes)
+            })
+            .collect();
+        let persisted = write_packages_toml(wt, &cfg).and_then(|_| write_packages_lock(wt, &lock));
+        if let Err(e) = persisted {
+            for (path, bytes) in originals {
+                let _ = match bytes {
+                    Some(b) => std::fs::write(&path, b),
+                    None => std::fs::remove_file(&path),
+                };
+            }
+            return Err(e);
+        }
         let rec =
             self.record_draft_mutation(draft_id, principal, format!("dependency:{pkg_name}"))?;
         Ok((rec, lock))
@@ -1092,15 +1107,26 @@ impl DraftManager {
             compute_generation_diff(&old_graph, &live_graph);
         let desired_bundles = instance_bundles(&live_graph);
         let rebuild_set: BTreeSet<&String> = rebuilt.iter().collect();
-        let to_prepare: Vec<CompiledInstanceBundle> = desired_bundles
+        // Prepare under the candidate Generation's `[resources]` (the live budget resolver still
+        // reads the outgoing one), and also validate Instances whose only change is their budget.
+        let pool = &self.engine.pool;
+        let to_prepare: Vec<(CompiledInstanceBundle, dash_luau::ResourceBudget)> = desired_bundles
             .iter()
-            .filter(|b| rebuild_set.contains(&b.instance_id) && has_luau_runtime(b))
-            .cloned()
+            .filter(|b| has_luau_runtime(b))
+            .filter_map(|b| {
+                let id = &b.instance_id;
+                let new_budget = pool.budget_with_overrides(
+                    live_graph.workspace.resources.overrides_for(id).as_ref(),
+                );
+                let old_budget = pool.budget_with_overrides(
+                    old_graph.workspace.resources.overrides_for(id).as_ref(),
+                );
+                (rebuild_set.contains(id) || !new_budget.same_vm_limits(&old_budget))
+                    .then(|| (b.clone(), new_budget))
+            })
             .collect();
-        let prepared = self
-            .engine
-            .pool
-            .prepare_replacements(&to_prepare)
+        let prepared = pool
+            .prepare_replacements_with(&to_prepare)
             .await
             .map_err(|(inst, e)| {
                 GitError::Workspace(format!(
@@ -1812,6 +1838,7 @@ async fn load_revision_graph(
 ) -> Result<ConfiguredGraph, GitError> {
     let porcelain = run_git(workspace_dir, &["status", "--porcelain"]).await?;
     if porcelain.trim().is_empty() {
+        materialize_locked_packages(workspace_dir, data_dir).await?;
         let mut graph = load_workspace_graph(workspace_dir, data_dir, head, 1, false).await?;
         graph.substitute_mocks = use_mocks;
         return Ok(graph);
@@ -1823,9 +1850,20 @@ async fn load_revision_graph(
     ));
     let export = tempfile::tempdir()?;
     git_export_tree(workspace_dir, head, export.path()).await?;
+    materialize_locked_packages(export.path(), data_dir).await?;
     let mut graph = load_workspace_graph(export.path(), data_dir, head, 1, false).await?;
     graph.substitute_mocks = use_mocks;
     Ok(graph)
+}
+
+/// Materialize the Packages pinned by the `packages.lock` of the tree being loaded (the Revision
+/// itself, never an uncommitted working-tree lock) at their locked commits. Entries that are
+/// already cached and verified are skipped; missing or corrupt cache entries are re-fetched.
+/// The lockfile is never modified (§4.4).
+async fn materialize_locked_packages(revision_dir: &Path, data_dir: &Path) -> Result<(), GitError> {
+    let lock = read_packages_lock(revision_dir)?;
+    fetch_locked_packages(data_dir, &lock).await?;
+    Ok(())
 }
 
 /// Derive the remote sync state from local facts only (no network): HEAD counts as synced

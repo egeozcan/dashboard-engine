@@ -405,14 +405,15 @@ impl ConfiguredGraph {
         self.is_preview || self.substitute_mocks
     }
 
-    /// Content digest of a Definition including every Library it can `require` at runtime
-    /// (all Workspace Libraries are resolvable), so library edits count as code changes.
+    /// Content digest of a Definition including every Library it can `require` at runtime (its
+    /// [`ConfiguredGraph::library_closure`]), so an edit of such a Library counts as a code
+    /// change of the Definition while an edit of an unrelated Library does not.
     pub fn effective_code_digest(&self, definition_id: &str) -> Option<String> {
         let def = self.definitions.get(definition_id)?;
         let mut h = Sha256::new();
         h.update(def.manifest.identity_version.as_bytes());
-        for (id, d) in &self.definitions {
-            if d.manifest.category == DefinitionCategory::Library {
+        for id in self.library_closure(definition_id) {
+            if let Some(d) = self.definitions.get(&id) {
                 h.update(b"|lib:");
                 h.update(id.as_bytes());
                 h.update(b"@");
@@ -420,6 +421,42 @@ impl ConfiguredGraph {
             }
         }
         Some(format!("code:{}", hex::encode(h.finalize())))
+    }
+
+    /// Library Definitions that code of `definition_id` can load at runtime, transitively: its
+    /// declared `libraries` plus every Library named by a string-literal `require("...")` in its
+    /// runtime or tests source, closed under the same rule for each Library.
+    ///
+    /// This is a superset of what the VM module loader serves: Definition code may only
+    /// require declared libraries, and a library being loaded only the libraries its source
+    /// names literally, so a computed module name can never reach a Library outside this set.
+    pub fn library_closure(&self, definition_id: &str) -> BTreeSet<String> {
+        let direct = |id: &str| -> Vec<String> {
+            let Some(d) = self.definitions.get(id) else {
+                return Vec::new();
+            };
+            let mut out = d.manifest.libraries.clone();
+            out.extend(dash_luau::declaration::scan_required_modules(
+                &d.runtime_source,
+            ));
+            if let Some(t) = &d.tests_source {
+                out.extend(dash_luau::declaration::scan_required_modules(t));
+            }
+            out
+        };
+        let is_library = |id: &str| {
+            self.definitions
+                .get(id)
+                .is_some_and(|d| d.manifest.category == DefinitionCategory::Library)
+        };
+        let mut closure = BTreeSet::new();
+        let mut frontier = direct(definition_id);
+        while let Some(lib) = frontier.pop() {
+            if lib != definition_id && is_library(&lib) && closure.insert(lib.clone()) {
+                frontier.extend(direct(&lib));
+            }
+        }
+        closure
     }
 
     /// Find the Mock definition targeting `connector_def_id`, if any.
@@ -542,6 +579,81 @@ mod tests {
             fixtures: BTreeMap::new(),
             widget_assets: BTreeMap::new(),
         }
+    }
+
+    fn lib_def(id: &str, runtime: &str) -> LoadedDefinition {
+        let mut d = def(
+            "p",
+            &format!("local dash = require(\"dash\"); return dash.library {{ id = \"{id}\" }}"),
+        );
+        d.runtime_source = runtime.into();
+        d
+    }
+
+    /// R3:model-effective-code-digest-all-libraries: only Libraries a Definition can actually
+    /// load (declared or literally required, transitively) feed its effective code digest.
+    #[test]
+    fn effective_code_digest_covers_only_the_library_closure() {
+        let mut g = ConfiguredGraph::default();
+        let mut conn = def(
+            "p",
+            "local dash = require(\"dash\"); return dash.connector { id = \"p.conn\" }",
+        );
+        conn.runtime_source = "local u = require(\"p.util\")\nreturn {}".into();
+        g.definitions.insert("p.conn".into(), conn);
+        let mut prov = def(
+            "p",
+            "local dash = require(\"dash\"); return dash.data_provider { id = \"p.prov\", libraries = { \"p.fmt\" } }",
+        );
+        prov.runtime_source = "return {}".into();
+        g.definitions.insert("p.prov".into(), prov);
+        // p.util -> p.deep (literal require inside a library); p.fmt and p.other are unrelated.
+        g.definitions.insert(
+            "p.util".into(),
+            lib_def("p.util", "return require('p.deep')"),
+        );
+        g.definitions
+            .insert("p.deep".into(), lib_def("p.deep", "return {}"));
+        g.definitions
+            .insert("p.fmt".into(), lib_def("p.fmt", "return {}"));
+        g.definitions
+            .insert("p.other".into(), lib_def("p.other", "return {}"));
+
+        assert_eq!(
+            g.library_closure("p.conn"),
+            BTreeSet::from(["p.util".to_string(), "p.deep".to_string()])
+        );
+        assert_eq!(
+            g.library_closure("p.prov"),
+            BTreeSet::from(["p.fmt".to_string()])
+        );
+
+        let edit = |g: &ConfiguredGraph, lib: &str| {
+            let mut c = g.clone();
+            let d = c.definitions.get_mut(lib).unwrap();
+            d.manifest.identity_version = format!("{}-edited", d.manifest.identity_version);
+            c
+        };
+        let base_conn = g.effective_code_digest("p.conn");
+        // Unrelated and other-Definition Libraries do not change the connector's digest.
+        assert_eq!(
+            edit(&g, "p.other").effective_code_digest("p.conn"),
+            base_conn
+        );
+        assert_eq!(edit(&g, "p.fmt").effective_code_digest("p.conn"), base_conn);
+        assert_ne!(
+            edit(&g, "p.fmt").effective_code_digest("p.prov"),
+            g.effective_code_digest("p.prov")
+        );
+        // Direct and transitive Libraries do.
+        assert_ne!(
+            edit(&g, "p.util").effective_code_digest("p.conn"),
+            base_conn
+        );
+        assert_ne!(
+            edit(&g, "p.deep").effective_code_digest("p.conn"),
+            base_conn
+        );
     }
 
     #[test]
