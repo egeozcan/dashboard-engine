@@ -158,10 +158,16 @@ enum SecretAction {
         /// history; discouraged). Without it, the value is read from stdin.
         #[arg(long)]
         value: Option<String>,
-        #[arg(long, default_value = "")]
-        description: String,
-        #[arg(long = "allowed-binding")]
+        /// Description (omitted on a rotation = keep the current one)
+        #[arg(long)]
+        description: Option<String>,
+        /// Instance ids allowed to bind the secret (omitted on a rotation = keep the current
+        /// binding policy)
+        #[arg(long = "allowed-binding", conflicts_with = "clear_allowed_bindings")]
         allowed_bindings: Vec<String>,
+        /// Deliberately remove the binding restriction so any Instance may bind the secret
+        #[arg(long = "clear-allowed-bindings", default_value_t = false)]
+        clear_allowed_bindings: bool,
         /// Destination hosts the credential may be attached to (default: any allowed host)
         #[arg(long = "allowed-host")]
         allowed_hosts: Vec<String>,
@@ -253,6 +259,14 @@ async fn main() -> Result<()> {
 
             let admin_tok_path = cli.data_dir.join("admin.token");
             if !admin_tok_path.exists() || rotate_admin_token {
+                if rotate_admin_token {
+                    // Rotating credentials after a suspected compromise also logs out every
+                    // browser session (resetting the password already does, in the store).
+                    let revoked = store.revoke_all_sessions()?;
+                    if revoked > 0 {
+                        eprintln!("Revoked {revoked} browser session(s).");
+                    }
+                }
                 let tok = generate_random_token("adm");
                 std::fs::write(&admin_tok_path, &tok)?;
                 #[cfg(unix)]
@@ -327,8 +341,19 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("failed to bind {bind}"))?;
             let local = listener.local_addr()?;
-            let daemon_file = DaemonFile::write(&cli.data_dir, local)?;
+            // The admin CLI token is accepted only from loopback peers, so a deliberate bind to
+            // one specific non-loopback interface (LAN, tailnet) also serves the same router on
+            // loopback, and `daemon.json` points the CLI there (§14.1, §14.3).
+            let admin_listener = bind_loopback_admin_channel(local).await?;
+            let cli_addr = match admin_listener {
+                Some(ref l) => l.local_addr()?,
+                None => local,
+            };
+            let daemon_file = DaemonFile::write(&cli.data_dir, cli_addr)?;
             tracing::info!("dash serving on http://{local}");
+            if admin_listener.is_some() {
+                tracing::info!("local CLI admin channel on http://{cli_addr}");
+            }
 
             let drain = Duration::from_secs(shutdown_drain_secs);
             let signal_services = services.clone();
@@ -343,13 +368,37 @@ async fn main() -> Result<()> {
             });
 
             let mut graceful_rx = shutdown_rx.clone();
-            let server = axum::serve(
+            let mut admin_graceful_rx = shutdown_rx.clone();
+            let admin_app = app.clone();
+            let admin_server = async move {
+                match admin_listener {
+                    Some(l) => {
+                        axum::serve(
+                            l,
+                            admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(async move {
+                            let _ = admin_graceful_rx.wait_for(|v| *v).await;
+                        })
+                        .await
+                    }
+                    None => Ok(()),
+                }
+            };
+            let main_server = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(async move {
                 let _ = graceful_rx.wait_for(|v| *v).await;
             });
+            let server = async move {
+                tokio::try_join!(
+                    std::future::IntoFuture::into_future(main_server),
+                    admin_server
+                )
+                .map(|_| ())
+            };
             let mut deadline_rx = shutdown_rx.clone();
             let drain_deadline = async move {
                 let _ = deadline_rx.wait_for(|v| *v).await;
@@ -515,6 +564,7 @@ async fn run_admin_command(cli: &Cli) -> Result<()> {
                 value,
                 description,
                 allowed_bindings,
+                clear_allowed_bindings,
                 allowed_hosts,
                 credential_scheme,
             } => {
@@ -527,28 +577,39 @@ async fn run_admin_command(cli: &Cli) -> Result<()> {
                     }
                     None => read_secret_from_stdin().await?,
                 };
-                // Destination/credential-scheme policy is optional; without it the existing
-                // policy of the secret is preserved.
+                // Every policy field is optional: what is not given keeps the secret's current
+                // value, so rotating a value never widens its binding or destination policy.
                 let hosts = (!allowed_hosts.is_empty()).then_some(allowed_hosts.as_slice());
+                let bindings: Option<&[String]> = if *clear_allowed_bindings {
+                    Some(&[])
+                } else {
+                    (!allowed_bindings.is_empty()).then_some(allowed_bindings.as_slice())
+                };
                 match t {
                     Target::Local(s) => json!(s
-                        .secret_set_with_policy(
+                        .secret_update(
                             name,
-                            description,
                             &plaintext,
-                            allowed_bindings,
-                            hosts,
-                            credential_scheme.as_deref(),
+                            dash_store::SecretPolicyUpdate {
+                                description: description.as_deref(),
+                                allowed_bindings: bindings,
+                                allowed_hosts: hosts,
+                                credential_scheme: credential_scheme.as_deref(),
+                            },
                             &admin,
                         )
                         .map_err(|e| anyhow::anyhow!(e))?),
                     Target::Daemon(d) => {
                         let mut body = json!({
                             "name": name,
-                            "description": description,
                             "plaintext": plaintext,
-                            "allowed_bindings": allowed_bindings,
                         });
+                        if let Some(desc) = description {
+                            body["description"] = json!(desc);
+                        }
+                        if let Some(b) = bindings {
+                            body["allowed_bindings"] = json!(b);
+                        }
                         if let Some(h) = hosts {
                             body["allowed_hosts"] = json!(h);
                         }
@@ -690,6 +751,24 @@ impl InstallationLock {
             }
         }
     }
+}
+
+/// When `serve` binds one specific non-loopback address, bind a loopback listener for the local
+/// CLI admin channel: the same port when free, otherwise an ephemeral one. Wildcard and loopback
+/// binds already accept loopback connections and need none.
+async fn bind_loopback_admin_channel(local: SocketAddr) -> Result<Option<tokio::net::TcpListener>> {
+    let ip = local.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Ok(None);
+    }
+    let lo = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let listener = match tokio::net::TcpListener::bind(SocketAddr::new(lo, local.port())).await {
+        Ok(l) => l,
+        Err(_) => tokio::net::TcpListener::bind(SocketAddr::new(lo, 0))
+            .await
+            .context("failed to bind the loopback CLI admin channel")?,
+    };
+    Ok(Some(listener))
 }
 
 /// `<data_dir>/daemon.json`: where the running daemon can be reached over loopback.

@@ -73,6 +73,16 @@ pub struct StateMigrationStep {
     pub new_value: Option<serde_json::Value>,
 }
 
+/// Which secret policy fields a [`SqliteStore::set_secret_value`] call changes; `None` keeps
+/// the stored value (or the default for a new secret).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SecretPolicyUpdate<'a> {
+    pub description: Option<&'a str>,
+    pub allowed_bindings: Option<&'a [String]>,
+    pub allowed_hosts: Option<&'a [String]>,
+    pub credential_scheme: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretMetadata {
     pub name: String,
@@ -485,7 +495,8 @@ impl SqliteStore {
     }
 
     /// Store (or rotate) a secret with its destination-host and credential-scheme policy.
-    /// `None` keeps the existing policy value (or the default for a new secret).
+    /// `description` and `allowed_bindings` are set explicitly; `None` for hosts/scheme keeps
+    /// the existing policy value (or the default for a new secret).
     pub fn set_secret_with_policy(
         &self,
         name: &str,
@@ -495,33 +506,92 @@ impl SqliteStore {
         allowed_hosts: Option<&[String]>,
         credential_scheme: Option<&str>,
     ) -> Result<SecretMetadata, StoreError> {
-        if let Some(scheme) = credential_scheme {
+        self.set_secret_value(
+            name,
+            plaintext,
+            SecretPolicyUpdate {
+                description: Some(description),
+                allowed_bindings: Some(allowed_bindings),
+                allowed_hosts,
+                credential_scheme,
+            },
+        )
+    }
+
+    /// Store (or rotate) a secret value, updating only the policy fields `update` names.
+    /// Every `None` field keeps the stored value (or the default for a new secret), so a plain
+    /// value rotation never widens the Administrator's binding/destination policy (§5.2).
+    pub fn set_secret_value(
+        &self,
+        name: &str,
+        plaintext: &str,
+        update: SecretPolicyUpdate<'_>,
+    ) -> Result<SecretMetadata, StoreError> {
+        if let Some(scheme) = update.credential_scheme {
             validate_credential_scheme(scheme).map_err(StoreError::InvalidInput)?;
         }
         let now = Utc::now().to_rfc3339();
-        let allowed_json = serde_json::to_string(allowed_bindings)?;
-        let (key_version, created_at, prev_hosts, prev_scheme) = self.with_conn_sync(|conn| {
-            let existing: Option<(i64, String, String, String)> = conn
+        let (key_version, created_at, prev) = self.with_conn_sync(|conn| {
+            let existing: Option<(i64, String, String, String, String, String)> = conn
                 .query_row(
-                    "SELECT key_version, created_at, allowed_hosts_json, credential_scheme
+                    "SELECT key_version, created_at, allowed_hosts_json, credential_scheme,
+                            description, allowed_bindings_json
                      FROM secret_metadata WHERE name = ?1",
                     params![name],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
             match existing {
-                Some((v, c, h, sc)) => Ok((
+                Some((v, c, h, sc, d, b)) => Ok((
                     v + 1,
                     c,
-                    serde_json::from_str::<Vec<String>>(&h).unwrap_or_default(),
-                    sc,
+                    (
+                        serde_json::from_str::<Vec<String>>(&h).unwrap_or_default(),
+                        sc,
+                        d,
+                        serde_json::from_str::<Vec<String>>(&b).unwrap_or_default(),
+                    ),
                 )),
-                None => Ok((1_i64, now.clone(), Vec::new(), default_credential_scheme())),
+                None => Ok((
+                    1_i64,
+                    now.clone(),
+                    (
+                        Vec::new(),
+                        default_credential_scheme(),
+                        String::new(),
+                        Vec::new(),
+                    ),
+                )),
             }
         })?;
-        let hosts: Vec<String> = allowed_hosts.map(|h| h.to_vec()).unwrap_or(prev_hosts);
-        let scheme: String = credential_scheme.map(str::to_string).unwrap_or(prev_scheme);
+        let (prev_hosts, prev_scheme, prev_description, prev_bindings) = prev;
+        let hosts: Vec<String> = update
+            .allowed_hosts
+            .map(|h| h.to_vec())
+            .unwrap_or(prev_hosts);
+        let scheme: String = update
+            .credential_scheme
+            .map(str::to_string)
+            .unwrap_or(prev_scheme);
+        let description: String = update
+            .description
+            .map(str::to_string)
+            .unwrap_or(prev_description);
+        let allowed_bindings: Vec<String> = update
+            .allowed_bindings
+            .map(|b| b.to_vec())
+            .unwrap_or(prev_bindings);
         let hosts_json = serde_json::to_string(&hosts)?;
+        let allowed_json = serde_json::to_string(&allowed_bindings)?;
         let (nonce, ciphertext) = self.vault.encrypt(name, key_version, plaintext)?;
         self.with_conn_sync(|conn| {
             let tx = conn.unchecked_transaction()?;
@@ -552,9 +622,9 @@ impl SqliteStore {
         })?;
         Ok(SecretMetadata {
             name: name.to_string(),
-            description: description.to_string(),
+            description,
             key_version,
-            allowed_bindings: allowed_bindings.to_vec(),
+            allowed_bindings,
             allowed_hosts: hosts,
             credential_scheme: scheme,
             created_at,
@@ -2477,7 +2547,11 @@ impl SqliteStore {
     ) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         self.with_conn_sync(|conn| {
-            conn.execute(
+            // Replacing the credentials (reset after a suspected compromise, username change)
+            // revokes every browser session in the same transaction, so a stolen session cookie
+            // never outlives the password it was issued under (§14.3).
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO admin_credentials (id, username, password_hash, updated_at)
                  VALUES (1, ?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
@@ -2486,8 +2560,15 @@ impl SqliteStore {
                     updated_at = excluded.updated_at",
                 params![username, password_hash, now],
             )?;
+            tx.execute("DELETE FROM sessions", [])?;
+            tx.commit()?;
             Ok(())
         })
+    }
+
+    /// Revoke every browser session; returns how many were removed.
+    pub fn revoke_all_sessions(&self) -> Result<usize, StoreError> {
+        self.with_conn_sync(|conn| Ok(conn.execute("DELETE FROM sessions", [])?))
     }
 
     pub fn get_admin_credentials(&self) -> Result<Option<(String, String)>, StoreError> {
@@ -3143,6 +3224,74 @@ mod tests {
                 .as_deref(),
             Some("2999-01-01T00:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn rotating_a_secret_value_keeps_bindings_description_and_hosts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let bindings = vec!["github_reader".to_string()];
+        let hosts = vec!["api.github.com".to_string()];
+        store
+            .set_secret_with_policy(
+                "gh",
+                "Work PAT",
+                "v1",
+                &bindings,
+                Some(&hosts),
+                Some("bearer"),
+            )
+            .unwrap();
+        // A plain value rotation names no policy field: everything is preserved.
+        let rotated = store
+            .set_secret_value("gh", "v2", SecretPolicyUpdate::default())
+            .unwrap();
+        assert_eq!(rotated.key_version, 2);
+        assert_eq!(rotated.allowed_bindings, bindings);
+        assert_eq!(rotated.allowed_hosts, hosts);
+        assert_eq!(rotated.description, "Work PAT");
+        let listed = store.list_secrets().unwrap();
+        assert_eq!(listed[0].allowed_bindings, bindings);
+        assert_eq!(listed[0].description, "Work PAT");
+        assert_eq!(store.resolve_secret_plaintext("gh").unwrap().1, "v2");
+        // Widening is explicit.
+        let widened = store
+            .set_secret_value(
+                "gh",
+                "v3",
+                SecretPolicyUpdate {
+                    allowed_bindings: Some(&[]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(widened.allowed_bindings.is_empty());
+        assert_eq!(widened.description, "Work PAT");
+        // A new secret without policy fields gets the defaults.
+        let fresh = store
+            .set_secret_value("new", "x", SecretPolicyUpdate::default())
+            .unwrap();
+        assert!(fresh.allowed_bindings.is_empty() && fresh.description.is_empty());
+    }
+
+    #[test]
+    fn replacing_admin_credentials_revokes_existing_sessions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_admin_credentials("admin", "h1").unwrap();
+        let exp = Utc::now() + chrono::Duration::hours(24);
+        store
+            .create_session("ses_old", "csrf", "admin", exp)
+            .unwrap();
+        assert!(store.validate_session("ses_old").unwrap().is_some());
+        store.set_admin_credentials("newadmin", "h2").unwrap();
+        assert!(
+            store.validate_session("ses_old").unwrap().is_none(),
+            "a session issued under the old credentials must not survive a reset"
+        );
+        store
+            .create_session("ses_new", "csrf", "newadmin", exp)
+            .unwrap();
+        assert_eq!(store.revoke_all_sessions().unwrap(), 1);
+        assert!(store.validate_session("ses_new").unwrap().is_none());
     }
 
     #[test]
