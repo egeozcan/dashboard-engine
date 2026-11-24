@@ -1,0 +1,40 @@
+[package]
+name = "dash-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dash-core = { path = "../dash-core" }
+dash-git = { path = "../dash-git" }
+dash-luau = { path = "../dash-luau" }
+dash-store = { path = "../dash-store" }
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hmac.workspace = true
+mime_guess.workspace = true
+rand.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+tokio-tungstenite = "0.26"

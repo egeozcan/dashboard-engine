@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dash-core",
+    "crates/dash-luau",
+    "crates/dash-store",
+    "crates/dash-git",
+    "crates/dash-server",
+    "apps/dash",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["Universal Dashboard Engine Contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+arc-swap = "1"
+argon2 = "0.5"
+aes-gcm = "0.10"
+async-trait = "0.1"
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+cron = "0.12"
+dashmap = "6"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+lru = "0.12"
+mime_guess = "2"
+mlua = { version = "0.12.3", features = ["luau", "async", "serialize", "send"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
