@@ -60,14 +60,19 @@ export const DashboardView: React.FC = () => {
   }, [activeId]);
 
   const handleDashboardStateChange = async (key: string, value: unknown) => {
+    // Compare-and-swap against the version this view rendered (0 = key not yet stored). On a
+    // conflict nothing is merged: the view reloads to show the other writer's value.
+    const versions = rendered?.dashboard_state_versions;
+    const expected_version = versions ? (versions[key] ?? 0) : undefined;
     try {
       setError(null);
       await apiFetch(`/api/dashboards/${encodeURIComponent(activeId)}/state`, {
         method: "POST",
-        body: JSON.stringify({ key, value }),
+        body: JSON.stringify({ key, value, expected_version }),
       });
       await loadActiveDashboard(activeId);
     } catch (e) {
+      await loadActiveDashboard(activeId);
       setError(String(e));
     }
   };

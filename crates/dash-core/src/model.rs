@@ -330,6 +330,10 @@ pub struct DashboardDoc {
     pub initial_state: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub overrides: BTreeMap<String, LayoutOverride>,
+    /// Declared Dashboard State keys: schema version, value type, size limit and migration
+    /// policy (§8). Keys listed only in `initial_state` are implicitly declared (schema v1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub state_schema: BTreeMap<String, crate::state::StateKeyDeclaration>,
 }
 
 fn default_layout() -> String {

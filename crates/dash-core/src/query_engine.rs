@@ -22,7 +22,7 @@ use crate::http_broker::HttpBroker;
 use crate::model::{
     ConfiguredGraph, DashboardAdapterPlacement, DashboardDoc, InstanceConfig, LoadedDefinition,
 };
-use crate::signal::{compute_keyed_delta, QueryEnvelope, QueryStatus, RetryInfo, SignalHub};
+use crate::signal::{compute_keyed_delta_inferred, QueryEnvelope, QueryStatus, RetryInfo, SignalHub};
 use crate::state::StateManager;
 use crate::telemetry::{
     ExecutionGraphEdge, ExecutionGraphNode, ExecutionGraphSnapshot, Telemetry,
@@ -511,6 +511,34 @@ impl QueryEngine {
         n
     }
 
+    /// Resolve the `query_key` that `query(instance_id, params, principal)` uses, after the same
+    /// existence, category and access checks, without executing anything. Lets consumers
+    /// subscribe to a query's Signal *before* its first computation (no lost updates) and stay
+    /// subscribed when that computation fails.
+    pub fn resolve_query_key(
+        &self,
+        instance_id: &str,
+        params: &serde_json::Value,
+        principal: &Principal,
+    ) -> Result<String, String> {
+        let g = self.graph.load_full();
+        let inst = g
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| format!("data provider instance '{instance_id}' not found"))?;
+        if inst.category != DefinitionCategory::DataProvider
+            && inst.category != DefinitionCategory::Adapter
+        {
+            return Err(format!(
+                "instance '{instance_id}' is '{}', not queryable",
+                inst.category.as_str()
+            ));
+        }
+        check_provider_access(principal, inst).map_err(|e| e.to_string())?;
+        self.query_key_for(&g, inst, params, principal)
+            .ok_or_else(|| format!("definition '{}' missing", inst.definition))
+    }
+
     /// Execute or return cached query result (with singleflight dedup and stale-on-error fallback).
     pub async fn query(
         &self,
@@ -926,6 +954,20 @@ impl QueryEngine {
         }
         self.telemetry.query_misses.fetch_add(1, Ordering::Relaxed);
 
+        // First computation of a subscribed query: subscribers see `loading` (§6.1).
+        if !self.cache.lock().unwrap().contains(&job.query_key) {
+            let _ = self.signals.publish_query(QueryEnvelope::loading(
+                &instance_id,
+                &job.query_key,
+                job.graph.generation_id,
+                job.def
+                    .manifest
+                    .output
+                    .as_ref()
+                    .and_then(|s| s.semantic_type_name().map(|n| n.to_string())),
+            ));
+        }
+
         let run = if let Some(rule) = self.telemetry.take_injected_failure(&instance_id) {
             Err(ProviderFailure {
                 message: format!("injected failure ({}): {}", rule.mode, rule.message),
@@ -1068,7 +1110,7 @@ impl QueryEngine {
                     Some(err_msg.clone()),
                 );
                 env.updated_at = entry.source_updated_at.to_rfc3339();
-                env.retry = retry;
+                env.retry = retry.clone();
                 Some((env, was_fresh))
             } else {
                 None
@@ -1083,7 +1125,23 @@ impl QueryEngine {
                 }
                 Ok(env)
             }
-            None => Err(err_msg),
+            None => {
+                // No last good value: subscribers get an `error` Signal (§6.1).
+                let mut env = QueryEnvelope::error(
+                    instance_id,
+                    &job.query_key,
+                    job.graph.generation_id,
+                    job.def
+                        .manifest
+                        .output
+                        .as_ref()
+                        .and_then(|s| s.semantic_type_name().map(|n| n.to_string())),
+                    err_msg.clone(),
+                );
+                env.retry = retry;
+                let _ = self.signals.publish_query(env);
+                Err(err_msg)
+            }
         }
     }
 
@@ -1226,12 +1284,13 @@ impl QueryEngine {
         }
         self.key_invalidated.remove_if(query_key, |_, t| *t < start_tick);
 
-        // Keyed delta against the version subscribers hold (the previous entry's version).
+        // Order-preserving keyed delta against the version subscribers hold (the previous
+        // entry's version); the row key is inferred (preferring `id`) and carried as `row_key`.
         let delta = match (prev.as_ref(), value.as_array()) {
             (Some(p), Some(new_arr)) => p.value.as_array().and_then(|old_arr| {
-                compute_keyed_delta(old_arr, new_arr, "id")
-                    .filter(|ops| !ops.is_empty())
-                    .map(|ops| {
+                compute_keyed_delta_inferred(old_arr, new_arr, "id")
+                    .filter(|(_, ops)| !ops.is_empty())
+                    .map(|(field, ops)| {
                         let mut d = QueryEnvelope::delta(
                             instance_id,
                             query_key,
@@ -1240,7 +1299,8 @@ impl QueryEngine {
                             version,
                             schema_str.clone(),
                             ops,
-                        );
+                        )
+                        .with_row_key(field);
                         d.status = status;
                         d
                     })
@@ -1260,9 +1320,9 @@ impl QueryEngine {
             return;
         }
         if let Some(d) = &commit.delta {
-            self.signals.publish_query(d.clone());
+            let _ = self.signals.publish_query(d.clone());
         }
-        self.signals.publish_query(commit.snapshot.clone());
+        let _ = self.signals.publish_query(commit.snapshot.clone());
     }
 
     async fn execute_provider_vm(
@@ -1577,6 +1637,158 @@ impl QueryEngine {
             self.propagate_change(&query_key, &[]);
         }
         Ok(commit.snapshot)
+    }
+
+    /// Apply a provider-emitted keyed delta (§6.2) to a cached query.
+    ///
+    /// The provider's monotonic source-local `source_sequence` is verified (duplicates are
+    /// ignored); the delta is applied to the cached value, the version is bumped and the delta is
+    /// published with its `base_version` (the materialized value becomes the resync snapshot).
+    /// On a sequence gap, or when no cached snapshot exists to apply onto, the query is
+    /// resynchronized from a fresh snapshot instead. Requires the Definition to declare
+    /// `updates.push`.
+    pub async fn apply_provider_delta(
+        &self,
+        instance_id: &str,
+        params: &serde_json::Value,
+        principal: &Principal,
+        source_sequence: u64,
+        ops: Vec<crate::signal::DeltaOp>,
+    ) -> Result<crate::signal::ProviderDeltaOutcome, String> {
+        use crate::signal::{ProviderDeltaOutcome, SequenceCheck};
+        let g = self.graph.load_full();
+        let inst = g
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| format!("instance '{instance_id}' not found"))?;
+        let def = g
+            .definitions
+            .get(&inst.definition)
+            .ok_or_else(|| format!("definition '{}' missing", inst.definition))?;
+        if !def.manifest.updates.push {
+            return Err(format!(
+                "definition '{}' does not declare push updates",
+                def.manifest.id
+            ));
+        }
+        let query_key = self.resolve_query_key(instance_id, params, principal)?;
+        let seqs = self.signals.source_sequences();
+
+        let resync_reason = match seqs.check_and_advance(&query_key, source_sequence) {
+            SequenceCheck::Duplicate { last } => {
+                return Ok(ProviderDeltaOutcome::Duplicate {
+                    last_sequence: last,
+                })
+            }
+            SequenceCheck::Gap { expected, got } => Some(format!(
+                "source sequence gap: expected {expected}, got {got}"
+            )),
+            SequenceCheck::Baseline | SequenceCheck::InOrder => None,
+        };
+
+        let applied = if resync_reason.is_none() {
+            let mut cache = self.cache.lock().unwrap();
+            match cache.get_mut(&query_key) {
+                Some(entry) if entry.value.is_array() && !entry.stale => {
+                    let mut rows = entry.value.as_array().cloned().unwrap_or_default();
+                    let key_field = crate::signal::infer_row_key_field(&rows, &[], "id")
+                        .unwrap_or_else(|| "id".to_string());
+                    crate::signal::apply_delta_ops(&mut rows, &ops, &key_field);
+                    let base = entry.version;
+                    // Versions come from the engine-wide monotonic counter (Appendix A.2).
+                    entry.version = self.next_version();
+                    entry.value = serde_json::Value::Array(rows);
+                    entry.updated_at = Utc::now();
+                    entry.source_updated_at = entry.updated_at;
+                    entry.status = QueryStatus::Fresh;
+                    entry.last_error = None;
+                    let delta = QueryEnvelope::delta(
+                        instance_id,
+                        &query_key,
+                        entry.generation_id,
+                        base,
+                        entry.version,
+                        entry.schema.clone(),
+                        ops,
+                    )
+                    .with_row_key(key_field)
+                    .with_source_sequence(source_sequence);
+                    let materialized = QueryEnvelope::snapshot(
+                        instance_id,
+                        &query_key,
+                        entry.generation_id,
+                        entry.version,
+                        QueryStatus::Fresh,
+                        entry.schema.clone(),
+                        entry.value.clone(),
+                        None,
+                    )
+                    .with_updated_at(entry.updated_at);
+                    Some((delta, materialized))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some((delta, materialized)) = applied {
+            let _ = self
+                .signals
+                .publish_delta_with_snapshot(delta.clone(), materialized);
+            // Dynamic dependents of this query observe the change like any other commit.
+            self.propagate_change(&query_key, &[]);
+            return Ok(ProviderDeltaOutcome::Applied(delta));
+        }
+
+        // Resynchronize from a snapshot; the next delta establishes the new sequence baseline.
+        let reason = resync_reason
+            .unwrap_or_else(|| "no cached snapshot to apply the delta onto".to_string());
+        seqs.reset(&query_key, None);
+        let snapshot = self
+            .query(instance_id, params.clone(), principal, true)
+            .await?;
+        Ok(ProviderDeltaOutcome::Resynced { reason, snapshot })
+    }
+
+    /// Release idle query state (§6.1, §20 "no unbounded queues or caches"): expire cached
+    /// entries nobody subscribes to once they are older than the idle expiry (20 x cache TTL),
+    /// release Signal channels past their idle grace period, and prune dependency edges and
+    /// circuit breakers that no longer refer to a live query or Instance. Returns the number of
+    /// expired cache entries. Called periodically by the server's maintenance loop.
+    pub fn prune_idle(&self) -> usize {
+        self.signals.sweep_idle();
+        let g = self.graph.load_full();
+        let expiry = self.cache_ttl * 20;
+        let now = Utc::now();
+        let (expired, live_keys) = {
+            let mut cache = self.cache.lock().unwrap();
+            let idle: Vec<String> = cache
+                .iter()
+                .filter(|(k, e)| {
+                    let age = now
+                        .signed_duration_since(e.updated_at)
+                        .to_std()
+                        .unwrap_or(Duration::MAX);
+                    age >= expiry && !self.signals.is_query_subscribed(k)
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &idle {
+                cache.pop(k);
+            }
+            let live: HashSet<String> = cache.iter().map(|(k, _)| k.clone()).collect();
+            (idle.len(), live)
+        };
+        let is_live = |k: &str| live_keys.contains(k) || self.signals.is_query_subscribed(k);
+        self.forward_deps.retain(|k, _| is_live(k));
+        self.reverse_deps.retain(|_, parents| {
+            parents.retain(|p| is_live(p));
+            !parents.is_empty()
+        });
+        self.circuit_breakers
+            .retain(|inst, _| g.instances.contains_key(inst));
+        expired
     }
 
     /// Mark cached queries for specified instances (and downstream dependents) as stale & refresh active ones.
@@ -2022,7 +2234,10 @@ impl QueryEngine {
             .list_dashboard_state(dashboard_id)
             .map_err(|e| e.to_string())?;
         let mut dash_state = BTreeMap::new();
+        // Per-key record versions so Clients can write with `expected_version` (CAS, §8).
+        let mut dash_state_versions = BTreeMap::new();
         for r in dash_state_recs {
+            dash_state_versions.insert(r.state_key.clone(), r.version);
             dash_state.insert(r.state_key, r.value);
         }
 
@@ -2032,6 +2247,7 @@ impl QueryEngine {
             "layout": dash.layout,
             "generation": g.generation_id,
             "dashboard_state": dash_state,
+            "dashboard_state_versions": dash_state_versions,
             "overrides": dash.overrides,
             "adapters": adapter_trees,
         }))
@@ -3686,6 +3902,7 @@ return R
                         json!(repo),
                     )]),
                     overrides: BTreeMap::new(),
+                    state_schema: BTreeMap::new(),
                 },
             );
         }
@@ -3816,6 +4033,7 @@ return R
                 }],
                 initial_state: BTreeMap::new(),
                 overrides: BTreeMap::new(),
+                state_schema: BTreeMap::new(),
             },
         );
         let budget = ResourceBudget {

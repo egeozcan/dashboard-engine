@@ -514,6 +514,13 @@ impl DraftManager {
                 live_val.issues
             )));
         }
+        // State migrations must be possible before anything is committed (§8).
+        self.engine
+            .state
+            .check_generation_state(&candidate_graph.dashboards)
+            .map_err(|e| {
+                GitError::Workspace(format!("{e}; activation refused, live State preserved"))
+            })?;
 
         // Principal-aware authority (§5.2, §11.3, ADR-0002): every editor of the draft and the
         // activating Principal must hold the secrets / Service principal ceilings the change reaches.
@@ -608,6 +615,28 @@ impl DraftManager {
             .map_err(|e| GitError::Workspace(e.to_string()))?;
         live_graph.generation_id = new_gen_id;
 
+        // Migrate State transactionally and seed defaults before touching the live runtime; a
+        // failed migration rolls back and leaves the live Generation and its State untouched (§8).
+        if let Err(e) = self
+            .engine
+            .state
+            .apply_generation_state(&live_graph.dashboards, new_gen_id, principal)
+        {
+            let _ = self.store.upsert_activation_journal(&ActivationJournalRecord {
+                journal_id: journal_id.clone(),
+                draft_id: draft_id.to_string(),
+                base_revision: active_rev.clone(),
+                target_revision: Some(new_commit.clone()),
+                generation_id: Some(new_gen_id),
+                phase: "failed".into(),
+                error_message: Some(e.to_string()),
+                updated_at: Utc::now().to_rfc3339(),
+            });
+            return Err(GitError::Workspace(format!(
+                "{e}; live Generation preserved"
+            )));
+        }
+
         // Carry over unchanged VMs in VmPool, drop changed ones
         let desired_bundles: Vec<CompiledInstanceBundle> = live_graph
             .instances
@@ -630,9 +659,6 @@ impl DraftManager {
             .engine
             .history
             .sync_series_configs(&live_graph.workspace.history);
-        for dash in live_graph.dashboards.values() {
-            let _ = self.engine.state.seed_dashboard_defaults(dash, new_gen_id);
-        }
 
         // Atomic Generation swap (no partial graph ever visible!)
         self.engine.graph.store(std::sync::Arc::new(live_graph));

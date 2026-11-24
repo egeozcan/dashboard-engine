@@ -47,7 +47,10 @@ pub fn build_router(services: AppServices) -> Router {
         .route("/api/graph", get(graph_handler))
         .route("/api/dashboards", get(dashboards_list_handler))
         .route("/api/dashboards/{id}", get(dashboard_get_handler))
-        .route("/api/dashboards/{id}/state", post(dashboard_state_handler))
+        .route(
+            "/api/dashboards/{id}/state",
+            get(dashboard_state_get_handler).post(dashboard_state_handler),
+        )
         .route("/api/widget-request", post(widget_request_handler))
         .route("/api/queries/{instance_id}", post(query_handler))
         .route("/api/actions/{instance_id}/dry-run", post(action_dry_run_handler))
@@ -303,22 +306,52 @@ async fn dashboard_state_handler(
     Path(id): Path<String>,
     Json(req): Json<SetDashStateReq>,
 ) -> Response {
-    if let Err(r) = auth_or_err(&st, &headers, &Method::POST, peer) {
-        return r;
-    }
-    let gen_id = st.services.graph().generation_id;
-    match st.services.engine().state.set(
-        "dashboard",
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let graph = st.services.graph();
+    match st.services.engine().state.set_dashboard_state(
+        &graph,
+        &p,
         &id,
         &req.key,
-        1,
-        gen_id,
         req.value,
         req.expected_version,
     ) {
         Ok(rec) => Json(rec).into_response(),
-        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => state_error_response(&e),
     }
+}
+
+/// Dashboard State records with their versions (for CAS writes), for Principals that may read
+/// the dashboard.
+async fn dashboard_state_get_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let graph = st.services.graph();
+    match st
+        .services
+        .engine()
+        .state
+        .list_dashboard_state_for(&graph, &p, &id)
+    {
+        Ok(records) => Json(json!({ "dashboard_id": id, "records": records })).into_response(),
+        Err(e) => state_error_response(&e),
+    }
+}
+
+fn state_error_response(e: &dash_core::state::StateError) -> Response {
+    let status =
+        StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(json!({ "error": e.to_string(), "code": e.code() }))).into_response()
 }
 
 async fn widget_request_handler(

@@ -24,6 +24,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("state CAS version conflict: expected {expected}, actual {actual}")]
     CasConflict { expected: i64, actual: i64 },
+    #[error("state value too large: {size} bytes exceeds the {limit}-byte limit")]
+    StateTooLarge { size: usize, limit: usize },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("blocking task join error: {0}")]
@@ -44,6 +46,29 @@ pub struct StateRecord {
     pub generation_id: i64,
     pub value: serde_json::Value,
     pub updated_at: String,
+}
+
+/// Default per-record size limit for persisted State values (encoded JSON bytes, §8).
+///
+/// Applies to every write that does not carry a declared limit. Chosen to comfortably fit
+/// cursors, checkpoints and synchronized mappings while keeping a single record bounded.
+pub const DEFAULT_STATE_MAX_BYTES: usize = 256 * 1024;
+
+/// Absolute ceiling for any declared State size limit.
+pub const HARD_STATE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// One step of a transactional State migration (see [`SqliteStore::apply_state_migrations`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StateMigrationStep {
+    pub scope: String,
+    pub owner: String,
+    pub state_key: String,
+    /// The record version the plan was computed against (CAS).
+    pub expected_version: i64,
+    pub new_schema_version: i64,
+    pub generation_id: i64,
+    /// New value, or `None` to remove the record.
+    pub new_value: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,7 +589,37 @@ impl SqliteStore {
         })
     }
 
+    /// List every State record of one scope (e.g. all Dashboard State, for migration planning).
+    pub fn list_state_for_scope(&self, scope: &str) -> Result<Vec<StateRecord>, StoreError> {
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT scope, owner, state_key, schema_version, version, generation_id, encoded_value, updated_at
+                 FROM state_values WHERE scope = ?1 ORDER BY owner ASC, state_key ASC",
+            )?;
+            let rows = stmt.query_map(params![scope], |r| {
+                let raw: String = r.get(6)?;
+                Ok(StateRecord {
+                    scope: r.get(0)?,
+                    owner: r.get(1)?,
+                    state_key: r.get(2)?,
+                    schema_version: r.get(3)?,
+                    version: r.get(4)?,
+                    generation_id: r.get(5)?,
+                    value: serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null),
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Compare-and-swap state update. Pass `expected_version: None` to upsert unconditionally.
+    /// Values larger than [`DEFAULT_STATE_MAX_BYTES`] are rejected.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_state(
         &self,
         scope: &str,
@@ -575,8 +630,41 @@ impl SqliteStore {
         value: serde_json::Value,
         expected_version: Option<i64>,
     ) -> Result<StateRecord, StoreError> {
+        self.set_state_with_limit(
+            scope,
+            owner,
+            state_key,
+            schema_version,
+            generation_id,
+            value,
+            expected_version,
+            DEFAULT_STATE_MAX_BYTES,
+        )
+    }
+
+    /// [`Self::set_state`] with an explicit per-record size limit (capped at
+    /// [`HARD_STATE_MAX_BYTES`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_state_with_limit(
+        &self,
+        scope: &str,
+        owner: &str,
+        state_key: &str,
+        schema_version: i64,
+        generation_id: i64,
+        value: serde_json::Value,
+        expected_version: Option<i64>,
+        max_bytes: usize,
+    ) -> Result<StateRecord, StoreError> {
         let now = Utc::now().to_rfc3339();
         let encoded = serde_json::to_string(&value)?;
+        let limit = max_bytes.min(HARD_STATE_MAX_BYTES);
+        if encoded.len() > limit {
+            return Err(StoreError::StateTooLarge {
+                size: encoded.len(),
+                limit,
+            });
+        }
         self.with_conn_sync(|conn| {
             let tx = conn.unchecked_transaction()?;
             let current: Option<i64> = tx
@@ -635,6 +723,130 @@ impl SqliteStore {
                 value,
                 updated_at: now,
             })
+        })
+    }
+
+    /// Insert a State record only if none exists (atomic; never overwrites a concurrent write).
+    /// Returns the inserted record, or `None` when a record was already present.
+    pub fn insert_state_if_absent(
+        &self,
+        scope: &str,
+        owner: &str,
+        state_key: &str,
+        schema_version: i64,
+        generation_id: i64,
+        value: serde_json::Value,
+    ) -> Result<Option<StateRecord>, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let encoded = serde_json::to_string(&value)?;
+        if encoded.len() > HARD_STATE_MAX_BYTES {
+            return Err(StoreError::StateTooLarge {
+                size: encoded.len(),
+                limit: HARD_STATE_MAX_BYTES,
+            });
+        }
+        self.with_conn_sync(|conn| {
+            let inserted = conn.execute(
+                "INSERT INTO state_values (scope, owner, state_key, schema_version, version, generation_id, encoded_value, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)
+                 ON CONFLICT(scope, owner, state_key) DO NOTHING",
+                params![scope, owner, state_key, schema_version, generation_id, encoded, now],
+            )?;
+            if inserted == 0 {
+                return Ok(None);
+            }
+            Ok(Some(StateRecord {
+                scope: scope.to_string(),
+                owner: owner.to_string(),
+                state_key: state_key.to_string(),
+                schema_version,
+                version: 1,
+                generation_id,
+                value,
+                updated_at: now,
+            }))
+        })
+    }
+
+    /// Apply State migration steps in ONE SQLite transaction: every step is version-checked
+    /// (CAS) and either all steps commit or none do, leaving live State untouched (§8).
+    /// Returns the resulting records (`None` for removed records), in step order.
+    pub fn apply_state_migrations(
+        &self,
+        steps: &[StateMigrationStep],
+    ) -> Result<Vec<Option<StateRecord>>, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn_sync(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut out = Vec::with_capacity(steps.len());
+            for step in steps {
+                let current: Option<i64> = tx
+                    .query_row(
+                        "SELECT version FROM state_values WHERE scope = ?1 AND owner = ?2 AND state_key = ?3",
+                        params![step.scope, step.owner, step.state_key],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let actual = current.unwrap_or(0);
+                if actual != step.expected_version {
+                    // Dropping `tx` without commit rolls back every earlier step.
+                    return Err(StoreError::CasConflict {
+                        expected: step.expected_version,
+                        actual,
+                    });
+                }
+                match &step.new_value {
+                    Some(value) => {
+                        let encoded = serde_json::to_string(value)?;
+                        if encoded.len() > HARD_STATE_MAX_BYTES {
+                            return Err(StoreError::StateTooLarge {
+                                size: encoded.len(),
+                                limit: HARD_STATE_MAX_BYTES,
+                            });
+                        }
+                        let next_version = actual + 1;
+                        tx.execute(
+                            "INSERT INTO state_values (scope, owner, state_key, schema_version, version, generation_id, encoded_value, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                             ON CONFLICT(scope, owner, state_key) DO UPDATE SET
+                                schema_version = excluded.schema_version,
+                                version = excluded.version,
+                                generation_id = excluded.generation_id,
+                                encoded_value = excluded.encoded_value,
+                                updated_at = excluded.updated_at",
+                            params![
+                                step.scope,
+                                step.owner,
+                                step.state_key,
+                                step.new_schema_version,
+                                next_version,
+                                step.generation_id,
+                                encoded,
+                                now
+                            ],
+                        )?;
+                        out.push(Some(StateRecord {
+                            scope: step.scope.clone(),
+                            owner: step.owner.clone(),
+                            state_key: step.state_key.clone(),
+                            schema_version: step.new_schema_version,
+                            version: next_version,
+                            generation_id: step.generation_id,
+                            value: value.clone(),
+                            updated_at: now.clone(),
+                        }));
+                    }
+                    None => {
+                        tx.execute(
+                            "DELETE FROM state_values WHERE scope = ?1 AND owner = ?2 AND state_key = ?3",
+                            params![step.scope, step.owner, step.state_key],
+                        )?;
+                        out.push(None);
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(out)
         })
     }
 
@@ -1876,6 +2088,70 @@ mod tests {
             .set_state("dashboard", "engineering", "selected_repo", 1, 1, json!("acme/stale"), Some(1))
             .unwrap_err();
         assert!(matches!(err, StoreError::CasConflict { expected: 1, actual: 2 }));
+    }
+
+    #[test]
+    fn test_state_size_limit_and_insert_if_absent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let big = json!("x".repeat(DEFAULT_STATE_MAX_BYTES + 1));
+        let err = store
+            .set_state("instance", "p", "k", 1, 1, big, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::StateTooLarge { .. }));
+        let err = store
+            .set_state_with_limit("dashboard", "d", "k", 1, 1, json!("abcdef"), None, 4)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::StateTooLarge { limit: 4, .. }));
+
+        let seeded = store
+            .insert_state_if_absent("dashboard", "d", "repo", 1, 1, json!("a"))
+            .unwrap();
+        assert_eq!(seeded.unwrap().version, 1);
+        store
+            .set_state("dashboard", "d", "repo", 1, 1, json!("client-write"), Some(1))
+            .unwrap();
+        // Seeding again never overwrites the concurrent write.
+        assert!(store
+            .insert_state_if_absent("dashboard", "d", "repo", 1, 1, json!("a"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_state("dashboard", "d", "repo").unwrap().unwrap().value,
+            json!("client-write")
+        );
+    }
+
+    #[test]
+    fn test_state_migrations_are_transactional() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.set_state("dashboard", "d", "a", 1, 1, json!(1), None).unwrap();
+        store.set_state("dashboard", "d", "b", 1, 1, json!(2), None).unwrap();
+        let step = |key: &str, expected: i64, v: Option<serde_json::Value>| StateMigrationStep {
+            scope: "dashboard".into(),
+            owner: "d".into(),
+            state_key: key.into(),
+            expected_version: expected,
+            new_schema_version: 2,
+            generation_id: 2,
+            new_value: v,
+        };
+        // Second step has a stale expected version: nothing is applied.
+        let err = store
+            .apply_state_migrations(&[step("a", 1, Some(json!(10))), step("b", 7, None)])
+            .unwrap_err();
+        assert!(matches!(err, StoreError::CasConflict { expected: 7, actual: 1 }));
+        let a = store.get_state("dashboard", "d", "a").unwrap().unwrap();
+        assert_eq!((a.value, a.schema_version, a.version), (json!(1), 1, 1));
+
+        let out = store
+            .apply_state_migrations(&[step("a", 1, Some(json!(10))), step("b", 1, None)])
+            .unwrap();
+        assert_eq!(out[0].as_ref().unwrap().schema_version, 2);
+        assert!(out[1].is_none());
+        let a = store.get_state("dashboard", "d", "a").unwrap().unwrap();
+        assert_eq!((a.value, a.schema_version, a.version), (json!(10), 2, 2));
+        assert!(store.get_state("dashboard", "d", "b").unwrap().is_none());
+        assert_eq!(store.list_state_for_scope("dashboard").unwrap().len(), 1);
     }
 
     #[test]
