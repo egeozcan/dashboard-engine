@@ -61,6 +61,7 @@ fn ops_dashboard(title: &str) -> dash_core::DashboardDoc {
         adapters: vec![],
         initial_state: Default::default(),
         overrides: Default::default(),
+        state_schema: Default::default(),
     }
 }
 
@@ -460,13 +461,14 @@ async fn replacement_instances_are_prepared_before_commit() {
     let admin = Principal::administrator();
     let head = mgr.active_revision().await.unwrap();
     let d = mgr.draft_begin(&admin).await.unwrap();
-    // Valid declaration whose runtime module never finishes loading (exceeds the budget)
+    // Valid declaration whose runtime module never finishes loading (exceeds the budget). The
+    // declared handler must be defined in the module, or loading fails before VM preparation.
     mgr.draft_write_definition(
         &d.draft_id,
         "engineering",
         "spin",
         r#"local dash = require("dash"); return dash.data_provider { id = "engineering.spin", handler = "query" }"#,
-        Some("local n = 0\nwhile true do n = n + 1 end\nreturn {}\n"),
+        Some("local R = {}\nfunction R.query(ctx) return {} end\nlocal n = 0\nwhile true do n = n + 1 end\nreturn R\n"),
         None,
     )
     .unwrap();
