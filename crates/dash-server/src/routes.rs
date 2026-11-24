@@ -89,6 +89,8 @@ pub fn build_router(services: AppServices) -> Router {
         .route("/api/service-principals/{id}/grant", post(sp_grant_handler))
         .route("/api/workspace/reload", post(workspace_reload_handler))
         .route("/api/doctor", get(doctor_handler))
+        .route("/api/network-policy", get(network_policy_status_handler))
+        .route("/api/network-policy/grant", post(network_policy_grant_handler))
         .with_state(state.clone());
 
     Router::new()
@@ -1149,6 +1151,63 @@ async fn workspace_reload_handler(
     match st.services.workspace_reload(&p).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+/// Administrator network ceiling status (requested Workspace policy vs. granted ceiling).
+async fn network_policy_status_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::GET, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !p.ceiling.unrestricted {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "only the Administrator may inspect the network ceiling" })),
+        )
+            .into_response();
+    }
+    Json(st.services.network_policy_status()).into_response()
+}
+
+#[derive(Deserialize)]
+struct NetworkGrantReq {
+    #[serde(default)]
+    policy: Option<dash_core::NetworkPolicy>,
+    /// Grant exactly the policy the active Workspace requests in `dashboard.toml`.
+    #[serde(default)]
+    from_workspace: bool,
+}
+
+/// Grant the Administrator network ceiling (`dash network grant` against a running daemon).
+async fn network_policy_grant_handler(
+    State(st): State<ServerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<NetworkGrantReq>,
+) -> Response {
+    let p = match auth_or_err(&st, &headers, &Method::POST, peer) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let policy = match (req.policy, req.from_workspace) {
+        (Some(policy), false) => policy,
+        (None, true) => st.services.graph().workspace.network.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "pass either 'policy' or 'from_workspace: true'" })),
+            )
+                .into_response()
+        }
+    };
+    match st.services.network_policy_grant(policy, &p) {
+        Ok(()) => Json(st.services.network_policy_status()).into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
     }
 }
 
