@@ -1294,14 +1294,25 @@ impl AppServices {
         dashboard_id: &str,
         principal: &Principal,
     ) -> Result<serde_json::Value, String> {
+        self.dashboard_get_in(self.graph(), dashboard_id, principal)
+            .await
+    }
+
+    /// Render and document from one Generation snapshot: a concurrent activation never mixes
+    /// the old render with the new document (no visible partial state, §12.2 step 7).
+    async fn dashboard_get_in(
+        &self,
+        g: Arc<ConfiguredGraph>,
+        dashboard_id: &str,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
         let rendered = self
             .engine()
             .queries
-            .render_dashboard(dashboard_id, principal)
+            .render_dashboard_in(Arc::clone(&g), dashboard_id, principal)
             .await?;
         // Widget Requests are accepted only for widget_ids of the current render (Appendix A.3)
         self.engine().actions.record_rendered_dashboard(&rendered);
-        let g = self.graph();
         let doc = g.dashboards.get(dashboard_id).cloned();
         Ok(serde_json::json!({
             "document": doc,
@@ -2242,8 +2253,10 @@ impl AppServices {
         dashboard_id: &str,
         principal: &Principal,
     ) -> Result<serde_json::Value, String> {
-        let mut data = self.dashboard_get(dashboard_id, principal).await?;
         let g = self.graph();
+        let mut data = self
+            .dashboard_get_in(Arc::clone(&g), dashboard_id, principal)
+            .await?;
         if let Some(rendered) = data.get_mut("rendered") {
             annotate_widget_asset_urls(&g, rendered);
         }
