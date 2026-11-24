@@ -425,7 +425,24 @@ impl HostBridge for MockTestBridge {
             q.validate_value(&params)
                 .map_err(|e| format!("invalid query parameters for '{def_id}': {e}"))?;
         }
-        let val = self
+        // The built-in history provider has no Luau runtime and no Mock. A Definition test has
+        // recorded no samples, so it serves an empty series (after checking its parameters).
+        if def_id == "dash.history_series" {
+            let accepted = match &params {
+                serde_json::Value::Null => true,
+                serde_json::Value::Object(m) => m
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "series_id" | "params" | "since" | "limit")),
+                _ => false,
+            };
+            if !accepted {
+                return Err(format!(
+                    "invalid query parameters for 'dash.history_series': {params} (allowed: series_id, params, since, limit)"
+                ));
+            }
+            return Ok(serde_json::json!([]));
+        }
+        let mut val = self
             .run_nested(
                 &target,
                 DefinitionCategory::DataProvider,
@@ -436,6 +453,7 @@ impl HostBridge for MockTestBridge {
             )
             .await?;
         if let Some(ref out) = target.manifest.output {
+            out.normalize_empty_tables(&mut val);
             out.validate_value(&val)
                 .map_err(|e| format!("output contract violation on '{def_id}': {e}"))?;
         }
@@ -1376,11 +1394,11 @@ mod mock_test_bridge_tests {
             assert_eq!(r.failed, 0, "definition test failed: {r:?}");
         }
         // connector input -> github.mock fixtures (and Mock state within one test)
-        // 3 Mock-backed cases + 6 self-contained reconcile/dry_run/execute cases
-        assert_eq!(report_for(&reports, "github.merge_pr").passed, 9);
-        assert_eq!(report_for(&reports, "github.pull_requests").passed, 2);
+        // 5 Mock-backed cases + 5 self-contained reconcile/dry_run/execute cases
+        assert_eq!(report_for(&reports, "github.merge_pr").passed, 10);
+        assert_eq!(report_for(&reports, "github.pull_requests").passed, 4);
         // data inputs -> providers -> Mocks
-        assert_eq!(report_for(&reports, "engineering.linked_prs").passed, 2);
+        assert_eq!(report_for(&reports, "engineering.linked_prs").passed, 3);
         // adapter -> data provider -> providers -> Mocks
         assert_eq!(
             report_for(&reports, "engineering.pr_table_adapter").passed,

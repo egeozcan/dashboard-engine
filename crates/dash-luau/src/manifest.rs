@@ -211,6 +211,45 @@ impl SchemaSpec {
         self.validate_at("$", val)
     }
 
+    /// Luau has a single table type, so an empty Luau array crosses the boundary as `{}`. Where
+    /// this schema declares a list, rewrite such empty objects to `[]` (recursively) before
+    /// validation, so a provider returning "no rows" satisfies its own `dash.list` contract.
+    pub fn normalize_empty_tables(&self, val: &mut serde_json::Value) {
+        match self {
+            Self::List { item } => {
+                if val.as_object().is_some_and(|o| o.is_empty()) {
+                    *val = serde_json::Value::Array(Vec::new());
+                }
+                if let Some(arr) = val.as_array_mut() {
+                    for elem in arr {
+                        item.normalize_empty_tables(elem);
+                    }
+                }
+            }
+            Self::Optional { inner } => inner.normalize_empty_tables(val),
+            Self::Map { value } => {
+                if let Some(obj) = val.as_object_mut() {
+                    for v in obj.values_mut() {
+                        value.normalize_empty_tables(v);
+                    }
+                }
+            }
+            Self::Object { fields } => {
+                if let Some(obj) = val.as_object_mut() {
+                    for (k, field_schema) in fields {
+                        if let Some(v) = obj.get_mut(k) {
+                            field_schema.normalize_empty_tables(v);
+                        }
+                    }
+                }
+            }
+            Self::Semantic {
+                shape: Some(inner), ..
+            } => inner.normalize_empty_tables(val),
+            _ => {}
+        }
+    }
+
     fn validate_at(&self, path: &str, val: &serde_json::Value) -> Result<(), String> {
         match self {
             Self::Any => Ok(()),
@@ -749,6 +788,44 @@ pub fn build_semantic_registry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_luau_tables_become_lists_where_the_schema_declares_lists() {
+        let schema = SchemaSpec::List {
+            item: Box::new(SchemaSpec::Object {
+                fields: [(
+                    "tags".to_string(),
+                    SchemaSpec::List {
+                        item: Box::new(SchemaSpec::String),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+        };
+        let mut top = serde_json::json!({});
+        schema.normalize_empty_tables(&mut top);
+        assert_eq!(top, serde_json::json!([]));
+        assert!(schema.validate_value(&top).is_ok());
+
+        let mut nested = serde_json::json!([{ "tags": {} }, { "tags": ["a"] }]);
+        schema.normalize_empty_tables(&mut nested);
+        assert_eq!(
+            nested,
+            serde_json::json!([{ "tags": [] }, { "tags": ["a"] }])
+        );
+
+        // Maps and objects keep `{}`; non-empty objects are not reinterpreted as lists.
+        let map = SchemaSpec::Map {
+            value: Box::new(SchemaSpec::Any),
+        };
+        let mut m = serde_json::json!({});
+        map.normalize_empty_tables(&mut m);
+        assert_eq!(m, serde_json::json!({}));
+        let mut not_list = serde_json::json!({ "a": 1 });
+        schema.normalize_empty_tables(&mut not_list);
+        assert!(schema.validate_value(&not_list).is_err());
+    }
 
     fn obj(fields: &[(&str, SchemaSpec)]) -> SchemaSpec {
         SchemaSpec::Object {

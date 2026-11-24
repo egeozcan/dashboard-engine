@@ -252,6 +252,10 @@ struct PooledVm {
     last_used: Instant,
     /// Executions queued on or running in this VM.
     in_flight: Arc<AtomicUsize>,
+    /// Admission token for top-level executions of this Instance (one at a time). Executions
+    /// queued behind a busy Instance wait here, before taking a pool-wide permit, so a runaway
+    /// Instance with a deep queue cannot hold every permit and stall unrelated Instances (§15.3).
+    admission: Arc<tokio::sync::Semaphore>,
     /// Protected behind an async mutex so only one coroutine executes in a given VM at a time,
     /// while multiple Instances execute fully concurrently across blocking pool threads.
     lua: Arc<tokio::sync::Mutex<Lua>>,
@@ -261,6 +265,7 @@ struct VmHandle {
     vm_uid: String,
     lua: Arc<tokio::sync::Mutex<Lua>>,
     in_flight: Arc<AtomicUsize>,
+    admission: Arc<tokio::sync::Semaphore>,
     started: bool,
     startup: Duration,
 }
@@ -533,6 +538,7 @@ impl VmPool {
                     idle_ttl,
                     last_used: Instant::now(),
                     in_flight: Arc::new(AtomicUsize::new(0)),
+                    admission: Arc::new(tokio::sync::Semaphore::new(1)),
                     lua: Arc::new(tokio::sync::Mutex::new(lua)),
                 },
             ));
@@ -570,6 +576,7 @@ impl VmPool {
             pool.counters.vm_starts.fetch_add(1, Ordering::Relaxed);
             let vm_arc = Arc::new(tokio::sync::Mutex::new(lua));
             let in_flight = Arc::new(AtomicUsize::new(0));
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
             let uid = format!("vm_{}", Uuid::now_v7().simple());
             Ok((
                 PooledVm {
@@ -580,12 +587,14 @@ impl VmPool {
                     idle_ttl: budget.idle_ttl,
                     last_used: Instant::now(),
                     in_flight: Arc::clone(&in_flight),
+                    admission: Arc::clone(&admission),
                     lua: Arc::clone(&vm_arc),
                 },
                 VmHandle {
                     vm_uid: uid,
                     lua: vm_arc,
                     in_flight,
+                    admission,
                     started: true,
                     startup,
                 },
@@ -604,6 +613,7 @@ impl VmPool {
                         vm_uid: v.vm_uid.clone(),
                         lua: Arc::clone(&v.lua),
                         in_flight: Arc::clone(&v.in_flight),
+                        admission: Arc::clone(&v.admission),
                         started: false,
                         startup: Duration::ZERO,
                     });
@@ -727,6 +737,34 @@ impl VmPool {
             queue_deadline = queue_deadline.min(d);
         }
         let queue_deadline_tokio = tokio::time::Instant::from_std(queue_deadline);
+
+        // Per-Instance admission first: top-level executions queued behind a busy (possibly
+        // runaway) Instance wait on that Instance alone and hold no pool-wide permit meanwhile.
+        // Nested executions skip it (their caller already holds a permit), so a parent waiting
+        // on a child never waits behind the child's own top-level queue.
+        let _admission = if inherited_deadline.is_none() {
+            match tokio::time::timeout_at(
+                queue_deadline_tokio,
+                Arc::clone(&vm.admission).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => Some(p),
+                Ok(Err(_)) => {
+                    return Err(RuntimeError::QueueFull(
+                        "instance admission queue closed".into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(RuntimeError::QueueFull(format!(
+                        "instance '{}' VM busy for longer than {:?}",
+                        bundle.instance_id, budget.queue_timeout
+                    )))
+                }
+            }
+        } else {
+            None
+        };
 
         // Pool-wide admission for top-level executions. Nested executions ride on their caller's
         // permit, so a parent waiting on a child can never starve the child of a permit.
@@ -986,6 +1024,17 @@ pub(crate) fn new_sandbox_lua(memory_limit_bytes: usize) -> Result<Lua, mlua::Er
         | StdLib::VECTOR;
     let lua = Lua::new_with(libs, LuaOptions::default())?;
     lua.set_memory_limit(memory_limit_bytes)?;
+    // §3.2: no dynamic code loading. Everything a VM runs must come from the content-digested
+    // Definition/Library sources, so `loadstring` (always present in the Luau base library) is
+    // replaced by a denial.
+    lua.globals().set(
+        "loadstring",
+        lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<()> {
+            Err(mlua::Error::runtime(
+                "SANDBOX_DENIED: loadstring is unavailable (no dynamic code loading)",
+            ))
+        })?,
+    )?;
     Ok(lua)
 }
 
@@ -1381,6 +1430,62 @@ return R
             )
             .await;
         assert!(third.is_ok(), "{third:?}");
+    }
+
+    /// §15.3 failure isolation: executions queued behind one busy Instance must not occupy the
+    /// pool-wide permits, or a runaway Instance with a deep queue stalls every other Instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_executions_of_a_busy_instance_hold_no_pool_permits() {
+        let pool = VmPool::new(ResourceBudget {
+            max_concurrent_executions: 2,
+            ..budget(5_000)
+        });
+        let slow = probe(600);
+        let busy = bundle("busy", DP_DECL, AWAIT_RT);
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            let (p, b, br) = (pool.clone(), busy.clone(), slow.clone());
+            queued.push(tokio::spawn(async move {
+                p.execute_handler(
+                    &b,
+                    "query",
+                    cfg(DefinitionCategory::DataProvider, "busy", &["up"], br),
+                    None,
+                )
+                .await
+            }));
+        }
+        // All four are admitted to the busy Instance (one running, three queued).
+        let t0 = Instant::now();
+        while pool.metrics().queued_or_running < 4 || slow.seen_deadlines.lock().unwrap().is_empty()
+        {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "busy executions never queued"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let other = bundle(
+            "other",
+            "local dash = require(\"dash\")\nreturn dash.data_provider { id = \"t.other\" }",
+            "local R = {}\nfunction R.query(ctx) return 7 end\nreturn R",
+        );
+        let res = pool
+            .execute_handler(
+                &other,
+                "query",
+                cfg(DefinitionCategory::DataProvider, "other", &[], probe(0)),
+                None,
+            )
+            .await;
+        assert_eq!(res.unwrap(), json!(7));
+        assert!(
+            queued.iter().all(|h| !h.is_finished()),
+            "the unrelated Instance had to wait for the busy Instance to finish"
+        );
+        for h in queued {
+            assert!(h.await.unwrap().is_ok());
+        }
     }
 
     #[tokio::test]

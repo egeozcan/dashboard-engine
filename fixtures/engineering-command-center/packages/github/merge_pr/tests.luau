@@ -64,11 +64,25 @@ local function only_reads(calls)
     return true
 end
 
-dash.test("merge_pr exposes execute, dry_run, and reconcile handlers", function(make_ctx)
-    local _ = make_ctx({ args = { repository = "acme/platform", number = 42 } })
-    dash.assert(type(Runtime.execute) == "function", "execute missing")
-    dash.assert(type(Runtime.dry_run) == "function", "dry_run missing")
-    dash.assert(type(Runtime.reconcile) == "function", "reconcile missing")
+dash.test("after a Mock merge, dry_run reports the PR infeasible with an explanation", function(make_ctx)
+    local ctx = make_ctx({ args = { repository = "acme/platform", number = 43 } })
+    dash.assert(Runtime.dry_run(ctx).feasible == true, "PR 43 starts open")
+    local res = Runtime.execute(ctx)
+    dash.assert_eq(res, { merged = true, sha = "mocksha_43" }, "typed merge result from the Mock")
+    local report = Runtime.dry_run(ctx)
+    dash.assert(report.feasible == false, "a merged PR cannot be merged again")
+    dash.assert_eq(report.warnings, { "PR is currently in state 'merged'" }, "infeasibility warning")
+    dash.assert_eq(report.preconditions[1].actual, "merged", "observed precondition")
+    -- Other PRs are untouched by the merge.
+    local other = make_ctx({ args = { repository = "acme/platform", number = 42 } })
+    dash.assert_eq(Runtime.reconcile(other).status, "unknown", "PR 42 still open")
+end)
+
+dash.test("dry_run of a PR the Mock does not know fails instead of reporting feasible", function(make_ctx)
+    local ctx = make_ctx({ args = { repository = "acme/platform", number = 999 } })
+    local ok, err = pcall(Runtime.dry_run, ctx)
+    dash.assert(not ok, "unknown PR must not be feasible")
+    dash.assert(string.find(tostring(err), "not found", 1, true) ~= nil, tostring(err))
 end)
 
 dash.test("reconcile reports succeeded once the PR is merged", function(_make_ctx)

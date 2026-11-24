@@ -609,9 +609,13 @@ impl QueryEngine {
             call_stack,
             parent_query_key,
             WaitCtx::default(),
+            None,
         ))
     }
 
+    /// `pinned` is the Generation snapshot of a calling computation: dependency queries resolve
+    /// against the caller's graph, never against a Generation activated mid-computation, so no
+    /// result mixes two Generations (§12.2 "no partial graph visible during activation").
     #[allow(clippy::too_many_arguments)]
     async fn query_inner(
         &self,
@@ -622,8 +626,10 @@ impl QueryEngine {
         mut call_stack: Vec<String>,
         parent_query_key: Option<String>,
         wait: WaitCtx,
+        pinned: Option<Arc<ConfiguredGraph>>,
     ) -> Result<QueryEnvelope, String> {
-        let g = self.graph.load_full();
+        let live_generation = self.graph.load().generation_id;
+        let g = pinned.unwrap_or_else(|| self.graph.load_full());
         let inst = g
             .instances
             .get(instance_id)
@@ -703,10 +709,17 @@ impl QueryEngine {
             query_key: query_key.clone(),
             call_stack,
         });
+        // A computation pinned to a superseded Generation never shares a flight with the live
+        // Generation (an unchanged Definition keeps its query key across Generations).
+        let flight_key = if g.generation_id == live_generation {
+            query_key.clone()
+        } else {
+            format!("{query_key}@generation:{}", g.generation_id)
+        };
         let engine = self.clone();
         self.join_or_lead(
             &self.in_flight,
-            &query_key,
+            &flight_key,
             instance_id,
             not_before,
             &wait,
@@ -863,16 +876,42 @@ impl QueryEngine {
         params: &serde_json::Value,
         principal: &Principal,
     ) -> Result<QueryEnvelope, String> {
-        let series_id = inst
-            .config
-            .get("series_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
+        // Configured series: `series_id` (one) and/or `series_ids` (several, e.g. one sampled
+        // series per repository); a query can only ever reach these.
+        let mut configured: Vec<&str> = Vec::new();
+        if let Some(v) = inst.config.get("series_id") {
+            configured.push(v.as_str().ok_or_else(|| {
                 format!(
-                    "history_series Instance '{}' has no configured 'series_id'",
+                    "history_series Instance '{}': 'series_id' must be a string",
+                    inst.id
+                )
+            })?);
+        }
+        if let Some(v) = inst.config.get("series_ids") {
+            let arr = v.as_array().ok_or_else(|| {
+                format!(
+                    "history_series Instance '{}': 'series_ids' must be a list",
                     inst.id
                 )
             })?;
+            for item in arr {
+                let id = item.as_str().ok_or_else(|| {
+                    format!(
+                        "history_series Instance '{}': 'series_ids' must hold strings",
+                        inst.id
+                    )
+                })?;
+                if !configured.contains(&id) {
+                    configured.push(id);
+                }
+            }
+        }
+        if configured.is_empty() {
+            return Err(format!(
+                "history_series Instance '{}' has no configured 'series_id'",
+                inst.id
+            ));
+        }
         let empty = serde_json::Map::new();
         let obj = match params {
             serde_json::Value::Null => &empty,
@@ -881,23 +920,72 @@ impl QueryEngine {
         };
         if let Some(unknown) = obj
             .keys()
-            .find(|k| !matches!(k.as_str(), "series_id" | "since" | "limit"))
+            .find(|k| !matches!(k.as_str(), "series_id" | "params" | "since" | "limit"))
         {
             return Err(format!(
-                "history_series query does not accept parameter '{unknown}' (allowed: series_id, since, limit)"
+                "history_series query does not accept parameter '{unknown}' (allowed: series_id, params, since, limit)"
             ));
         }
-        if let Some(requested) = obj.get("series_id") {
-            let requested = requested
-                .as_str()
-                .ok_or_else(|| "history_series 'series_id' must be a string".to_string())?;
-            if requested != series_id {
-                return Err(format!(
-                    "history_series Instance '{}' serves series '{series_id}', not '{requested}'",
-                    inst.id
-                ));
+        let serves = || {
+            format!(
+                "history_series Instance '{}' serves series {}",
+                inst.id,
+                configured
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let series_id: Option<&str> = match (obj.get("series_id"), obj.get("params")) {
+            (Some(_), Some(_)) => {
+                return Err("history_series query takes 'series_id' or 'params', not both".into())
             }
-        }
+            (Some(requested), None) => {
+                let requested = requested
+                    .as_str()
+                    .ok_or_else(|| "history_series 'series_id' must be a string".to_string())?;
+                if !configured.contains(&requested) {
+                    return Err(format!("{}, not '{requested}'", serves()));
+                }
+                Some(requested)
+            }
+            // Select the configured series whose sampled query parameters include `params`
+            // (e.g. `{repository = "acme/payments"}`); none sampled means no history: `[]`.
+            (None, Some(selector)) => {
+                let selector = selector
+                    .as_object()
+                    .ok_or_else(|| "history_series 'params' must be an object".to_string())?;
+                let matching: Vec<&str> = configured
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        g.workspace
+                            .history
+                            .iter()
+                            .find(|h| h.series_id == *id)
+                            .and_then(|h| h.params.as_object())
+                            .is_some_and(|sampled| {
+                                selector.iter().all(|(k, v)| sampled.get(k) == Some(v))
+                            })
+                    })
+                    .collect();
+                if matching.len() > 1 {
+                    return Err(format!(
+                        "history_series 'params' matches several series ({}); be more specific",
+                        matching.join(", ")
+                    ));
+                }
+                matching.first().copied()
+            }
+            (None, None) if configured.len() == 1 => Some(configured[0]),
+            (None, None) => {
+                return Err(format!(
+                    "{}; select one with 'series_id' or 'params'",
+                    serves()
+                ))
+            }
+        };
         let since = match obj.get("since") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(s)) => Some(s.as_str()),
@@ -911,33 +999,38 @@ impl QueryEngine {
         }
         .min(HISTORY_MAX_LIMIT);
 
-        // Reading a series exposes aggregates of its source provider: require authority over it.
-        let source = g
-            .workspace
-            .history
-            .iter()
-            .find(|h| h.series_id == series_id);
-        match source.and_then(|cfg| g.instances.get(&cfg.instance_id)) {
-            Some(src_inst) => audited(
-                &self.store,
-                principal,
-                "provider.query",
-                check_provider_access(principal, src_inst),
-            )
-            .map_err(|e| e.to_string())?,
-            None if principal.ceiling.unrestricted => {}
-            None => {
-                return Err(format!(
-                    "history series '{series_id}' has no declared source provider in this Workspace; access denied"
-                ))
+        let val = match series_id {
+            None => serde_json::Value::Array(Vec::new()),
+            Some(series_id) => {
+                // Reading a series exposes aggregates of its source provider: require authority
+                // over it.
+                let source = g
+                    .workspace
+                    .history
+                    .iter()
+                    .find(|h| h.series_id == series_id);
+                match source.and_then(|cfg| g.instances.get(&cfg.instance_id)) {
+                    Some(src_inst) => audited(
+                        &self.store,
+                        principal,
+                        "provider.query",
+                        check_provider_access(principal, src_inst),
+                    )
+                    .map_err(|e| e.to_string())?,
+                    None if principal.ceiling.unrestricted => {}
+                    None => {
+                        return Err(format!(
+                            "history series '{series_id}' has no declared source provider in this Workspace; access denied"
+                        ))
+                    }
+                }
+                let samples = self
+                    .store
+                    .query_history_samples(series_id, since, limit)
+                    .map_err(|e| e.to_string())?;
+                serde_json::to_value(samples).map_err(|e| e.to_string())?
             }
-        }
-
-        let samples = self
-            .store
-            .query_history_samples(series_id, since, limit)
-            .map_err(|e| e.to_string())?;
-        let val = serde_json::to_value(samples).map_err(|e| e.to_string())?;
+        };
         let qk = self.compute_query_key(&inst.id, HISTORY_BUILTIN_DIGEST, params, principal);
         Ok(QueryEnvelope::snapshot(
             &inst.id,
@@ -1463,7 +1556,7 @@ impl QueryEngine {
 
         let deps = recorded_deps.lock().unwrap().clone();
         let upstreams = recorded_upstreams.lock().unwrap().clone();
-        let val = match res {
+        let mut val = match res {
             Ok(v) => v,
             Err(e) => {
                 return Err(ProviderFailure {
@@ -1476,6 +1569,7 @@ impl QueryEngine {
 
         // Validate output contract at boundary
         if let Some(ref out_schema) = def.manifest.output {
+            out_schema.normalize_empty_tables(&mut val);
             if let Err(e) = out_schema.validate_value(&val) {
                 return Err(ProviderFailure {
                     message: format!("output contract violation on '{}': {e}", inst.id),
@@ -2929,6 +3023,7 @@ impl HostBridge for EngineHostBridge {
                 self.call_stack.clone(),
                 self.parent_query_key.clone(),
                 self.wait_ctx(),
+                Some(Arc::clone(&self.graph)),
             )
             .await;
 
@@ -4078,6 +4173,96 @@ return R
         assert!(other.unwrap_err().contains("serves series 's_list'"));
         let unknown = q.query("hist", json!({"bogus": 1}), &admin, false).await;
         assert!(unknown.is_err());
+    }
+
+    /// One history Instance serving a series per sampled repository; readers select by the
+    /// sampled query parameters (§16 behaviour 4: trend follows the selected repository).
+    #[tokio::test]
+    async fn history_series_selects_configured_series_by_sampled_params() {
+        let mut g = list_and_count_graph();
+        g.instances.insert(
+            "hist".into(),
+            instance(
+                "hist",
+                DefinitionCategory::DataProvider,
+                "dash.history_series",
+                &[],
+                json!({"series_ids": ["s_a", "s_b"]}),
+            ),
+        );
+        let series = |id: &str, repo: &str| HistorySeriesConfig {
+            series_id: id.into(),
+            instance_id: "inst_list".into(),
+            params: json!({"repository": repo, "state": "open"}),
+            aggregator: "count".into(),
+            value_path: None,
+            cadence_secs: 3600,
+            retention_days: 30,
+            service_principal: "sampler".into(),
+        };
+        let cfgs = vec![
+            series("s_a", "acme/a"),
+            series("s_b", "acme/b"),
+            series("s_c", "acme/c"),
+        ];
+        g.workspace.history = cfgs.clone();
+        let (e, q) = engine_for(g, ResourceBudget::default());
+        e.history.sync_series_configs(&cfgs).unwrap();
+        let now = Utc::now().to_rfc3339();
+        e.store
+            .append_history_sample("s_a", &now, 1.0, None)
+            .unwrap();
+        e.store
+            .append_history_sample("s_b", &now, 2.0, None)
+            .unwrap();
+        e.store
+            .append_history_sample("s_c", &now, 3.0, None)
+            .unwrap();
+        let admin = Principal::administrator();
+
+        let b = q
+            .query(
+                "hist",
+                json!({"params": {"repository": "acme/b"}}),
+                &admin,
+                false,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let b = b.as_array().unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["series_id"], "s_b");
+        assert_eq!(b[0]["value_num"], 2.0);
+
+        // A series sampled in the Workspace but not configured on this Instance is unreachable.
+        let c = q
+            .query(
+                "hist",
+                json!({"params": {"repository": "acme/c"}}),
+                &admin,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(c.value, Some(json!([])));
+        assert!(q
+            .query("hist", json!({"series_id": "s_c"}), &admin, false)
+            .await
+            .unwrap_err()
+            .contains("serves series 's_a', 's_b'"));
+        // Ambiguous or missing selectors are rejected rather than guessed.
+        assert!(q
+            .query("hist", json!({"params": {"state": "open"}}), &admin, false)
+            .await
+            .unwrap_err()
+            .contains("matches several series"));
+        assert!(q
+            .query("hist", json!({}), &admin, false)
+            .await
+            .unwrap_err()
+            .contains("select one"));
     }
 
     // ---- state-7 / widget-16: widget_id derivation ----
