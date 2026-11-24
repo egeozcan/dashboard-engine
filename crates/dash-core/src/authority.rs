@@ -543,8 +543,13 @@ pub fn check_draft_activation_authority(
         ));
     }
     for (sp_id, root, binding_changed) in consumers {
+        // Emitters feeding the consumer's unscoped Event triggers drive it like inputs (§7.3).
+        let mut closure = input_closure(candidate, &root);
+        for src in crate::automations::unscoped_event_sources(candidate, &root) {
+            closure.extend(input_closure(candidate, &src));
+        }
         let changed = binding_changed
-            || input_closure(candidate, &root)
+            || closure
                 .iter()
                 .any(|i| instance_changed(active, candidate, i));
         if !changed {

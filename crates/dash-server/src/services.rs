@@ -241,10 +241,13 @@ impl AppServices {
     /// principals:
     /// - a durable Event consumer task that drains the Event log from each automation's
     ///   checkpoint at startup, on every live Event or broadcast lag, and periodically;
+    /// - an automation trigger task that fires due cron and Signal triggers and runs those
+    ///   automations (with their actions and retry backoff) off the maintenance ticker, so a
+    ///   slow or lock-contended automation never stalls polling, sampling or reconciles;
     /// - a maintenance ticker for idle VM reclamation, history sampling, scheduled polling,
-    ///   cron and Signal triggers, and durable Event retention.
+    ///   reconcile retries and durable Event retention.
     ///
-    /// Aborting the returned handle also stops the consumer task.
+    /// Aborting the returned handle also stops the consumer and trigger tasks.
     pub fn spawn_background_workers(&self) -> tokio::task::JoinHandle<()> {
         // The sender is dropped immediately: the workers then simply never observe a shutdown.
         let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -304,10 +307,33 @@ impl AppServices {
             }
         });
 
+        let triggers = self.clone();
+        let mut trigger_shutdown = shutdown.clone();
+        let trigger_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(BACKGROUND_TICK_SECS));
+            let mut shutdown_open = true;
+            loop {
+                if *trigger_shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    changed = trigger_shutdown.changed(), if shutdown_open => {
+                        match changed {
+                            Err(_) => shutdown_open = false,
+                            Ok(()) if *trigger_shutdown.borrow() => break,
+                            Ok(()) => {}
+                        }
+                    }
+                    _ = tick.tick() => triggers.run_due_automation_triggers().await,
+                }
+            }
+        });
+
         let services = self.clone();
         let mut shutdown = shutdown;
         tokio::spawn(async move {
             let mut consumer = AbortOnDrop(consumer_task);
+            let mut trigger_runs = AbortOnDrop(trigger_task);
             let mut ticker = tokio::time::interval(Duration::from_secs(BACKGROUND_TICK_SECS));
             let mut tick: u64 = 0;
             let mut shutdown_open = true;
@@ -330,7 +356,6 @@ impl AppServices {
                         services.engine().actions.run_due_reconciles(16).await;
                         services.run_due_history_samples().await;
                         services.run_due_polls().await;
-                        services.run_due_automation_triggers().await;
                         services.run_due_event_retention().await;
                         // Every minute: sample runtime metrics; every 5 minutes (and at start):
                         // enforce retention and size budgets off the async runtime (§13).
@@ -344,9 +369,11 @@ impl AppServices {
                     }
                 }
             }
-            // Shutdown: let the consumer finish its in-progress delivery (it observes the same
-            // signal); aborting the returned handle still aborts it through AbortOnDrop.
+            // Shutdown: let the consumer and trigger tasks finish their in-progress delivery
+            // (they observe the same signal); aborting the returned handle still aborts them
+            // through AbortOnDrop.
             let _ = (&mut consumer.0).await;
+            let _ = (&mut trigger_runs.0).await;
         })
     }
 
@@ -442,7 +469,8 @@ impl AppServices {
         }
     }
 
-    async fn run_due_automation_triggers(&self) {
+    /// Fire due cron and Signal triggers and run their automations (the trigger task's body).
+    pub async fn run_due_automation_triggers(&self) {
         let automations = &self.engine().automations;
         let fired = automations.run_due_schedules(Utc::now()).await;
         let signalled = automations.run_due_signal_triggers().await;

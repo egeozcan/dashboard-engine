@@ -619,8 +619,9 @@ impl UserData for LuaContext {
                 let decl = this
                     .check_emit(&event_type, &payload_json)
                     .map_err(mlua::Error::runtime)?;
-                // Explicit flag wins; otherwise the contract's declared durability applies.
-                let durable = durable.unwrap_or(decl.durable);
+                // A contract that declares the Event durable keeps it durable: the script may
+                // only upgrade an Event to durable, never downgrade it (§7.2, as `emit_declared`).
+                let durable = decl.durable || durable.unwrap_or(false);
                 let version = decl.schema_version.clone();
                 this.cfg
                     .bridge
@@ -1061,6 +1062,58 @@ return dash.data_provider {
         )
         .await;
         assert!(res.unwrap_err().to_string().contains("not permitted"));
+    }
+
+    #[tokio::test]
+    async fn emit_cannot_downgrade_a_contract_declared_durable_event() {
+        let decl = r#"
+local dash = require("dash")
+return dash.data_provider {
+    id = "t.durable",
+    emits = {
+        { semantic_type = "dev.durable", schema_version = "1", durable = true },
+        { semantic_type = "dev.live", schema_version = "1", durable = false },
+    },
+}
+"#;
+        let rt = r#"
+local R = {}
+function R.query(ctx)
+    ctx:await(ctx:emit(ctx.config.event_type, { number = 1 }, ctx.config.durable))
+    return true
+end
+return R
+"#;
+        let pool = VmPool::new(ResourceBudget::default());
+        for (event_type, flag, expect) in [
+            ("dev.durable", json!(false), true),
+            ("dev.durable", json!(null), true),
+            ("dev.live", json!(true), true),
+            ("dev.live", json!(false), false),
+            ("dev.live", json!(null), false),
+        ] {
+            let bridge = Arc::new(ProbeBridge::default());
+            let b = bundle("emitter", decl, rt);
+            let mut c = cfg(
+                DefinitionCategory::DataProvider,
+                "emitter",
+                &[],
+                bridge.clone(),
+            );
+            // A missing key is `nil` in Luau (no explicit flag).
+            c.config = if flag.is_null() {
+                json!({ "event_type": event_type })
+            } else {
+                json!({ "event_type": event_type, "durable": flag })
+            };
+            pool.execute_handler(&b, "query", c, None).await.unwrap();
+            let emitted = bridge.emitted.lock().unwrap().clone();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(
+                emitted[0].2, expect,
+                "{event_type} with flag {flag}: durable must be {expect}"
+            );
+        }
     }
 
     #[tokio::test]

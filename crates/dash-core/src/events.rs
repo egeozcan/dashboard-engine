@@ -54,7 +54,9 @@ impl From<DurableEventRecord> for EventEnvelope {
 /// Replaceable durable Event storage contract (§7.2): append, ordered reads, consumer
 /// checkpoints, dead letters and retention.
 pub trait EventLog: Send + Sync {
-    /// Append with sequence `max(last durable + 1, min_sequence)`.
+    /// Append with sequence `max(high water + 1, min_sequence)`, where the high water is
+    /// [`EventLog::max_sequence`]: a backend must never re-issue a sequence at or below one it
+    /// already issued or a consumer acknowledged, even after retention emptied the log.
     #[allow(clippy::too_many_arguments)]
     fn append(
         &self,
@@ -65,6 +67,8 @@ pub trait EventLog: Send + Sync {
         payload: serde_json::Value,
         min_sequence: i64,
     ) -> Result<DurableEventRecord, String>;
+    /// Highest sequence the source is known to have reached (newest logged Event or furthest
+    /// consumer checkpoint); seeds the per-source counter after a restart.
     fn max_sequence(&self, source_instance: &str) -> Result<i64, String>;
     fn max_sequence_before(&self, source_instance: &str, cutoff: &str) -> Result<i64, String>;
     fn list_since(
@@ -97,7 +101,8 @@ pub trait EventLog: Send + Sync {
     ) -> Result<Vec<DeadLetterRecord>, String>;
     fn get_dead_letter(&self, dlq_id: &str) -> Result<Option<DeadLetterRecord>, String>;
     fn resolve_dead_letter(&self, dlq_id: &str) -> Result<bool, String>;
-    /// Delete acknowledged Events older than `cutoff`; returns how many were deleted.
+    /// Delete acknowledged Events older than `cutoff`, keeping each source's newest Event and every
+    /// Event an unresolved dead letter references; returns how many were deleted.
     fn prune_before(&self, cutoff: &str) -> Result<usize, String>;
 }
 
@@ -123,7 +128,7 @@ impl EventLog for SqliteStore {
         .map_err(|e| e.to_string())
     }
     fn max_sequence(&self, source_instance: &str) -> Result<i64, String> {
-        self.max_event_sequence(source_instance)
+        self.event_sequence_high_water(source_instance)
             .map_err(|e| e.to_string())
     }
     fn max_sequence_before(&self, source_instance: &str, cutoff: &str) -> Result<i64, String> {

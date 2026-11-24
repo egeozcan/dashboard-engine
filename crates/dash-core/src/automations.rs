@@ -21,6 +21,17 @@
 //!   (intermediate values may coalesce, §7.1); the first observation only records a baseline
 //!   unless `catch_up = "catch_up"`.
 //! - **Concurrency**: one run at a time per automation Instance (preserves per-source order).
+//! - **Action outcomes**: a run succeeds only when every action it invoked succeeded. An action
+//!   that ended `failed` or `cancelled` fails the attempt (and is retried; a retry-safe failure is
+//!   superseded under the same deterministic key). An action whose outcome is not known yet
+//!   (`unknown`, still `running`) fails the run without further attempts and is dead-lettered,
+//!   to be redriven once the execution is reconciled or resolved.
+//! - **Unscoped Event triggers** (no `source_input`) consume the Events of exactly those Instances
+//!   of the active Generation whose contract declares the Event type (`emits`; every action
+//!   Instance for `dash.action_completed`). Their consumers are registered at activation, and a
+//!   new or changed emitter counts as a change to the automation for activation authority.
+//! - **Circuit breaker**: automation handler timeouts and memory violations count towards the
+//!   Instance's circuit breaker (§15.2); while it is open runs fail fast with `circuit_open`.
 
 use crate::actions::ActionManager;
 use crate::authority::{Principal, PrincipalKind, ValidationIssue};
@@ -55,6 +66,12 @@ pub const DEFAULT_CATCH_UP: &str = "skip";
 pub const CRON_ON_TIME_GRACE_SECS: i64 = 60;
 /// Upper bound on scheduled times inspected per cron trigger and tick.
 const MAX_CRON_WINDOWS: usize = 10_000;
+/// Semantic type of the completion Event every action execution emits (§7.2).
+pub const ACTION_COMPLETED_EVENT: &str = "dash.action_completed";
+/// Error code of an automation run refused because the Instance's circuit breaker is open.
+pub const CIRCUIT_OPEN_CODE: &str = "circuit_open";
+/// Error code of an automation run that invoked an action whose outcome is not known yet.
+pub const ACTION_OUTCOME_PENDING_CODE: &str = "action_outcome_pending";
 
 /// Outcome summary of one durable-consumer pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -237,9 +254,13 @@ impl AutomationEngine {
             .collect()
     }
 
+    /// Whether `t` accepts `ev`. A scoped trigger (`source_input`) accepts its bound source only;
+    /// an unscoped one accepts only sources whose contract in `g` declares the Event type, so an
+    /// Event from any other Instance (or one no longer in the graph) never drives the automation.
     fn event_trigger_matches(
         t: &TriggerDeclSpec,
         inst: &InstanceConfig,
+        g: &ConfiguredGraph,
         ev: &EventEnvelope,
     ) -> bool {
         t.kind == "event"
@@ -248,7 +269,10 @@ impl AutomationEngine {
                 Some(slot) => {
                     inst.inputs.get(slot).map(|s| s.as_str()) == Some(ev.source_instance.as_str())
                 }
-                None => true,
+                None => g
+                    .instances
+                    .get(&ev.source_instance)
+                    .is_some_and(|src| instance_emits(g, src, &ev.semantic_type)),
             }
     }
 
@@ -256,13 +280,14 @@ impl AutomationEngine {
     fn max_attempts_for_event(
         def: &LoadedDefinition,
         inst: &InstanceConfig,
+        g: &ConfiguredGraph,
         ev: &EventEnvelope,
     ) -> Option<u32> {
         let matching: Vec<&TriggerDeclSpec> = def
             .manifest
             .triggers
             .iter()
-            .filter(|t| Self::event_trigger_matches(t, inst, ev))
+            .filter(|t| Self::event_trigger_matches(t, inst, g, ev))
             .collect();
         if matching.is_empty() {
             return None;
@@ -289,7 +314,7 @@ impl AutomationEngine {
         let g = self.graph.load_full();
         let mut results = Vec::new();
         for (auto_id, inst, def) in Self::automations(&g) {
-            let Some(max_attempts) = Self::max_attempts_for_event(def, inst, event) else {
+            let Some(max_attempts) = Self::max_attempts_for_event(def, inst, &g, event) else {
                 continue;
             };
             if event.durable && !event.is_replay {
@@ -316,18 +341,14 @@ impl AutomationEngine {
         results
     }
 
-    /// Durable at-least-once consumer pass (§7.2): for every enabled automation and each source
-    /// Instance of its Event triggers, read the durable log after the consumer checkpoint in
-    /// sequence order, deliver matching Events (with bounded retry, then dead-letter) and advance
-    /// the checkpoint. Run at startup, periodically and whenever the live broadcast signals new
-    /// Events or reports lag.
-    /// Source Instances an automation's Event triggers consume (`all_sources` is filled lazily
-    /// from the log for triggers without a `source_input`).
+    /// Source Instances an automation's Event triggers consume: the bound `source_input` of a
+    /// scoped trigger, or every declared emitter of the Event type in `g` for an unscoped one.
+    /// Resolved from the graph (not from the log), so a consumer exists for a source before
+    /// that source ever emits.
     fn event_sources(
-        &self,
+        g: &ConfiguredGraph,
         inst: &InstanceConfig,
         def: &LoadedDefinition,
-        all_sources: &mut Option<Vec<String>>,
     ) -> BTreeSet<String> {
         let mut sources = BTreeSet::new();
         for t in def.manifest.triggers.iter().filter(|t| t.kind == "event") {
@@ -338,10 +359,9 @@ impl AutomationEngine {
                     }
                 }
                 None => {
-                    if all_sources.is_none() {
-                        *all_sources = Some(self.events.log().sources().unwrap_or_default());
+                    if let Some(event_type) = t.event_type.as_deref() {
+                        sources.extend(event_type_emitters(g, event_type));
                     }
-                    sources.extend(all_sources.clone().unwrap_or_default());
                 }
             }
         }
@@ -356,10 +376,9 @@ impl AutomationEngine {
     /// number of consumers registered.
     pub fn register_consumers(&self) -> usize {
         let g = self.graph.load_full();
-        let mut all_sources: Option<Vec<String>> = None;
         let mut registered = 0;
         for (auto_id, inst, def) in Self::automations(&g) {
-            for src in self.event_sources(inst, def, &mut all_sources) {
+            for src in Self::event_sources(&g, inst, def) {
                 if let Ok(None) = self.events.find_checkpoint(auto_id, &src) {
                     let start = self.consumer_start_sequence(&g, &src);
                     match self.events.ack_checkpoint(auto_id, &src, start) {
@@ -375,15 +394,19 @@ impl AutomationEngine {
         registered
     }
 
+    /// Durable at-least-once consumer pass (§7.2): for every enabled automation and each source
+    /// Instance of its Event triggers, read the durable log after the consumer checkpoint in
+    /// sequence order, deliver matching Events (with bounded retry, then dead-letter) and advance
+    /// the checkpoint. Run at startup, periodically and whenever the live broadcast signals new
+    /// Events or reports lag.
     pub async fn drain_durable_events(&self) -> DrainReport {
         let g = self.graph.load_full();
         let mut report = DrainReport::default();
-        let mut all_sources: Option<Vec<String>> = None;
         for (auto_id, inst, def) in Self::automations(&g) {
             if !def.manifest.triggers.iter().any(|t| t.kind == "event") {
                 continue;
             }
-            let sources = self.event_sources(inst, def, &mut all_sources);
+            let sources = Self::event_sources(&g, inst, def);
             for src in sources {
                 let mut ckpt = match self.events.find_checkpoint(auto_id, &src) {
                     Ok(Some(c)) => c,
@@ -416,7 +439,7 @@ impl AutomationEngine {
                     };
                     let full = batch.len() >= EVENT_READ_BUDGET;
                     for ev in &batch {
-                        match Self::max_attempts_for_event(def, inst, ev) {
+                        match Self::max_attempts_for_event(def, inst, &g, ev) {
                             Some(max_attempts) => {
                                 match self
                                     .deliver(
@@ -502,7 +525,7 @@ impl AutomationEngine {
         let mut results = Vec::new();
         for ev in &events {
             for (auto_id, inst, def) in Self::automations(&g) {
-                let Some(max_attempts) = Self::max_attempts_for_event(def, inst, ev) else {
+                let Some(max_attempts) = Self::max_attempts_for_event(def, inst, &g, ev) else {
                     continue;
                 };
                 results.push(
@@ -571,7 +594,7 @@ impl AutomationEngine {
             .get(&inst.definition)
             .ok_or_else(|| format!("definition '{}' missing", inst.definition))?;
         let max_attempts =
-            Self::max_attempts_for_event(def, inst, &event).unwrap_or(DEFAULT_MAX_ATTEMPTS);
+            Self::max_attempts_for_event(def, inst, &g, &event).unwrap_or(DEFAULT_MAX_ATTEMPTS);
         let res = self
             .deliver(
                 &dlq.consumer_id,
@@ -1040,6 +1063,9 @@ impl AutomationEngine {
                         .extend(ids.lock().unwrap().drain(..));
                     match &last {
                         Ok(_) => break,
+                        // Retrying cannot help: the breaker is open, or an action's outcome is
+                        // not known yet (re-invoking it would only return the same record).
+                        Err(e) if !is_retryable_run_error(e) => break,
                         Err(e) if attempts < max_attempts => {
                             self.telemetry.log(
                                 "warn",
@@ -1148,6 +1174,7 @@ impl AutomationEngine {
     ) -> Arc<AutomationHostBridge> {
         Arc::new(AutomationHostBridge {
             actions: self.actions.clone(),
+            store: self.store.clone(),
             queries: self.queries.clone(),
             graph: g.clone(),
             caller_inst: inst.clone(),
@@ -1178,7 +1205,17 @@ impl AutomationEngine {
             config_digest: inst.config_digest(),
             resolved_libraries: graph.resolved_libraries(),
         };
-        self.pool
+        // Per-Instance circuit breaker (§15.2, ADR-0003): repeated timeouts or memory violations
+        // of this automation open it, and runs then fail fast instead of burning wall time.
+        let admission = self.queries.breaker_admit(&inst.id);
+        if let crate::query_engine::Admission::Rejected { .. } = admission {
+            return Err(format!(
+                "{CIRCUIT_OPEN_CODE}: circuit breaker open for automation '{}' after repeated runtime faults",
+                inst.id
+            ));
+        }
+        let res = self
+            .pool
             .execute_handler(
                 &bundle,
                 handler,
@@ -1197,8 +1234,10 @@ impl AutomationEngine {
                 },
                 None,
             )
-            .await
-            .map_err(|e| self.store.redactor().redact_str(&e.to_string()))
+            .await;
+        self.queries
+            .record_runtime_outcome(&inst.id, admission, &res, false);
+        res.map_err(|e| self.store.redactor().redact_str(&e.to_string()))
     }
 }
 
@@ -1210,6 +1249,65 @@ fn parse_cron(expr: &str) -> Result<cron::Schedule, String> {
     };
     cron::Schedule::from_str(&normalized)
         .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
+}
+
+/// Whether a failed run attempt may be retried (see the module docs).
+fn is_retryable_run_error(err: &str) -> bool {
+    !err.contains(CIRCUIT_OPEN_CODE) && !err.contains(ACTION_OUTCOME_PENDING_CODE)
+}
+
+/// Whether `inst` may emit Events of `event_type` under its contract in `g` (§7.2): its
+/// Definition declares the type in `emits`; an action Instance always emits its completion
+/// Event; and a connector routed to its Mock (Preview) emits what the Mock declares.
+pub fn instance_emits(g: &ConfiguredGraph, inst: &InstanceConfig, event_type: &str) -> bool {
+    let declares = |def: &LoadedDefinition| {
+        def.manifest
+            .emits
+            .iter()
+            .any(|e| e.semantic_type == event_type)
+    };
+    if inst.category == DefinitionCategory::ActionProvider && event_type == ACTION_COMPLETED_EVENT {
+        return true;
+    }
+    if g.definitions.get(&inst.definition).is_some_and(declares) {
+        return true;
+    }
+    inst.category == DefinitionCategory::Connector
+        && g.routes_to_mocks()
+        && g.find_mock_for(&inst.definition).is_some_and(declares)
+}
+
+/// Instances of `g` that may emit `event_type` (the sources of an unscoped Event trigger).
+pub fn event_type_emitters(g: &ConfiguredGraph, event_type: &str) -> BTreeSet<String> {
+    g.instances
+        .values()
+        .filter(|inst| instance_emits(g, inst, event_type))
+        .map(|inst| inst.id.clone())
+        .collect()
+}
+
+/// Source Instances that reach automation `automation_id` through its unscoped Event triggers
+/// (empty for other Instances). Activation authority treats a new or changed one like a change
+/// to the automation's own input closure: its payloads drive the automation's Service principal
+/// (§7.3 "no implicit additional permissions", ADR-0002).
+pub fn unscoped_event_sources(g: &ConfiguredGraph, automation_id: &str) -> BTreeSet<String> {
+    let Some(inst) = g
+        .instances
+        .get(automation_id)
+        .filter(|i| i.category == DefinitionCategory::Automation)
+    else {
+        return BTreeSet::new();
+    };
+    let Some(def) = g.definitions.get(&inst.definition) else {
+        return BTreeSet::new();
+    };
+    def.manifest
+        .triggers
+        .iter()
+        .filter(|t| t.kind == "event" && t.source_input.is_none())
+        .filter_map(|t| t.event_type.as_deref())
+        .flat_map(|event_type| event_type_emitters(g, event_type))
+        .collect()
 }
 
 /// The Dashboard an automation's Dashboard State refers to: its Instance config must bind one
@@ -1403,6 +1501,7 @@ pub fn validate_background_work(
 
 struct AutomationHostBridge {
     actions: ActionManager,
+    store: SqliteStore,
     queries: QueryEngine,
     graph: ConfiguredGraph,
     caller_inst: InstanceConfig,
@@ -1432,6 +1531,54 @@ impl AutomationHostBridge {
             }
             other => Err(format!("automations cannot access '{other}' State")),
         }
+    }
+
+    /// Mediated Dashboard State write (§8): the Service principal must be allowed to read the
+    /// bound Dashboard (every placed Adapter), the key must be declared by the Dashboard, and the
+    /// value is validated (type, size) and stamped with the declared schema version, exactly as
+    /// the HTTP/WS write path does. Denials are audited.
+    fn dashboard_state_set(
+        &self,
+        dashboard_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let declared =
+            crate::state::authorize_dashboard_read(&self.principal, &self.graph, dashboard_id)
+                .and_then(|doc| {
+                    crate::state::dashboard_state_declaration(doc, key).ok_or_else(|| {
+                        crate::state::StateError::Forbidden(format!(
+                            "state key '{key}' is not declared by dashboard '{dashboard_id}'"
+                        ))
+                    })
+                });
+        let decl = match declared {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.store.append_audit(
+                    &self.principal.id,
+                    self.principal.kind.as_str(),
+                    "dashboard_state.set",
+                    &format!("{dashboard_id}/{key}"),
+                    "denied",
+                    serde_json::json!({ "reason": e.to_string(), "automation": self.caller_inst.id }),
+                );
+                return Err(e.to_string());
+            }
+        };
+        self.queries
+            .state_manager()
+            .set_declared(
+                "dashboard",
+                dashboard_id,
+                key,
+                &decl,
+                self.graph.generation_id,
+                value,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1491,7 +1638,23 @@ impl HostBridge for AutomationHostBridge {
             .lock()
             .unwrap()
             .push(rec.execution_id.clone());
-        serde_json::to_value(rec).map_err(|e| e.to_string())
+        // The automation run's outcome follows its side effects (§7.2 bounded retry and
+        // dead-letter, §7.3): a failed action fails the attempt; an outcome that is not known
+        // yet fails the run without retrying, so it is dead-lettered for redrive after
+        // reconcile or manual resolution.
+        let reason = rec.reason.clone().unwrap_or_default();
+        match rec.status.as_str() {
+            "succeeded" => serde_json::to_value(rec).map_err(|e| e.to_string()),
+            "failed" | "cancelled" => Err(format!(
+                "action '{target_action}' execution {} ended {}: {reason}",
+                rec.execution_id, rec.status
+            )),
+            other => Err(format!(
+                "{ACTION_OUTCOME_PENDING_CODE}: action '{target_action}' execution {} is {other}; \
+                 redrive once it is reconciled or resolved: {reason}",
+                rec.execution_id
+            )),
+        }
     }
 
     async fn http_request(&self, _req: HttpHostRequest) -> Result<HttpHostResponse, String> {
@@ -1535,6 +1698,9 @@ impl HostBridge for AutomationHostBridge {
                 .set_instance_state(&self.graph, &owner, key, value)
                 .map(|_| ())
                 .map_err(|e| e.to_string());
+        }
+        if scope == "dashboard" {
+            return self.dashboard_state_set(&owner, key, value);
         }
         // Write through the StateManager so a State Signal is published (§8).
         self.queries

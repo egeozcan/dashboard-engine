@@ -1001,11 +1001,7 @@ impl SqliteStore {
         let emitted_at = Utc::now().to_rfc3339();
         self.with_conn_sync(|conn| {
             let tx = conn.unchecked_transaction()?;
-            let max_seq: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE source_instance = ?1",
-                params![source_instance],
-                |r| r.get(0),
-            )?;
+            let max_seq = Self::sequence_high_water(&tx, source_instance)?;
             let next_seq = (max_seq + 1).max(min_sequence);
             tx.execute(
                 "INSERT INTO events (event_id, source_instance, sequence, emitted_at, semantic_type, schema_version, trace_id, durable, payload_json)
@@ -1098,6 +1094,31 @@ impl SqliteStore {
         })
     }
 
+    /// Highest sequence a source has ever been known to reach: its newest logged Event or the
+    /// furthest consumer checkpoint on it, whichever is larger. New sequences are allocated above
+    /// it, so even a log emptied by retention never re-issues a sequence at or below a consumer
+    /// checkpoint (which the consumer would silently skip, §7.2 at-least-once).
+    fn sequence_high_water(
+        conn: &rusqlite::Connection,
+        source_instance: &str,
+    ) -> Result<i64, StoreError> {
+        conn.query_row(
+            "SELECT MAX(
+                 COALESCE((SELECT MAX(sequence) FROM events WHERE source_instance = ?1), 0),
+                 COALESCE((SELECT MAX(last_sequence) FROM event_consumer_checkpoints
+                            WHERE source_instance = ?1), 0))",
+            params![source_instance],
+            |r| r.get(0),
+        )
+        .map_err(StoreError::from)
+    }
+
+    /// Base for the next sequence of a source: see [`Self::sequence_high_water`]. The EventBus
+    /// seeds ephemeral sequences from it after a restart.
+    pub fn event_sequence_high_water(&self, source_instance: &str) -> Result<i64, StoreError> {
+        self.with_conn_sync(|conn| Self::sequence_high_water(conn, source_instance))
+    }
+
     /// Highest durable sequence of one source (0 when it has no Events).
     pub fn max_event_sequence(&self, source_instance: &str) -> Result<i64, StoreError> {
         self.with_conn_sync(|conn| {
@@ -1154,75 +1175,18 @@ impl SqliteStore {
         })
     }
 
-    /// Retention (§7.2): delete durable Events emitted before `cutoff` (RFC 3339) that every
-    /// registered consumer of their source has acknowledged and that no unresolved dead letter
-    /// still references, together with finished automation execution records older than
-    /// `cutoff` whose Event is gone. Returns the number of deleted Events.
+    /// Retention (§7.2): delete durable Events emitted before `cutoff` (RFC 3339) under the
+    /// shared retention rule ([`retention::prune_retained_events`]): the newest Event of each
+    /// source is kept, and so is every Event a consumer has not acknowledged or an unresolved
+    /// dead letter still references. Finished automation execution records older than `cutoff`
+    /// whose Event is gone are dropped too. Returns the number of deleted Events.
     pub fn prune_events_before(&self, cutoff: &str) -> Result<usize, StoreError> {
         let cutoff_dt = DateTime::parse_from_rfc3339(cutoff)
             .map(|d| d.with_timezone(&Utc))
             .map_err(|e| {
                 StoreError::NotFound(format!("invalid retention cutoff '{cutoff}': {e}"))
             })?;
-        self.with_conn_sync(|conn| {
-            let candidates: Vec<(String, String)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT e.event_id, e.emitted_at FROM events e
-                     WHERE e.sequence <= COALESCE(
-                            (SELECT MIN(c.last_sequence) FROM event_consumer_checkpoints c
-                              WHERE c.source_instance = e.source_instance),
-                            e.sequence)
-                       AND NOT EXISTS (SELECT 1 FROM dead_letters d
-                                        WHERE d.event_id = e.event_id AND d.resolved = 0)",
-                )?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                let mut v = Vec::new();
-                for row in rows {
-                    v.push(row?);
-                }
-                v
-            };
-            let tx = conn.unchecked_transaction()?;
-            let mut deleted = 0;
-            for (event_id, at) in candidates {
-                let old = DateTime::parse_from_rfc3339(&at)
-                    .map(|d| d.with_timezone(&Utc) < cutoff_dt)
-                    .unwrap_or(false);
-                if old {
-                    deleted +=
-                        tx.execute("DELETE FROM events WHERE event_id = ?1", params![event_id])?;
-                }
-            }
-            // Automation execution records older than the cutoff whose Event is gone (or that had
-            // no Event) can no longer guard a replay; drop them with the same retention.
-            let stale_runs: Vec<(String, String)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT a.execution_id, a.started_at FROM automation_executions a
-                     WHERE a.status != 'running'
-                       AND (a.event_id IS NULL
-                            OR NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id = a.event_id))",
-                )?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                let mut v = Vec::new();
-                for row in rows {
-                    v.push(row?);
-                }
-                v
-            };
-            for (execution_id, at) in stale_runs {
-                let old = DateTime::parse_from_rfc3339(&at)
-                    .map(|d| d.with_timezone(&Utc) < cutoff_dt)
-                    .unwrap_or(false);
-                if old {
-                    tx.execute(
-                        "DELETE FROM automation_executions WHERE execution_id = ?1",
-                        params![execution_id],
-                    )?;
-                }
-            }
-            tx.commit()?;
-            Ok(deleted)
-        })
+        self.with_conn_sync(|conn| retention::prune_retained_events(conn, cutoff_dt))
     }
 
     pub fn get_consumer_checkpoint(
@@ -3546,6 +3510,40 @@ mod tests {
         assert_eq!(store.max_event_sequence_before("src", &future).unwrap(), 8);
         let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
         assert_eq!(store.max_event_sequence_before("src", &past).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_pruning_a_consumed_source_keeps_its_sequence_above_the_checkpoint() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for _ in 0..5 {
+            store
+                .append_event("src", "t", "1", "tr", true, json!({}))
+                .unwrap();
+        }
+        store.set_consumer_checkpoint("auto", "src", 5).unwrap();
+        let cutoff = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        assert_eq!(store.prune_events_before(&cutoff).unwrap(), 4);
+        assert_eq!(store.max_event_sequence("src").unwrap(), 5, "head row kept");
+        let next = store
+            .append_event("src", "t", "1", "tr", true, json!({}))
+            .unwrap();
+        assert_eq!(next.sequence, 6);
+        assert_eq!(store.list_events_since("src", 5).unwrap().len(), 1);
+
+        // Even with the whole log gone, new sequences start above the furthest checkpoint.
+        store
+            .with_conn_sync(|c| {
+                c.execute("DELETE FROM events", [])?;
+                Ok(())
+            })
+            .unwrap();
+        store.set_consumer_checkpoint("auto", "src", 6).unwrap();
+        assert_eq!(store.event_sequence_high_water("src").unwrap(), 6);
+        let next = store
+            .append_event("src", "t", "1", "tr", true, json!({}))
+            .unwrap();
+        assert_eq!(next.sequence, 7);
+        assert_eq!(store.list_events_since("src", 6).unwrap().len(), 1);
     }
 
     #[test]
