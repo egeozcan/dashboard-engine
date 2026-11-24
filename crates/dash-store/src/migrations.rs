@@ -1,4 +1,10 @@
-//! Transactional SQLite schema migrations covering all §13 tables.
+//! Transactional SQLite schema migrations for the §13 logical tables.
+//!
+//! Not every table is populated yet: `instances`, `contracts`, `dependency_locks`,
+//! `service_principals` and `query_cache_index` are reserved schema (the active graph, manifests,
+//! `packages.lock` and requested Service principal ceilings currently live in the Git Workspace
+//! and the in-memory Generation). `runtime_metrics` is sampled by the daemon and pruned by
+//! [`crate::retention`].
 
 use rusqlite::Connection;
 

@@ -628,12 +628,23 @@ async fn ac11_visual_ui_embedded_assets_and_api_flows() {
     assert!(index.headers().contains_key("content-security-policy"));
     assert!(index.text().await.unwrap().contains("<div id=\"root\">"));
 
-    let widget = client
+    // Widget assets require an authenticated Principal (the shell iframe carries the session
+    // cookie) and are isolated by a CSP `sandbox` even when opened top-level (§10.1, §14.3).
+    let anon = client
         .get(format!("{base}/widgets/engineering.pr_badge_widget/assets/index.html"))
         .send()
         .await
         .unwrap();
+    assert_eq!(anon.status(), 401);
+    let widget = client
+        .get(format!("{base}/widgets/engineering.pr_badge_widget/assets/index.html"))
+        .header("authorization", "Bearer adm_test_local")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(widget.status(), 200);
+    let csp = widget.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(csp.contains("sandbox allow-scripts"));
     assert!(widget.text().await.unwrap().contains("dash.widget/1"));
 
     let graph = client

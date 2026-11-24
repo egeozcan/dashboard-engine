@@ -43,7 +43,7 @@ pub use signal::{
 pub use state::StateManager;
 pub use telemetry::{
     ExecutionGraphEdge, ExecutionGraphNode, ExecutionGraphSnapshot, FailureInjectionRule,
-    RuntimeMetricsSnapshot, SanitizedLogEntry, Telemetry,
+    RequestTraceContext, RuntimeMetricsSnapshot, SanitizedLogEntry, SpanGuard, Telemetry,
 };
 
 use arc_swap::ArcSwap;
@@ -154,12 +154,18 @@ impl RuntimeEngine {
             query_cache_hits: self.telemetry.query_hits.load(std::sync::atomic::Ordering::Relaxed),
             query_cache_misses: self.telemetry.query_misses.load(std::sync::atomic::Ordering::Relaxed),
             active_subscribers: self.signals.total_subscribers(),
-            pending_events: 0,
+            pending_events: self.store.event_consumer_lag().unwrap_or(0) as usize,
             action_executions_total: self
                 .telemetry
                 .actions_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             sqlite_bytes: self.store.db_size_bytes(),
+            sqlite_wal_bytes: self.store.wal_size_bytes(),
+            event_lag: self.store.event_consumer_lag().unwrap_or(0),
+            refresh_latency_p50_ms: self.telemetry.refresh_latency_percentiles().0,
+            refresh_latency_p95_ms: self.telemetry.refresh_latency_percentiles().1,
+            trace_write_queue_depth: self.telemetry.trace_write_queue_depth(),
+            trace_spans_dropped: self.telemetry.trace_spans_dropped(),
         }
     }
 }

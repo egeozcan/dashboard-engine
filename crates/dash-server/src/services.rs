@@ -28,7 +28,8 @@ use tokio::sync::Mutex;
 pub struct AppServices {
     pub drafts: DraftManager,
     pub trusted_proxies: Vec<IpAddr>,
-    pub allow_insecure_cookie_on_loopback: bool,
+    /// Host allowlist, cookie policy, drain flag, MCP sessions and retention policy.
+    pub server: crate::context::ServerContext,
     pub admin_cli_token_path: PathBuf,
     last_history_sample: Arc<Mutex<HashMap<String, i64>>>,
     last_poll_run: Arc<Mutex<HashMap<String, i64>>>,
@@ -75,11 +76,17 @@ impl AppServices {
         Self {
             drafts,
             trusted_proxies,
-            allow_insecure_cookie_on_loopback: true,
+            server: crate::context::ServerContext::default(),
             admin_cli_token_path,
             last_history_sample: Arc::new(Mutex::new(HashMap::new())),
             last_poll_run: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the server context (Host allowlist, cookie mode, retention policy).
+    pub fn with_server_context(mut self, ctx: crate::context::ServerContext) -> Self {
+        self.server = ctx;
+        self
     }
 
     pub fn store(&self) -> &SqliteStore {
@@ -223,14 +230,39 @@ impl AppServices {
     ///
     /// Aborting the returned handle also stops the consumer task.
     pub fn spawn_background_workers(&self) -> tokio::task::JoinHandle<()> {
+        // The sender is dropped immediately: the workers then simply never observe a shutdown.
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.spawn_background_workers_until(rx)
+    }
+
+    /// Like [`Self::spawn_background_workers`], but both loops stop picking up new work once
+    /// `shutdown` becomes true; the in-progress iteration (e.g. an automation-initiated action)
+    /// completes first, so the caller can drain it within its configured limit (§15.2).
+    pub fn spawn_background_workers_until(
+        &self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let consumer = self.clone();
         let mut event_rx = consumer.engine().events.subscribe();
+        let mut consumer_shutdown = shutdown.clone();
         let consumer_task = tokio::spawn(async move {
             // Startup catch-up: redeliver durable Events appended before a crash/restart.
             consumer.drain_durable_events().await;
             let mut tick = tokio::time::interval(Duration::from_secs(BACKGROUND_TICK_SECS));
+            let mut shutdown_open = true;
             loop {
+                if *consumer_shutdown.borrow() {
+                    break;
+                }
                 tokio::select! {
+                    changed = consumer_shutdown.changed(), if shutdown_open => {
+                        match changed {
+                            Err(_) => shutdown_open = false,
+                            Ok(()) if *consumer_shutdown.borrow() => break,
+                            Ok(()) => {}
+                        }
+                        continue;
+                    }
                     _ = tick.tick() => {}
                     msg = event_rx.recv() => match msg {
                         Ok(ev) => {
@@ -257,20 +289,48 @@ impl AppServices {
         });
 
         let services = self.clone();
+        let mut shutdown = shutdown;
         tokio::spawn(async move {
-            let _consumer = AbortOnDrop(consumer_task);
+            let mut consumer = AbortOnDrop(consumer_task);
             let mut ticker = tokio::time::interval(Duration::from_secs(BACKGROUND_TICK_SECS));
+            let mut tick: u64 = 0;
+            let mut shutdown_open = true;
             loop {
-                ticker.tick().await;
-                services.engine().pool.reclaim_idle(None);
-                services.engine().queries.prune_idle();
-                // Host retry of `reconcile` with backoff for `unknown` executions (§9.1)
-                services.engine().actions.run_due_reconciles(16).await;
-                services.run_due_history_samples().await;
-                services.run_due_polls().await;
-                services.run_due_automation_triggers().await;
-                services.run_due_event_retention().await;
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    changed = shutdown.changed(), if shutdown_open => {
+                        match changed {
+                            Err(_) => shutdown_open = false,
+                            Ok(()) if *shutdown.borrow() => break,
+                            Ok(()) => {}
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        services.engine().pool.reclaim_idle(None);
+                        services.engine().queries.prune_idle();
+                        // Host retry of `reconcile` with backoff for `unknown` executions (§9.1)
+                        services.engine().actions.run_due_reconciles(16).await;
+                        services.run_due_history_samples().await;
+                        services.run_due_polls().await;
+                        services.run_due_automation_triggers().await;
+                        services.run_due_event_retention().await;
+                        // Every minute: sample runtime metrics; every 5 minutes (and at start):
+                        // enforce retention and size budgets off the async runtime (§13).
+                        if tick.is_multiple_of(12) {
+                            services.sample_runtime_metrics().await;
+                        }
+                        if tick.is_multiple_of(60) {
+                            let _ = services.enforce_retention().await;
+                        }
+                        tick = tick.wrapping_add(1);
+                    }
+                }
             }
+            // Shutdown: let the consumer finish its in-progress delivery (it observes the same
+            // signal); aborting the returned handle still aborts it through AbortOnDrop.
+            let _ = (&mut consumer.0).await;
         })
     }
 
@@ -287,6 +347,49 @@ impl AppServices {
             );
         }
         report
+    }
+
+    /// Apply the configured retention policy on a blocking thread.
+    pub async fn enforce_retention(&self) -> Result<dash_store::RetentionReport, String> {
+        let store = self.store().clone();
+        let policy = self.server.retention.clone();
+        let report = tokio::task::spawn_blocking(move || store.enforce_retention(&policy))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if report.over_budget {
+            tracing::warn!(
+                "SQLite footprint {} bytes exceeds budget {} bytes after retention",
+                report.db_size_bytes_after,
+                report.db_size_budget_bytes
+            );
+        }
+        Ok(report)
+    }
+
+    /// Persist a sample of the runtime metrics into `runtime_metrics` (bounded by retention).
+    async fn sample_runtime_metrics(&self) {
+        let snap = self.metrics_query();
+        let store = self.store().clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let samples: [(&str, f64); 8] = [
+                ("active_vms", snap.active_vms as f64),
+                ("cache_entries", snap.cache_entries as f64),
+                ("active_subscribers", snap.active_subscribers as f64),
+                ("event_lag", snap.event_lag as f64),
+                ("sqlite_bytes", snap.sqlite_bytes as f64),
+                ("sqlite_wal_bytes", snap.sqlite_wal_bytes as f64),
+                ("trace_write_queue_depth", snap.trace_write_queue_depth as f64),
+                (
+                    "refresh_latency_p95_ms",
+                    snap.refresh_latency_p95_ms.unwrap_or(0) as f64,
+                ),
+            ];
+            for (name, v) in samples {
+                let _ = store.record_runtime_metric(name, v, serde_json::json!({}));
+            }
+        })
+        .await;
     }
 
     async fn run_due_history_samples(&self) {
@@ -584,6 +687,13 @@ impl AppServices {
             .definitions
             .get(definition_id)
             .ok_or_else(|| format!("definition '{definition_id}' not found"))?;
+        contract_json(def)
+    }
+}
+
+/// Generated manifest of one Definition plus its JSON Schemas (§4.3), shared by API, MCP and CLI.
+pub fn contract_json(def: &dash_core::LoadedDefinition) -> Result<serde_json::Value, String> {
+    {
         let mut val = serde_json::to_value(&def.manifest).map_err(|e| e.to_string())?;
         if let Some(obj) = val.as_object_mut() {
             if let Some(ref q) = def.manifest.query {
@@ -601,6 +711,9 @@ impl AppServices {
         }
         Ok(val)
     }
+}
+
+impl AppServices {
 
     pub fn graph_inspect(&self) -> serde_json::Value {
         let g = self.graph();
@@ -616,18 +729,43 @@ impl AppServices {
         })
     }
 
+    /// Graph inspection as seen by `principal`: secret references the caller's ceiling does not
+    /// permit are masked so secret names do not leak (§5.2, §11.1).
+    pub fn graph_inspect_for(&self, principal: &Principal) -> serde_json::Value {
+        let mut val = self.graph_inspect();
+        if principal.ceiling.unrestricted {
+            return val;
+        }
+        if let Some(instances) = val.get_mut("instances").and_then(|v| v.as_object_mut()) {
+            for inst in instances.values_mut() {
+                if let Some(secrets) = inst.get_mut("secrets").and_then(|v| v.as_object_mut()) {
+                    for v in secrets.values_mut() {
+                        let name = v
+                            .as_str()
+                            .map(|s| s.trim_start_matches("secret://").to_string())
+                            .unwrap_or_default();
+                        if !principal.ceiling.allows_secret(&name) {
+                            *v = serde_json::Value::String("secret://[hidden]".into());
+                        }
+                    }
+                }
+            }
+        }
+        val
+    }
+
+    /// Explain effective authority on one Instance, per category (§5.1 item 4, §11.2):
+    /// data providers use provider access, connectors report every operation, actions use the
+    /// full action authority check. Also reports the Instance-granted capabilities and their
+    /// intersection with the Principal's allowed capabilities.
     pub fn capability_explain(&self, target: &str, principal: &Principal) -> serde_json::Value {
         let g = self.graph();
         let inst = g.instances.get(target);
-        let action_allowed = inst
-            .map(|i| {
-                dash_core::check_action_authority(principal, i, &g, self.store())
-                    .map(|_| true)
-                    .map_err(|e| e.to_string())
-            })
-            .unwrap_or(Err(format!("instance '{target}' not found")));
-
-        serde_json::json!({
+        let verdict = |r: Result<(), dash_core::AuthError>| match r {
+            Ok(()) => serde_json::json!({ "allowed": true }),
+            Err(e) => serde_json::json!({ "allowed": false, "reason": e.to_string() }),
+        };
+        let mut out = serde_json::json!({
             "principal": {
                 "id": principal.id,
                 "kind": principal.kind,
@@ -635,11 +773,157 @@ impl AppServices {
             },
             "target": target,
             "instance": inst,
-            "action_authority": match action_allowed {
-                Ok(_) => serde_json::json!({ "allowed": true }),
-                Err(reason) => serde_json::json!({ "allowed": false, "reason": reason }),
-            },
-        })
+        });
+        let Some(i) = inst else {
+            out["action_authority"] = serde_json::json!({
+                "allowed": false,
+                "reason": format!("instance '{target}' not found"),
+            });
+            return out;
+        };
+        out["category"] = serde_json::json!(i.category.as_str());
+        let effective: Vec<&String> = i
+            .capabilities
+            .iter()
+            .filter(|c| principal.ceiling.allows_capability(c))
+            .collect();
+        out["instance_capabilities"] = serde_json::json!(i.capabilities);
+        out["effective_capabilities"] = serde_json::json!(effective);
+        match i.category {
+            DefinitionCategory::DataProvider => {
+                out["provider_access"] = verdict(dash_core::check_provider_access(principal, i));
+            }
+            DefinitionCategory::Connector => {
+                let mut ops = serde_json::Map::new();
+                if let Some(def) = g.definitions.get(&i.definition) {
+                    for op in def.manifest.operations.keys() {
+                        ops.insert(
+                            op.clone(),
+                            verdict(dash_core::check_connector_operation_authority(
+                                principal, i, op, &g,
+                            )),
+                        );
+                    }
+                }
+                out["connector_operations"] = serde_json::Value::Object(ops);
+            }
+            _ => {}
+        }
+        out["action_authority"] = if i.category == DefinitionCategory::ActionProvider {
+            verdict(dash_core::check_action_authority(principal, i, &g, self.store()))
+        } else {
+            serde_json::json!({
+                "allowed": false,
+                "reason": format!("instance '{target}' is a {} and cannot be invoked as an action", i.category.as_str()),
+            })
+        };
+        out
+    }
+
+    /// Authorize `principal` to operate on a Draft (§2.1, §11.3): it needs `can_author_drafts`,
+    /// and a non-Administrator may only touch Drafts it created.
+    pub fn authorize_draft(&self, draft_id: &str, principal: &Principal) -> Result<DraftRecord, String> {
+        if !principal.ceiling.can_author_drafts && !principal.ceiling.unrestricted {
+            self.audit_denial(principal, "draft.access", draft_id, "principal lacks can_author_drafts");
+            return Err("principal lacks can_author_drafts".into());
+        }
+        let draft = self.draft_status(draft_id)?;
+        if !principal.ceiling.unrestricted && draft.created_by != principal.id {
+            self.audit_denial(principal, "draft.access", draft_id, "draft belongs to another principal");
+            return Err(format!("draft '{draft_id}' not found or not owned by this principal"));
+        }
+        Ok(draft)
+    }
+
+    fn audit_denial(&self, principal: &Principal, operation: &str, target: &str, reason: &str) {
+        let _ = self.store().append_audit(
+            &principal.id,
+            principal.kind.as_str(),
+            operation,
+            target,
+            "denied",
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+
+    // Draft status/list/validate/preview/test/rebase/abort `_as` variants are defined below and
+    // enforce ownership inside DraftManager.
+
+    pub async fn draft_activate_as(&self, draft_id: &str, principal: &Principal) -> Result<ActivationResult, String> {
+        self.authorize_draft(draft_id, principal)?;
+        self.draft_activate(draft_id, principal).await
+    }
+
+
+    /// `definition_create`: fails when the Definition directory already exists in the Draft.
+    #[allow(clippy::too_many_arguments)]
+    pub fn definition_create_in_draft(
+        &self,
+        draft_id: &str,
+        package: &str,
+        def_name: &str,
+        definition_luau: &str,
+        runtime_luau: Option<&str>,
+        tests_luau: Option<&str>,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
+        let draft = self.authorize_draft(draft_id, principal)?;
+        if draft_definition_exists(&draft, package, def_name) {
+            return Err(format!(
+                "definition '{package}/{def_name}' already exists in draft; use definition_edit"
+            ));
+        }
+        self.definition_upsert_in_draft(draft_id, package, def_name, definition_luau, runtime_luau, tests_luau, principal)
+    }
+
+    /// `definition_edit`: fails when the Definition does not exist in the Draft.
+    #[allow(clippy::too_many_arguments)]
+    pub fn definition_edit_in_draft(
+        &self,
+        draft_id: &str,
+        package: &str,
+        def_name: &str,
+        definition_luau: &str,
+        runtime_luau: Option<&str>,
+        tests_luau: Option<&str>,
+        principal: &Principal,
+    ) -> Result<DraftRecord, String> {
+        let draft = self.authorize_draft(draft_id, principal)?;
+        if !draft_definition_exists(&draft, package, def_name) {
+            return Err(format!(
+                "definition '{package}/{def_name}' does not exist in draft; use definition_create"
+            ));
+        }
+        self.definition_upsert_in_draft(draft_id, package, def_name, definition_luau, runtime_luau, tests_luau, principal)
+    }
+
+    /// `instance_create`: fails when an Instance with this id already exists in the Draft.
+    pub fn instance_create_in_draft(&self, draft_id: &str, inst: &InstanceConfig, principal: &Principal) -> Result<DraftRecord, String> {
+        let draft = self.authorize_draft(draft_id, principal)?;
+        if draft_instance_exists(&draft, &inst.id)? {
+            return Err(format!("instance '{}' already exists in draft; use instance_configure", inst.id));
+        }
+        self.instance_upsert_in_draft(draft_id, inst, principal)
+    }
+
+    /// `instance_configure`: fails when the Instance does not exist in the Draft.
+    pub fn instance_configure_in_draft(&self, draft_id: &str, inst: &InstanceConfig, principal: &Principal) -> Result<DraftRecord, String> {
+        let draft = self.authorize_draft(draft_id, principal)?;
+        if !draft_instance_exists(&draft, &inst.id)? {
+            return Err(format!("instance '{}' does not exist in draft; use instance_create", inst.id));
+        }
+        self.instance_upsert_in_draft(draft_id, inst, principal)
+    }
+
+    /// Administrator-only hot reload of the bound Workspace via the Draft protocol (`dash reload`).
+    pub async fn workspace_reload(&self, principal: &Principal) -> Result<ActivationResult, String> {
+        if !principal.ceiling.unrestricted {
+            return Err("only the Administrator may reload the Workspace".into());
+        }
+        self.drafts
+            .reload_workspace(principal)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     // ---- Drafts & Definitions & Instances & Dashboards ----
@@ -728,15 +1012,18 @@ impl AppServices {
     }
 
     pub async fn draft_test(&self, draft_id: &str) -> Result<PreviewTestReport, String> {
-        self.draft_preview(draft_id).await
+        self.draft_test_as(draft_id, &Principal::administrator()).await
     }
 
+    /// Test-focused report: validation, Definition tests and Scenario results (no Preview renders).
     pub async fn draft_test_as(
         &self,
         draft_id: &str,
         principal: &Principal,
     ) -> Result<PreviewTestReport, String> {
-        self.draft_preview_as(draft_id, principal).await
+        let mut report = self.draft_preview_as(draft_id, principal).await?;
+        report.preview_renders.clear();
+        Ok(report)
     }
 
     pub async fn draft_rebase(&self, draft_id: &str) -> Result<DraftRecord, String> {
@@ -975,6 +1262,9 @@ impl AppServices {
         idempotency_key: Option<String>,
         principal: &Principal,
     ) -> Result<ActionExecutionRecord, String> {
+        if self.server.is_shutting_down() {
+            return Err("daemon is shutting down; not admitting new actions".into());
+        }
         self.engine()
             .actions
             .invoke(action_instance, args, principal, idempotency_key, None)
@@ -986,6 +1276,9 @@ impl AppServices {
         req: WidgetRequestEnvelope,
         principal: &Principal,
     ) -> Result<ActionExecutionRecord, String> {
+        if self.server.is_shutting_down() {
+            return Err("daemon is shutting down; not admitting new actions".into());
+        }
         self.engine()
             .actions
             .dispatch_widget_request(req, principal)
@@ -998,6 +1291,9 @@ impl AppServices {
         req: WidgetRequestEnvelope,
         principal: &Principal,
     ) -> Result<WidgetRequestOutcome, String> {
+        if self.server.is_shutting_down() {
+            return Err("daemon is shutting down; not admitting new actions".into());
+        }
         self.engine()
             .actions
             .dispatch_widget_request_outcome(req, principal)
@@ -1017,6 +1313,40 @@ impl AppServices {
                 .store()
                 .list_action_executions(100)
                 .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_value(list).unwrap())
+        }
+    }
+
+    /// Execution records visible to `principal` (§5.1.4, §11.2): the Administrator sees all;
+    /// other Principals see executions they initiated or whose action Instance their ceiling allows.
+    pub fn execution_inspect_for(
+        &self,
+        execution_id: Option<&str>,
+        principal: &Principal,
+    ) -> Result<serde_json::Value, String> {
+        let visible = |r: &ActionExecutionRecord| {
+            principal.ceiling.unrestricted
+                || r.principal_id == principal.id
+                || principal.ceiling.allows_action(&r.action_instance)
+        };
+        if let Some(id) = execution_id {
+            let rec = self
+                .store()
+                .get_action_execution(id)
+                .map_err(|e| e.to_string())?
+                .filter(|r| visible(r))
+                .ok_or_else(|| format!("execution '{id}' not found"))?;
+            Ok(serde_json::to_value(rec).unwrap())
+        } else {
+            let scan = if principal.ceiling.unrestricted { 100 } else { 1000 };
+            let list: Vec<ActionExecutionRecord> = self
+                .store()
+                .list_action_executions(scan)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|r| visible(r))
+                .take(100)
+                .collect();
             Ok(serde_json::to_value(list).unwrap())
         }
     }
@@ -1067,6 +1397,17 @@ impl AppServices {
 
     pub fn audit_query(&self, limit: usize) -> Result<Vec<AuditRecord>, String> {
         self.store().list_audits(limit).map_err(|e| e.to_string())
+    }
+
+    /// Audit trail visible to `principal`: everything for the Administrator, only the
+    /// Principal's own attributed records otherwise.
+    pub fn audit_query_for(&self, limit: usize, principal: &Principal) -> Result<Vec<AuditRecord>, String> {
+        if principal.ceiling.unrestricted {
+            return self.audit_query(limit);
+        }
+        self.store()
+            .list_audits_for_principal(&principal.id, limit)
+            .map_err(|e| e.to_string())
     }
 
     // ---- Git ----
@@ -1427,16 +1768,62 @@ impl AppServices {
         self.graph().workspace.history.clone()
     }
 
+    /// `dash doctor` (§14.1): real store, vault, journal, Git sync, credential and budget checks.
+    /// Read-only: it never repairs journals or records Generations.
     pub fn workspace_doctor(&self) -> Result<serde_json::Value, GitError> {
         let g = self.graph();
         let val = validate_configured_graph(&g, self.store(), false);
         let key_protection = self.store().vault().key_protection().clone();
         let warnings: Vec<String> = key_protection.warning().into_iter().collect();
+        let mut checks: Vec<serde_json::Value> = self
+            .store()
+            .health_checks()
+            .into_iter()
+            .map(|c| serde_json::json!({ "name": c.name, "ok": c.ok, "detail": c.detail }))
+            .collect();
+        let sqlite_ok = checks
+            .iter()
+            .filter(|c| c["name"].as_str().is_some_and(|n| n.starts_with("sqlite_")))
+            .all(|c| c["ok"] == true);
+        let journals = self
+            .store()
+            .list_incomplete_activation_journals()
+            .map(|j| j.len())
+            .map_err(|e| e.to_string());
+        checks.push(match journals {
+            Ok(0) => serde_json::json!({ "name": "activation_journal", "ok": true, "detail": "no incomplete activations" }),
+            Ok(n) => serde_json::json!({ "name": "activation_journal", "ok": false, "detail": format!("{n} incomplete activation journal entr(y/ies); restart the daemon to reconcile") }),
+            Err(e) => serde_json::json!({ "name": "activation_journal", "ok": false, "detail": e }),
+        });
+        let sync = self.store().get_git_sync_state().ok().flatten();
+        checks.push(serde_json::json!({
+            "name": "git_sync",
+            "ok": sync.as_ref().map(|s| s.sync_status != "unsynced").unwrap_or(true),
+            "detail": sync.as_ref().map(|s| format!("{}{}", s.sync_status, s.last_error.as_ref().map(|e| format!(": {e}")).unwrap_or_default())).unwrap_or_else(|| "no sync state recorded".into()),
+        }));
+        let budget = self.server.retention.db_size_budget_bytes;
+        let size = self.store().db_size_bytes();
+        checks.push(serde_json::json!({
+            "name": "sqlite_size_budget",
+            "ok": size <= budget,
+            "detail": format!("{size} of {budget} bytes"),
+        }));
+        checks.push(serde_json::json!({
+            "name": "graph_validation",
+            "ok": val.valid,
+            "detail": format!("{} issue(s)", val.issues.len()),
+        }));
+        let ok = checks.iter().all(|c| c["ok"] == true);
         Ok(serde_json::json!({
             "vault_key_protection": key_protection,
             "network_policy": self.network_policy_status(),
             "warnings": warnings,
-            "sqlite_ok": true,
+            "ok": ok,
+            "checks": checks,
+            "table_rows": self.store().table_row_counts().unwrap_or_default().into_iter().collect::<BTreeMap<_, _>>(),
+            "retention_policy": self.server.retention,
+            "git_sync_state": sync,
+            "sqlite_ok": sqlite_ok,
             "sqlite_bytes": self.store().db_size_bytes(),
             "active_revision": g.revision_commit,
             "generation_id": g.generation_id,
@@ -1447,4 +1834,44 @@ impl AppServices {
             "startup_warnings": self.drafts.startup_warnings(),
         }))
     }
+}
+
+fn draft_definition_exists(draft: &DraftRecord, package: &str, def_name: &str) -> bool {
+    std::path::Path::new(&draft.worktree_path)
+        .join("packages")
+        .join(package)
+        .join(def_name)
+        .join("definition.luau")
+        .exists()
+}
+
+/// Whether an Instance id is declared in any of the Draft's `instances/*.yaml` files.
+fn draft_instance_exists(draft: &DraftRecord, instance_id: &str) -> Result<bool, String> {
+    let dir = std::path::Path::new(&draft.worktree_path).join("instances");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(false);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "yaml" || e == "yml");
+        if !is_yaml || path.file_stem().and_then(|s| s.to_str()) == Some("service_principals") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if let serde_yaml_ng::Value::Mapping(top) = doc {
+            for (_, section) in top {
+                if let serde_yaml_ng::Value::Mapping(m) = section {
+                    if m.contains_key(serde_yaml_ng::Value::String(instance_id.to_string())) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
 }
