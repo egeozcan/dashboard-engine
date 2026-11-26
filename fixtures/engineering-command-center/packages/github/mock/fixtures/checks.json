@@ -1,0 +1,88 @@
+[
+  {
+    "repository": "acme/platform",
+    "refs": [
+      "feat/query-dedup",
+      "9f1c2e7a42"
+    ],
+    "statuses": [
+      {
+        "context": "coverage",
+        "state": "success",
+        "description": "92%"
+      }
+    ],
+    "check_runs": [
+      {
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "test",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
+  {
+    "repository": "acme/platform",
+    "refs": [
+      "feat/delta-resync",
+      "7b3d9a1c43"
+    ],
+    "statuses": [],
+    "check_runs": [
+      {
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "test",
+        "status": "completed",
+        "conclusion": "failure"
+      }
+    ]
+  },
+  {
+    "repository": "acme/platform",
+    "refs": [
+      "main",
+      "aa11bb22cc"
+    ],
+    "statuses": [
+      {
+        "context": "deploy/staging",
+        "state": "pending",
+        "description": "Deploying"
+      }
+    ],
+    "check_runs": [
+      {
+        "name": "build",
+        "status": "in_progress"
+      }
+    ]
+  },
+  {
+    "repository": "acme/payments",
+    "refs": [
+      "fix/idempotency",
+      "5a6b7c8d07"
+    ],
+    "statuses": [],
+    "check_runs": [
+      {
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "lint",
+        "status": "completed",
+        "conclusion": "skipped"
+      }
+    ]
+  }
+]

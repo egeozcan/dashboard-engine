@@ -141,7 +141,7 @@ dash serve                          # without --use-mocks, the real connectors a
 To change configuration on disk, edit the Workspace files (for example `instances/connectors.yaml` → `config.base_url`, or the `[network]` section of `dashboard.toml`). Then run `dash reload`. It turns your working-tree changes into a Draft, then validates, tests, commits and activates it. You can also make the change in the UI or over MCP.
 
 > [!NOTE]
-> The reference GitHub and Jira connectors are intentionally minimal examples of the connector contract. The Mock path is the supported demo. For production use, write connectors that map each API's real response shapes.
+> The GitHub and Jira connectors speak the real APIs: github.com or GitHub Enterprise Server, Jira Cloud (v3) or Server/Data Center (v2). They handle pagination, rate limits and error codes. For any other JSON API, use the built-in `dash.http` connector. See [docs/connectors.md](./docs/connectors.md) for credential schemes, capabilities, operations and examples.
 
 ### Private access over Tailscale
 
@@ -273,13 +273,19 @@ crates/
   dash-server/             Axum router + REST, auth, WebSocket, MCP, AppServices, embedded UI
 web/                       React 19 + TypeScript + Vite UI (embedded into the binary from web/dist)
   src/views/               DashboardView, GraphEditorView, PackageStudioView, DiagnosticsView
-  src/components/widgets/  Built-in widget renderers (dash.table, dash.chart, …)
+  src/components/widgets/  Built-in widget renderers (dash.table, dash.chart, …), one error boundary per node
   src/lib/                 api.ts (fetch + CSRF), signals.ts (/ws client), clientState.ts (Client State),
-                           designer.ts, graphEditor.ts, luau.ts (Studio autocomplete, diagnostics, diffs)
-builtins/catalog.json      Built-in Definitions (11 widget providers, dash.history_series); compiled in
+                           designer.ts, graphEditor.ts, luau.ts (Studio autocomplete, diagnostics, diffs),
+                           widgetFormat.ts, formFields.ts, markdown.tsx (built-in widget helpers)
+builtins/catalog.json      Built-in Definitions (11 widget providers with props contracts,
+                           dash.history_series); compiled in. Reference: docs/builtin-widgets.md
+builtins/luau/             Built-in Luau Definitions (dash.http REST/JSON connector, its Mock,
+                           dash.http_query, dash.http_action, dash.http_util); compiled in
 fixtures/engineering-command-center/   Reference Workspace (§16); the canonical authoring example
 specs/                     Product specification (v0.2 current)
 docs/adr/                  Architectural Decision Records (also served as MCP resources)
+docs/builtin-widgets.md    Props reference for the built-in widgets and dash.history_series
+docs/connectors.md         GitHub, Jira and dash.http connectors: setup, operations, providers, actions
 docs/screenshots/          README images
 GLOSSARY.md                Canonical vocabulary (also served as an MCP resource)
 Dockerfile, docker/        Optional container image (multi-stage; tini; unprivileged)
@@ -352,7 +358,7 @@ Dockerfile, docker/        Optional container image (multi-stage; tini; unprivil
 
 **Build-time gotchas:**
 
-- `GLOSSARY.md`, `docs/adr/*.md`, `builtins/catalog.json` and `web/index.html` are pulled in with `include_str!`. After editing them, rebuild so the MCP `dash://docs/*` resources, the built-in catalog and the CSP test pick up the change.
+- `GLOSSARY.md`, `docs/adr/*.md`, `docs/builtin-widgets.md`, `docs/connectors.md`, `builtins/catalog.json`, `builtins/luau/**` and `web/index.html` are pulled in with `include_str!`. After editing them, rebuild so the MCP `dash://docs/*` resources, the built-in catalog and the CSP test pick up the change.
 - `.cargo/config.toml` sets `DASH_ALLOW_COLOCATED_VAULT_KEY_IN_TEMP=1`. This only covers vault keys inside the system temp directory, i.e. test `TempDir`s. Running `cargo run -- serve` against a real data directory therefore still needs `DASH_VAULT_PASSPHRASE` or one of the other key sources.
 - `RUST_MIN_STACK` is set to 8 MiB because deep Adapter → action → connector chains overflow the default 2 MiB test-thread stack in debug builds. The daemon builds its Tokio runtime with explicit 8 MiB worker stacks.
 - Never point a second daemon or an in-process CLI at a data directory a daemon already owns. `dash serve` holds an exclusive lock on `<data_dir>/daemon.lock` and refuses to start twice.
@@ -404,6 +410,7 @@ scenarios/*.yaml        Scenario tests (run in Preview)
 | `dash.library` | `runtime`. Imported with `require("pkg.lib")` and listed in `libraries`. Runs with the importer's authority. |
 | `dash.automation` | `inputs`, `triggers{ {kind = "event"\|"cron"\|"signal", …} }` |
 
+- **Built-in widgets:** Adapters render `dash.table`, `dash.chart`, `dash.map`, `dash.counter`, `dash.text`, `dash.form`, `dash.button`, `dash.filter`, `dash.container`, `dash.grid` and `dash.tabs` with no Package. Their props are contracts: a node that breaks one renders as a `WIDGET_CONTRACT_VIOLATION` error node. See [docs/builtin-widgets.md](./docs/builtin-widgets.md) for every prop, the shared value formats, and `dash.history_series` windows and downsampling (`window`, `until`, `bucket_secs`, `aggregate`).
 - **Schema builders:** `dash.string()`, `dash.number()`, `dash.integer()`, `dash.boolean()`, `dash.any()`, `dash.enum{…}`, `dash.list(x)`, `dash.optional(x)`, `dash.map(x)`, `dash.object{…}`, and `dash.semantic("ns.type@1", shape)`. You can also pass a semantic type name as a string.
 - **Input references:** `dash.connector_ref(id, {required_capabilities})`, `dash.data_ref(id)` and `dash.action_ref(id)`.
 - **Validation:** declarations with unknown keys, or that aren't deterministic, are rejected. `dash manifest <id>` shows the generated manifest, the JSON Schema and the Luau types.
@@ -515,7 +522,7 @@ These are the spec §15.3 gates, measured by `apps/dash/tests/benchmarks.rs` in 
 
 - Spec §19 items are still open: OS keychain integration, webhook ingress, large-data record batches, contract evolution and Package signature verification. The code documents the defaults it chose. Don't present these as finished features.
 - Luau sandboxing runs in-process. It is **not** an OS-level security boundary, and a subprocess worker mode is reserved for hostile Packages (§3.2).
-- The reference connectors are examples of the contract, not complete GitHub or Jira clients.
+- The GitHub and Jira Packages cover pull requests, issues, comments, search, CI status, Actions runs (GitHub), and JQL search, transitions, comments and issue creation (Jira). Other API areas (reviews, releases, projects, sprints, webhooks) are not covered yet. Build them on `dash.http` or extend the Packages.
 - `cargo clippy --workspace --all-targets` reports warnings. Fix them when you touch the code nearby, and don't add new ones.
 
 ---

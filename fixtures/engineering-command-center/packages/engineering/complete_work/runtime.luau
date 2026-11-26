@@ -16,9 +16,10 @@ function Runtime.run(ctx)
     else
         ikey = "complete-" .. tostring(ctx.event.event_id)
     end
+    -- A `done` status by category: workflows name it Done, Closed, Resolved or a translation.
     return ctx:await(ctx.inputs.transition:invoke({
         key = issue_key,
-        status = "Done",
+        status_category = "done",
     }, ikey))
 end
 

@@ -1,0 +1,11 @@
+local dash = require("dash")
+local Runtime = require("runtime")
+
+dash.test("JQL search over the Jira Mock", function(make_ctx)
+    local dev = Runtime.query(make_ctx({ query = { jql = "project = DEV AND statusCategory != Done ORDER BY priority DESC" } }))
+    dash.assert_eq(#dev, 3, "three open DEV issues")
+    local review = Runtime.query(make_ctx({ query = { jql = 'status = "In Review"' } }))
+    dash.assert_eq(#review, 2, "two issues in review")
+    local limited = Runtime.query(make_ctx({ query = { jql = "project in (DEV, PAY)", max_results = 2 } }))
+    dash.assert_eq(#limited, 2, "max_results")
+end)

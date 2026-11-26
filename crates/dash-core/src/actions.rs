@@ -264,8 +264,9 @@ const WIDGET_DRY_RUN_BINDING_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_WIDGET_DRY_RUN_BINDINGS: usize = 4096;
 
 /// Built-in widget types whose host-rendered UI sends Requests; the Request name is the one the
-/// Adapter configured in the widget's props (`request`, `row_action.request`) or its default.
-const BUILTIN_REQUEST_WIDGETS: &[&str] = &["dash.button", "dash.form", "dash.table"];
+/// Adapter configured in the widget's props (`request`, `row_action.request`/`row_actions[].request`,
+/// `point_action.request`) or its default.
+const BUILTIN_REQUEST_WIDGETS: &[&str] = &["dash.button", "dash.form", "dash.map", "dash.table"];
 
 /// Built-in widget types that never send Requests (they only render, or change Dashboard State).
 const BUILTIN_SILENT_WIDGETS: &[&str] = &[
@@ -274,7 +275,6 @@ const BUILTIN_SILENT_WIDGETS: &[&str] = &[
     "dash.counter",
     "dash.filter",
     "dash.grid",
-    "dash.map",
     "dash.tabs",
     "dash.text",
 ];
@@ -2892,8 +2892,10 @@ fn resolve_invalidations(
     out
 }
 
-/// `invalidates` entries of action Instances that match no Instance, Definition or input slot
-/// (they silently invalidate nothing). Returns `(action_instance, entry)` pairs.
+/// `invalidates` entries of action Instances that match no Instance, input slot or data-provider
+/// Definition: typos that silently invalidate nothing. A data-provider Definition without
+/// Instances in this Workspace is not reported (a reusable Package names every provider its
+/// writes affect). Returns `(action_instance, entry)` pairs.
 pub fn unresolved_invalidations(graph: &ConfiguredGraph) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (id, inst) in &graph.instances {
@@ -2906,7 +2908,11 @@ pub fn unresolved_invalidations(graph: &ConfiguredGraph) -> Vec<(String, String)
         for target in &def.manifest.invalidates {
             let matched = graph.instances.contains_key(target)
                 || graph.instances.values().any(|c| c.definition == *target)
-                || inst.inputs.contains_key(target);
+                || inst.inputs.contains_key(target)
+                || graph
+                    .definitions
+                    .get(target)
+                    .is_some_and(|d| d.manifest.category == DefinitionCategory::DataProvider);
             if !matched {
                 out.push((id.clone(), target.clone()));
             }
@@ -3536,6 +3542,7 @@ function R.render(ctx)
             { key = "badge", widget_type = "t.badge", props = {} },
             { key = "mute", widget_type = "t.mute", props = {} },
             { key = "label", widget_type = "dash.text", props = {} },
+            { key = "map", widget_type = "dash.map", props = {} },
             { key = "stray", widget_type = "t.not_a_widget", props = {} },
         },
     }
@@ -3980,6 +3987,7 @@ return R
             headers: BTreeMap::new(),
             body: Some(json!({"merge": true})),
             credential: None,
+            confine_to: None,
         };
 
         let lost = broker
@@ -4900,6 +4908,13 @@ return R
             ),
             "{stray}"
         );
+        // dash.map sends the marker Request its Adapter configured (`point_action`).
+        a.dispatch_widget_request_outcome(
+            req("refresh", "adapter_map", 1, json!({"id": "fra"})),
+            &admin,
+        )
+        .await
+        .unwrap();
         // Built-in widgets that only render, and unknown widget types, send no Requests.
         for (wid, needle) in [
             ("adapter_label", "does not send Requests"),
@@ -5199,9 +5214,16 @@ return R
             vec!["data_inst".to_string()]
         );
         assert!(unresolved_invalidations(&g).is_empty());
+        // A known data-provider Definition without Instances is not a typo.
         g.instances.remove("data_inst");
+        assert!(unresolved_invalidations(&g).is_empty());
+        // An entry that names nothing at all is reported.
+        let mut def = g.definitions["t.write"].clone();
+        def.manifest.invalidates.push("t.dta".into());
+        g.definitions.insert("t.write".into(), def);
         let missing = unresolved_invalidations(&g);
-        assert!(missing.contains(&("write".to_string(), "t.data".to_string())));
+        assert!(missing.contains(&("write".to_string(), "t.dta".to_string())));
+        assert!(!missing.iter().any(|(_, e)| e == "t.data"));
     }
 
     // Reference fixture: merge_pr declares a Definition (not Instance names) in `invalidates`,
@@ -5218,7 +5240,10 @@ return R
         );
         assert_eq!(
             merge.manifest.invalidates,
-            vec!["github.pull_requests".to_string()]
+            vec![
+                "github.pull_requests".to_string(),
+                "github.search".to_string()
+            ]
         );
         let conn = load_def(
             "github",
@@ -5236,7 +5261,7 @@ return R
             &merge.manifest,
             &merge.runtime_source,
             &read("merge_pr/tests.luau"),
-            &BTreeMap::new(),
+            &BTreeMap::from([("github.model".to_string(), read("model/runtime.luau"))]),
             Arc::new(dash_luau::NullHostBridge),
             json!({}),
         )

@@ -23,6 +23,8 @@ export interface WidgetNode {
   layout_override?: LayoutOverride;
   /** Entry point of a custom widget provider's declared asset (server-provided). */
   asset_url?: string;
+  /** Set when the server replaced an invalid node by a `dash.text` error node. */
+  render_error?: string;
 }
 
 export interface AdapterRender {

@@ -740,6 +740,16 @@ const DOC_TOPICS: &[(&str, &str, &str)] = &[
         include_str!("../../../GLOSSARY.md"),
     ),
     (
+        "connectors",
+        "GitHub, Jira and generic REST/JSON (dash.http) connectors: setup, operations, providers, actions",
+        include_str!("../../../docs/connectors.md"),
+    ),
+    (
+        "builtin-widgets",
+        "Built-in widget providers (props reference) and dash.history_series",
+        include_str!("../../../docs/builtin-widgets.md"),
+    ),
+    (
         "adr-0001-adapters-evaluated-per-dashboard",
         "ADR 0001: Adapters evaluated per Dashboard",
         include_str!("../../../docs/adr/0001-adapters-evaluated-per-dashboard.md"),

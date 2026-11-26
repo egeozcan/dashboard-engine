@@ -23,6 +23,10 @@ pub struct HttpHostRequest {
     /// Secret binding name (credential handle, never plaintext).
     #[serde(default)]
     pub credential: Option<String>,
+    /// URL prefix (`scheme://host[:port]/path`) the request and every redirect hop must stay
+    /// under; a hop outside it is refused before anything (or any credential) is sent.
+    #[serde(default)]
+    pub confine_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -916,6 +920,17 @@ pub fn build_dash_runtime_sdk(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
     dash.set("json", json)?;
+    dash.set("url", build_url_helpers(lua)?)?;
+    // An empty table that serializes as a JSON array (`[]`) rather than an object (`{}`), for
+    // list results built up in Luau that may stay empty.
+    dash.set(
+        "array",
+        lua.create_function(|lua, ()| {
+            let t = lua.create_table()?;
+            t.set_metatable(Some(lua.array_metatable()))?;
+            Ok(t)
+        })?,
+    )?;
 
     dash.set(
         "uuid",
@@ -938,12 +953,210 @@ pub fn build_dash_runtime_sdk(lua: &Lua) -> mlua::Result<Table> {
     Ok(dash)
 }
 
+/// Percent-encode `s` as one URL component: every byte except RFC 3986 unreserved characters
+/// (`A-Z a-z 0-9 - _ . ~`) becomes `%XX`.
+pub fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn query_scalar(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(match n.as_f64() {
+            Some(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => format!("{}", f as i64),
+            _ => n.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// `k=v&...` query string of a JSON object: keys sorted, `null`/empty values skipped, lists
+/// repeated per element (`k=a&k=b`), everything percent-encoded.
+pub fn build_query_string(params: &serde_json::Value) -> Result<String, String> {
+    let Some(obj) = params.as_object() else {
+        return if params.is_null() {
+            Ok(String::new())
+        } else {
+            Err("dash.url.query expects a table of parameters".into())
+        };
+    };
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    let mut parts = Vec::new();
+    for k in keys {
+        let v = &obj[k];
+        let values: Vec<String> = match v {
+            serde_json::Value::Null => Vec::new(),
+            serde_json::Value::Array(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    out.push(query_scalar(item).ok_or_else(|| {
+                        format!("dash.url.query: list parameter '{k}' must hold scalars")
+                    })?);
+                }
+                out
+            }
+            // An empty Luau table arrives as an empty object: no values.
+            serde_json::Value::Object(m) if m.is_empty() => Vec::new(),
+            serde_json::Value::Object(_) => {
+                return Err(format!(
+                    "dash.url.query: parameter '{k}' must be a scalar or a list of scalars"
+                ))
+            }
+            other => vec![query_scalar(other).unwrap_or_default()],
+        };
+        for val in values {
+            parts.push(format!(
+                "{}={}",
+                percent_encode_component(k),
+                percent_encode_component(&val)
+            ));
+        }
+    }
+    Ok(parts.join("&"))
+}
+
+/// Parse an RFC 8288 `Link` header (`<url>; rel="next", <url>; rel="last"`) into `rel -> url`.
+pub fn parse_link_header(header: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for part in header.split(',') {
+        let mut segs = part.split(';');
+        let Some(target) = segs.next().map(str::trim) else {
+            continue;
+        };
+        let Some(url) = target.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
+            continue;
+        };
+        for param in segs {
+            let Some((name, value)) = param.split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("rel") {
+                for rel in value.trim().trim_matches('"').split_whitespace() {
+                    out.entry(rel.to_ascii_lowercase())
+                        .or_insert_with(|| url.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `dash.url`: URL helpers for connector runtimes (`encode`, `query`, `parse_links`).
+fn build_url_helpers(lua: &Lua) -> mlua::Result<Table> {
+    let url = lua.create_table()?;
+    url.set(
+        "encode",
+        lua.create_function(|_, v: Value| {
+            let s = match v {
+                Value::String(s) => s.to_str()?.to_string(),
+                Value::Integer(i) => i.to_string(),
+                Value::Number(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => (n as i64).to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Boolean(b) => b.to_string(),
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "dash.url.encode expects a string or number, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            Ok(percent_encode_component(&s))
+        })?,
+    )?;
+    url.set(
+        "query",
+        lua.create_function(|lua, v: Value| {
+            let j: serde_json::Value = if v.is_nil() {
+                serde_json::Value::Null
+            } else {
+                lua.from_value(v)?
+            };
+            build_query_string(&j).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    url.set(
+        "parse_links",
+        lua.create_function(|lua, v: Option<String>| {
+            let t = lua.create_table()?;
+            if let Some(h) = v {
+                for (rel, target) in parse_link_header(&h) {
+                    t.set(rel, target)?;
+                }
+            }
+            Ok(t)
+        })?,
+    )?;
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pool::tests::{bundle, cfg, ProbeBridge};
     use crate::pool::{ResourceBudget, VmPool};
     use serde_json::json;
+
+    #[test]
+    fn url_helpers_encode_build_queries_and_parse_link_headers() {
+        assert_eq!(
+            percent_encode_component("a b/c?d=é~"),
+            "a%20b%2Fc%3Fd%3D%C3%A9~"
+        );
+        assert_eq!(
+            build_query_string(&json!({
+                "state": "open", "per_page": 100, "labels": ["bug", "p 1"],
+                "skip": null, "empty": {}, "draft": false
+            }))
+            .unwrap(),
+            "draft=false&labels=bug&labels=p%201&per_page=100&state=open"
+        );
+        assert_eq!(build_query_string(&json!(null)).unwrap(), "");
+        assert!(build_query_string(&json!({ "nested": { "a": 1 } })).is_err());
+        let links = parse_link_header(
+            r#"<https://api.github.com/repos/a/b/pulls?page=2>; rel="next", <https://api.github.com/repos/a/b/pulls?page=5>; rel="last""#,
+        );
+        assert_eq!(
+            links["next"],
+            "https://api.github.com/repos/a/b/pulls?page=2"
+        );
+        assert_eq!(
+            links["last"],
+            "https://api.github.com/repos/a/b/pulls?page=5"
+        );
+        assert!(parse_link_header("garbage").is_empty());
+
+        let lua = Lua::new();
+        lua.globals()
+            .set("dash", build_dash_runtime_sdk(&lua).unwrap())
+            .unwrap();
+        let out: String = lua
+            .load(
+                r#"
+                local links = dash.url.parse_links('<https://x/y?p=2>; rel="next"')
+                return dash.url.encode("o/r") .. "|" .. dash.url.query({ q = "is:pr", n = 2 }) .. "|" .. links.next
+            "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(out, "o%2Fr|n=2&q=is%3Apr|https://x/y?p=2");
+
+        let arr: Value = lua
+            .load("local empty = dash.array(); local full = dash.array(); table.insert(full, 1); return { empty = empty, full = full }")
+            .eval()
+            .unwrap();
+        let j: serde_json::Value = lua.from_value(arr).unwrap();
+        assert_eq!(j, json!({ "empty": [], "full": [1] }));
+    }
 
     const EMIT_RT: &str = r#"
 local R = {}

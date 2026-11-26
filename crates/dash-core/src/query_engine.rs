@@ -963,14 +963,7 @@ impl QueryEngine {
             serde_json::Value::Object(m) => m,
             _ => return Err("history_series query parameters must be an object".into()),
         };
-        if let Some(unknown) = obj
-            .keys()
-            .find(|k| !matches!(k.as_str(), "series_id" | "params" | "since" | "limit"))
-        {
-            return Err(format!(
-                "history_series query does not accept parameter '{unknown}' (allowed: series_id, params, since, limit)"
-            ));
-        }
+        let read = crate::history::parse_history_read_options(obj, Utc::now())?;
         let serves = || {
             format!(
                 "history_series Instance '{}' serves series {}",
@@ -1031,18 +1024,10 @@ impl QueryEngine {
                 ))
             }
         };
-        let since = match obj.get("since") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(s)) => Some(s.as_str()),
-            Some(_) => return Err("history_series 'since' must be an RFC 3339 string".into()),
-        };
-        let limit = match obj.get("limit") {
-            None | Some(serde_json::Value::Null) => HISTORY_DEFAULT_LIMIT,
-            Some(v) => v.as_u64().ok_or_else(|| {
-                "history_series 'limit' must be a non-negative integer".to_string()
-            })? as usize,
-        }
-        .min(HISTORY_MAX_LIMIT);
+        let limit = read
+            .limit
+            .unwrap_or(HISTORY_DEFAULT_LIMIT)
+            .min(HISTORY_MAX_LIMIT);
 
         let val = match series_id {
             None => serde_json::Value::Array(Vec::new()),
@@ -1069,11 +1054,28 @@ impl QueryEngine {
                         ))
                     }
                 }
-                let samples = self
-                    .store
-                    .query_history_samples(series_id, since, limit)
-                    .map_err(|e| e.to_string())?;
-                serde_json::to_value(samples).map_err(|e| e.to_string())?
+                let (since, until) = (read.since.as_deref(), read.until.as_deref());
+                match read.bucket {
+                    // Downsampled: one aggregate per time bucket.
+                    Some((bucket_secs, aggregate)) => serde_json::to_value(
+                        self.store
+                            .query_history_buckets(
+                                series_id,
+                                since,
+                                until,
+                                bucket_secs,
+                                aggregate,
+                                limit,
+                            )
+                            .map_err(|e| e.to_string())?,
+                    ),
+                    None => serde_json::to_value(
+                        self.store
+                            .query_history_samples_window(series_id, since, until, limit)
+                            .map_err(|e| e.to_string())?,
+                    ),
+                }
+                .map_err(|e| e.to_string())?
             }
         };
         let qk = self.compute_query_key(&inst.id, HISTORY_BUILTIN_DIGEST, params, principal);
@@ -5233,6 +5235,47 @@ return R
         assert!(other.unwrap_err().contains("serves series 's_list'"));
         let unknown = q.query("hist", json!({"bogus": 1}), &admin, false).await;
         assert!(unknown.is_err());
+
+        // Windowed, downsampled read: one bucket aggregating both recent samples; samples
+        // outside the window are excluded.
+        e.store
+            .append_history_sample("s_list", &Utc::now().to_rfc3339(), 6.0, None)
+            .unwrap();
+        e.store
+            .append_history_sample(
+                "s_list",
+                &(Utc::now() - chrono::Duration::days(3)).to_rfc3339(),
+                100.0,
+                None,
+            )
+            .unwrap();
+        let buckets = q
+            .query(
+                "hist",
+                json!({"window": "1d", "bucket_secs": "1d", "aggregate": "max"}),
+                &admin,
+                false,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let buckets = buckets.as_array().unwrap();
+        let total: i64 = buckets.iter().map(|b| b["samples"].as_i64().unwrap()).sum();
+        assert_eq!(total, 2, "{buckets:?}");
+        assert!(buckets
+            .iter()
+            .all(|b| b["value_num"].as_f64().unwrap() <= 6.0));
+        let bad = q
+            .query(
+                "hist",
+                json!({"aggregate": "median", "bucket_secs": 60}),
+                &admin,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(bad.contains("aggregate"), "{bad}");
     }
 
     /// One history Instance serving a series per sampled repository; readers select by the
@@ -5934,6 +5977,7 @@ return R"#,
             headers: BTreeMap::new(),
             body: None,
             credential: None,
+            confine_to: None,
         };
         let post = mk(Instant::now() + Duration::from_millis(150));
         let err = post.http_request(req("POST")).await.unwrap_err();

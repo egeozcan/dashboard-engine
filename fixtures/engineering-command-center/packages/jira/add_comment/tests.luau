@@ -1,0 +1,12 @@
+local dash = require("dash")
+local Runtime = require("runtime")
+
+dash.test("comments on an existing issue; a missing issue fails the Dry run", function(make_ctx)
+    local ctx = make_ctx({ args = { key = "PAY-9", body = "Deployed to staging" } })
+    dash.assert(Runtime.dry_run(ctx).feasible == true, "feasible")
+    local res = Runtime.execute(ctx)
+    dash.assert_eq(res.key, "PAY-9", "key")
+    dash.assert(res.id ~= "", "comment id")
+    local ok, err = pcall(Runtime.dry_run, make_ctx({ args = { key = "PAY-999", body = "x" } }))
+    dash.assert(not ok and string.find(tostring(err), "NOT_FOUND", 1, true) ~= nil, tostring(err))
+end)

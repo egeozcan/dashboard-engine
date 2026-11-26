@@ -428,17 +428,18 @@ impl HostBridge for MockTestBridge {
         // The built-in history provider has no Luau runtime and no Mock. A Definition test has
         // recorded no samples, so it serves an empty series (after checking its parameters).
         if def_id == "dash.history_series" {
-            let accepted = match &params {
-                serde_json::Value::Null => true,
-                serde_json::Value::Object(m) => m
-                    .keys()
-                    .all(|k| matches!(k.as_str(), "series_id" | "params" | "since" | "limit")),
-                _ => false,
-            };
-            if !accepted {
-                return Err(format!(
-                    "invalid query parameters for 'dash.history_series': {params} (allowed: series_id, params, since, limit)"
-                ));
+            match &params {
+                serde_json::Value::Null => {}
+                serde_json::Value::Object(m) => {
+                    dash_core::history::parse_history_read_options(m, chrono::Utc::now()).map_err(
+                        |e| format!("invalid query parameters for 'dash.history_series': {e}"),
+                    )?;
+                }
+                _ => {
+                    return Err(format!(
+                        "invalid query parameters for 'dash.history_series': {params} (expected an object)"
+                    ))
+                }
             }
             return Ok(serde_json::json!([]));
         }
@@ -1408,7 +1409,27 @@ mod mock_test_bridge_tests {
         // connector input -> github.mock fixtures (and Mock state within one test)
         // 5 Mock-backed cases + 5 self-contained reconcile/dry_run/execute cases
         assert_eq!(report_for(&reports, "github.merge_pr").passed, 10);
-        assert_eq!(report_for(&reports, "github.pull_requests").passed, 4);
+        // 3 Mock-backed cases + 4 scripted polling/merge-detection cases
+        assert_eq!(report_for(&reports, "github.pull_requests").passed, 7);
+        // Every GitHub data provider and action reaches the Mock's operations.
+        for (id, cases) in [
+            ("github.connector", 13),
+            ("jira.connector", 11),
+            ("jira.search", 1),
+            ("jira.issues_by_keys", 2),
+            ("jira.transition_issue", 4),
+            ("jira.add_comment", 1),
+            ("jira.create_issue", 1),
+            ("github.issues", 2),
+            ("github.search", 1),
+            ("github.workflow_runs", 1),
+            ("github.ci_status", 1),
+            ("github.create_issue", 2),
+            ("github.comment", 2),
+            ("github.set_issue_state", 1),
+        ] {
+            assert_eq!(report_for(&reports, id).passed, cases, "{id}");
+        }
         // data inputs -> providers -> Mocks
         assert_eq!(report_for(&reports, "engineering.linked_prs").passed, 3);
         // adapter -> data provider -> providers -> Mocks
@@ -1500,6 +1521,7 @@ end)
                 headers: Default::default(),
                 body: None,
                 credential: None,
+                confine_to: None,
             })
             .await
             .unwrap_err();

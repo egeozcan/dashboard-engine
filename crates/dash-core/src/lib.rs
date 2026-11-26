@@ -565,6 +565,7 @@ return R
                     headers: BTreeMap::new(),
                     body: None,
                     credential: Some("auth".into()),
+                    confine_to: None,
                 },
             )
             .await
@@ -585,6 +586,7 @@ return R
                     headers: BTreeMap::new(),
                     body: None,
                     credential: Some("auth".into()),
+                    confine_to: None,
                 },
             )
             .await

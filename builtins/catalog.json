@@ -1,22 +1,228 @@
 {
+  "$comment": "Built-in Definitions. `props` is each widget provider's props contract in a compact notation: a JSON object is a record (a key ending in '?' is optional), a one-element array is a list of that element, and a string names a type: string | number | integer | boolean | any | enum:a|b|c | map:<type> | list:<type>.",
   "widget_providers": [
-    { "id": "dash.table", "category": "widget_provider", "description": "Interactive data table with client-side sort, filter, and row action Requests" },
-    { "id": "dash.chart", "category": "widget_provider", "description": "Time-series and categorical SVG chart" },
-    { "id": "dash.map", "category": "widget_provider", "description": "Geographic marker visualization" },
-    { "id": "dash.counter", "category": "widget_provider", "description": "Metric KPI counter and status indicator" },
-    { "id": "dash.text", "category": "widget_provider", "description": "Formatted status and rich text block" },
-    { "id": "dash.form", "category": "widget_provider", "description": "Typed parameter or action input form" },
-    { "id": "dash.button", "category": "widget_provider", "description": "Action trigger button with optional Dry run" },
-    { "id": "dash.container", "category": "widget_provider", "description": "Vertical/horizontal flex layout container" },
-    { "id": "dash.grid", "category": "widget_provider", "description": "Responsive CSS grid container" },
-    { "id": "dash.tabs", "category": "widget_provider", "description": "Tabbed widget view switcher" },
-    { "id": "dash.filter", "category": "widget_provider", "description": "Client/Dashboard filter control" }
+    {
+      "id": "dash.table",
+      "category": "widget_provider",
+      "description": "Interactive data table with typed/formatted columns, client-side sort, search and pagination, CSV export, and row action Requests",
+      "props": {
+        "title?": "string",
+        "columns?": [
+          {
+            "key": "string",
+            "label?": "string",
+            "type?": "string",
+            "format?": "string",
+            "decimals?": "number",
+            "currency?": "string",
+            "unit?": "string",
+            "prefix?": "string",
+            "align?": "enum:left|right|center",
+            "width?": "any",
+            "hidden?": "boolean",
+            "sortable?": "boolean",
+            "badges?": "map:string",
+            "href_key?": "string",
+            "max_chars?": "number"
+          }
+        ],
+        "rows?": ["map:any"],
+        "row_key?": "string",
+        "client_sort_state_key?": "string",
+        "client_filter_state_key?": "string",
+        "default_sort?": { "key": "string", "dir?": "enum:asc|desc|ascending|descending" },
+        "searchable?": "boolean",
+        "page_size?": "number",
+        "empty_message?": "string",
+        "exportable?": "boolean",
+        "row_action?": {
+          "label?": "string",
+          "request": "string",
+          "variant?": "enum:default|primary|danger",
+          "disabled_key?": "string",
+          "hidden_key?": "string"
+        },
+        "row_actions?": [
+          {
+            "label?": "string",
+            "request": "string",
+            "variant?": "enum:default|primary|danger",
+            "disabled_key?": "string",
+            "hidden_key?": "string"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dash.chart",
+      "category": "widget_provider",
+      "description": "Line, area and bar SVG chart over one or more series with time, numeric or categorical x axis, thresholds and tooltips",
+      "props": {
+        "title?": "string",
+        "series?": ["map:any"],
+        "x_key?": "string",
+        "y_key?": "string",
+        "y_keys?": ["any"],
+        "series_label?": "string",
+        "kind?": "enum:line|area|bar",
+        "height?": "number",
+        "y_min?": "number",
+        "y_max?": "number",
+        "zero_baseline?": "boolean",
+        "format?": "string",
+        "decimals?": "number",
+        "currency?": "string",
+        "unit?": "string",
+        "prefix?": "string",
+        "x_format?": "enum:auto|time|number|category",
+        "thresholds?": [{ "value": "number", "label?": "string", "status?": "string", "color?": "string" }],
+        "show_legend?": "boolean",
+        "empty_message?": "string"
+      }
+    },
+    {
+      "id": "dash.map",
+      "category": "widget_provider",
+      "description": "Geographic marker visualization fitted to its points, colored by status, sized by value, with optional marker Requests",
+      "props": {
+        "title?": "string",
+        "points?": ["map:any"],
+        "fit?": "boolean",
+        "height?": "number",
+        "format?": "string",
+        "decimals?": "number",
+        "currency?": "string",
+        "unit?": "string",
+        "prefix?": "string",
+        "point_action?": { "label?": "string", "request": "string" }
+      }
+    },
+    {
+      "id": "dash.counter",
+      "category": "widget_provider",
+      "description": "Metric KPI counter with value formatting, status or threshold badge, change vs previous value and sparkline",
+      "props": {
+        "label?": "string",
+        "value?": "any",
+        "format?": "string",
+        "decimals?": "number",
+        "currency?": "string",
+        "unit?": "string",
+        "prefix?": "string",
+        "status?": "string",
+        "thresholds?": { "warning?": "number", "critical?": "number", "direction?": "enum:above|below" },
+        "previous?": "any",
+        "delta?": "any",
+        "delta_format?": "enum:percent|absolute",
+        "delta_label?": "string",
+        "higher_is_better?": "boolean",
+        "description?": "string",
+        "sparkline?": ["any"]
+      }
+    },
+    {
+      "id": "dash.text",
+      "category": "widget_provider",
+      "description": "Formatted status and rich text block (plain text or a safe Markdown subset) with callout variants",
+      "props": {
+        "title?": "string",
+        "text?": "string",
+        "markdown?": "boolean",
+        "format?": "enum:plain|markdown",
+        "variant?": "enum:default|info|success|warning|danger"
+      }
+    },
+    {
+      "id": "dash.form",
+      "category": "widget_provider",
+      "description": "Typed, validated parameter or action input form that submits one Request",
+      "props": {
+        "title?": "string",
+        "request?": "string",
+        "submit_label?": "string",
+        "variant?": "enum:default|primary|danger",
+        "disabled?": "boolean",
+        "reset_on_submit?": "boolean",
+        "payload?": "map:any",
+        "fields?": [
+          {
+            "name": "string",
+            "label?": "string",
+            "type?": "enum:text|textarea|number|integer|boolean|select|date|datetime|email|url",
+            "required?": "boolean",
+            "placeholder?": "string",
+            "help?": "string",
+            "default?": "any",
+            "options?": ["any"],
+            "min?": "number",
+            "max?": "number",
+            "step?": "number",
+            "pattern?": "string",
+            "min_length?": "number",
+            "max_length?": "number"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dash.button",
+      "category": "widget_provider",
+      "description": "Action trigger button with optional Dry run",
+      "props": {
+        "label?": "string",
+        "request?": "string",
+        "payload?": "map:any",
+        "variant?": "enum:default|primary|danger",
+        "disabled?": "boolean",
+        "description?": "string"
+      }
+    },
+    {
+      "id": "dash.container",
+      "category": "widget_provider",
+      "description": "Vertical/horizontal flex layout container",
+      "props": {
+        "title?": "string",
+        "direction?": "enum:vertical|horizontal",
+        "gap?": "number",
+        "wrap?": "boolean",
+        "align?": "enum:start|center|end|stretch|baseline",
+        "justify?": "enum:start|center|end|between|around|evenly"
+      }
+    },
+    {
+      "id": "dash.grid",
+      "category": "widget_provider",
+      "description": "Responsive 12-column CSS grid container",
+      "props": { "title?": "string", "columns?": "number", "gap?": "number" }
+    },
+    {
+      "id": "dash.tabs",
+      "category": "widget_provider",
+      "description": "Tabbed widget view switcher with keyboard navigation and a remembered tab",
+      "props": { "title?": "string", "default_tab?": "any", "client_state_key?": "string" }
+    },
+    {
+      "id": "dash.filter",
+      "category": "widget_provider",
+      "description": "Dashboard State filter control: select, multiselect, search, toggle or segmented",
+      "props": {
+        "label?": "string",
+        "state_key?": "string",
+        "control?": "enum:select|multiselect|search|toggle|segmented",
+        "options?": ["any"],
+        "value?": "any",
+        "placeholder?": "string",
+        "all_label?": "string",
+        "debounce_ms?": "number"
+      }
+    }
   ],
   "data_providers": [
     {
       "id": "dash.history_series",
       "category": "data_provider",
-      "description": "Queries sampled compact historical time-series stored by HistoryManager"
+      "description": "Queries sampled compact historical time-series stored by HistoryManager, optionally windowed and downsampled into time buckets"
     }
   ]
 }

@@ -2,7 +2,7 @@ local dash = require("dash")
 
 return dash.data_provider {
     id = "jira.issues_by_keys",
-    description = "Fetches Jira issues by issue key list",
+    description = "Fetches Jira issues by issue key list (unknown keys are skipped)",
     runtime = "runtime.luau",
     handler = "query",
     inputs = {
@@ -13,11 +13,7 @@ return dash.data_provider {
     query = dash.object {
         keys = dash.list(dash.string()),
     },
-    output = dash.list(dash.semantic("pm.issue@1", dash.object {
-        key = dash.string(),
-        summary = dash.string(),
-        status = dash.string(),
-    })),
+    output = dash.list("pm.issue@1"),
     updates = {
         on_demand = true,
         subscribe = true,

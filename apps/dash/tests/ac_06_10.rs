@@ -17,10 +17,12 @@
 //! - Appendix A.3 / §10.3: stale-Generation and unbound-widget_id Requests are rejected; a
 //!   connector without a Mock fails Preview with MISSING_MOCK.
 
+mod fake_api;
+
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use dash_core::{
     apply_delta_envelope, CapabilityCeiling, EnvelopeKind, Principal, PrincipalKind, QueryEnvelope,
@@ -103,8 +105,12 @@ impl Upstream {
             .route("/repos/{owner}/{repo}/pulls", get(list_prs))
             .route("/repos/{owner}/{repo}/pulls/{num}", get(get_pr))
             .route("/repos/{owner}/{repo}/pulls/{num}/merge", put(merge_pr))
-            .route("/rest/api/3/search", get(search_issues))
-            .route("/rest/api/3/issue/{key}/transitions", post(transition))
+            .route("/rest/api/3/search/jql", get(search_issues))
+            .route("/rest/api/3/issue/{key}", get(get_issue))
+            .route(
+                "/rest/api/3/issue/{key}/transitions",
+                get(list_transitions).post(transition),
+            )
             .with_state((state.clone(), released.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -206,13 +212,16 @@ async fn list_prs(
     if s.fail_reads {
         return (StatusCode::INTERNAL_SERVER_ERROR, "upstream down").into_response();
     }
+    // GitHub's `closed` covers closed and merged PRs; the response is real REST payloads.
     let rows: Vec<Value> = s
         .prs
         .iter()
         .filter(|p| {
-            p["repository"] == repo.as_str() && (wanted == "all" || p["state"] == wanted.as_str())
+            let st = p["state"].as_str().unwrap_or("open");
+            let api_state = if st == "open" { "open" } else { "closed" };
+            p["repository"] == repo.as_str() && (wanted == "all" || api_state == wanted.as_str())
         })
-        .cloned()
+        .map(|p| fake_api::github_pr(p, false))
         .collect();
     Json(rows).into_response()
 }
@@ -232,8 +241,12 @@ async fn get_pr(
         .iter()
         .find(|p| p["repository"] == repo.as_str() && p["number"] == num)
     {
-        Some(pr) => Json(pr.clone()).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such PR").into_response(),
+        Some(pr) => Json(fake_api::github_pr(pr, true)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "Not Found" })),
+        )
+            .into_response(),
     }
 }
 
@@ -272,12 +285,7 @@ async fn search_issues(
     State((state, _)): State<Shared>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let jql = q.get("jql").cloned().unwrap_or_default();
-    let keys: BTreeSet<String> = jql
-        .split_once('(')
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .map(|(inner, _)| inner.split(',').map(|k| k.trim().to_string()).collect())
-        .unwrap_or_default();
+    let keys = fake_api::jql_keys(q.get("jql").map(String::as_str).unwrap_or_default());
     let mut s = state.lock().unwrap();
     bump(&mut s, "jira_search".into());
     let rows: Vec<Value> = s
@@ -286,22 +294,64 @@ async fn search_issues(
         .filter(|i| keys.contains(i["key"].as_str().unwrap_or_default()))
         .cloned()
         .collect();
-    Json(rows).into_response()
+    Json(fake_api::jira_search_page(&rows)).into_response()
 }
 
+fn jira_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "errorMessages": ["Issue does not exist or you do not have permission to see it."], "errors": {} })),
+    )
+        .into_response()
+}
+
+async fn get_issue(State((state, _)): State<Shared>, AxPath(key): AxPath<String>) -> Response {
+    let mut s = state.lock().unwrap();
+    bump(&mut s, format!("get_issue:{key}"));
+    match s.issues.iter().find(|i| i["key"] == key.as_str()) {
+        Some(issue) => Json(fake_api::jira_issue(issue)).into_response(),
+        None => jira_not_found(),
+    }
+}
+
+async fn list_transitions(
+    State((state, _)): State<Shared>,
+    AxPath(key): AxPath<String>,
+) -> Response {
+    let s = state.lock().unwrap();
+    match s.issues.iter().find(|i| i["key"] == key.as_str()) {
+        Some(issue) => Json(fake_api::jira_transitions(
+            issue["status"].as_str().unwrap_or("To Do"),
+        ))
+        .into_response(),
+        None => jira_not_found(),
+    }
+}
+
+/// `POST /rest/api/3/issue/{key}/transitions` with `{ transition: { id } }`; records
+/// `(key, target status)` and answers 204 like Jira.
 async fn transition(
     State((state, _)): State<Shared>,
     AxPath(key): AxPath<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let status = body["status"].as_str().unwrap_or("Done").to_string();
     let mut s = state.lock().unwrap();
     bump(&mut s, format!("transition:{key}"));
-    s.transitions.push((key.clone(), status.clone()));
+    let Some(status) = body["transition"]["id"]
+        .as_str()
+        .and_then(fake_api::jira_transition_target)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "errorMessages": ["Transition id is not valid for this issue."] })),
+        )
+            .into_response();
+    };
+    s.transitions.push((key.clone(), status.to_string()));
     if let Some(issue) = s.issues.iter_mut().find(|i| i["key"] == key.as_str()) {
-        issue["status"] = json!(status.clone());
+        issue["status"] = json!(status);
     }
-    Json(json!({"key": key, "status": status, "transitioned": true})).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ---------------------------------------------------------------------------------------------

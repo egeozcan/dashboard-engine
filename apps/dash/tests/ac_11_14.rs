@@ -6,9 +6,12 @@
 //! graph view, widget bridge) is covered by the Vitest suites in `web/src/**`; the tests here
 //! check that the backend produces exactly the data those views rely on.
 
+mod fake_api;
+
+use axum::response::IntoResponse;
 use axum::{
-    extract::{Path as AxPath, State},
-    routing::{get, post},
+    extract::{Path as AxPath, Query, State},
+    routing::get,
     Json, Router,
 };
 use dash_core::{CapabilityCeiling, DashboardDoc, InstanceConfig, Principal};
@@ -146,6 +149,8 @@ async fn spawn_upstream() -> (Upstream, std::net::SocketAddr) {
             .unwrap(),
     )
     .unwrap();
+    let issues = Arc::new(Mutex::new(issues.as_array().unwrap().clone()));
+    let (issues_search, issues_get, issues_list) = (issues.clone(), issues.clone(), issues.clone());
     let app = Router::new()
         .route(
             "/repos/{owner}/{repo}/pulls",
@@ -158,28 +163,84 @@ async fn spawn_upstream() -> (Upstream, std::net::SocketAddr) {
                         .unwrap()
                         .iter()
                         .filter(|p| p["repository"] == full.as_str())
-                        .cloned()
+                        .map(|p| fake_api::github_pr(p, false))
                         .collect();
                     Json(Value::Array(rows))
                 }
             }),
         )
         .route(
-            "/rest/api/3/search",
-            get(move || {
-                let issues = issues.clone();
-                async move { Json(issues) }
+            "/rest/api/3/search/jql",
+            get(move |Query(q): Query<BTreeMap<String, String>>| {
+                let issues = issues_search.clone();
+                async move {
+                    let keys = fake_api::jql_keys(q.get("jql").map(String::as_str).unwrap_or(""));
+                    let rows: Vec<Value> = issues
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|i| keys.contains(i["key"].as_str().unwrap_or("")))
+                        .cloned()
+                        .collect();
+                    Json(fake_api::jira_search_page(&rows))
+                }
+            }),
+        )
+        .route(
+            "/rest/api/3/issue/{key}",
+            get(move |AxPath(key): AxPath<String>| {
+                let issues = issues_get.clone();
+                async move {
+                    let found = issues
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|i| i["key"] == key.as_str())
+                        .cloned();
+                    match found {
+                        Some(i) => Json(fake_api::jira_issue(&i)).into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
             }),
         )
         .route(
             "/rest/api/3/issue/{key}/transitions",
-            post(
-                |State(up): State<Upstream>,
-                 AxPath(key): AxPath<String>,
-                 Json(body): Json<Value>| async move {
-                    let status = body["status"].as_str().unwrap_or("Done").to_string();
-                    up.transitions.lock().unwrap().push((key.clone(), body));
-                    Json(json!({ "key": key, "status": status, "transitioned": true }))
+            get(move |AxPath(key): AxPath<String>| {
+                let issues = issues_list.clone();
+                async move {
+                    let status = issues
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|i| i["key"] == key.as_str())
+                        .and_then(|i| i["status"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    Json(fake_api::jira_transitions(&status))
+                }
+            })
+            .post(
+                move |State(up): State<Upstream>,
+                      AxPath(key): AxPath<String>,
+                      Json(body): Json<Value>| {
+                    let issues = issues.clone();
+                    async move {
+                        if let Some(target) = body["transition"]["id"]
+                            .as_str()
+                            .and_then(fake_api::jira_transition_target)
+                        {
+                            if let Some(i) = issues
+                                .lock()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|i| i["key"] == key.as_str())
+                            {
+                                i["status"] = json!(target);
+                            }
+                        }
+                        up.transitions.lock().unwrap().push((key.clone(), body));
+                        axum::http::StatusCode::NO_CONTENT
+                    }
                 },
             ),
         )
@@ -1153,7 +1214,8 @@ async fn ac12_agent_adds_widget_via_mcp_tests_rebases_activates_pushes_and_invok
         let calls = upstream.transitions.lock().unwrap();
         assert_eq!(calls.len(), 1, "the live Jira API received the transition");
         assert_eq!(calls[0].0, "DEV-123");
-        assert_eq!(calls[0].1["status"], "Done");
+        // The workflow transition reaching "Done" in the fixture workflow.
+        assert_eq!(calls[0].1["transition"]["id"], "31");
     }
     // Not a configuration write: no draft, no commit.
     assert_eq!(git(&app.ws, &["rev-parse", "HEAD"]), new_head);

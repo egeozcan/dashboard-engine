@@ -305,6 +305,72 @@ struct BuiltinCatalogEntry {
     id: String,
     #[serde(default)]
     description: String,
+    /// Widget providers: props contract in the catalog's compact notation (see
+    /// [`parse_builtin_schema`]); absent means any props.
+    #[serde(default)]
+    props: Option<serde_json::Value>,
+}
+
+/// Parse the catalog's compact schema notation into a [`dash_luau::SchemaSpec`]:
+///
+/// - a JSON object is a record; a key ending in `?` is optional,
+/// - a one-element array is a list of that element,
+/// - a string names a type: `string`, `number`, `integer`, `boolean`, `any`, `enum:a|b|c`,
+///   `map:<type>` or `list:<type>`.
+fn parse_builtin_schema(v: &serde_json::Value) -> Result<dash_luau::SchemaSpec, String> {
+    use dash_luau::SchemaSpec;
+    match v {
+        serde_json::Value::Object(fields) => {
+            let mut out = BTreeMap::new();
+            for (k, fv) in fields {
+                let inner = parse_builtin_schema(fv).map_err(|e| format!("{k}: {e}"))?;
+                match k.strip_suffix('?') {
+                    Some(name) => out.insert(
+                        name.to_string(),
+                        SchemaSpec::Optional {
+                            inner: Box::new(inner),
+                        },
+                    ),
+                    None => out.insert(k.clone(), inner),
+                };
+            }
+            Ok(SchemaSpec::Object { fields: out })
+        }
+        serde_json::Value::Array(items) if items.len() == 1 => Ok(SchemaSpec::List {
+            item: Box::new(parse_builtin_schema(&items[0])?),
+        }),
+        serde_json::Value::String(s) => parse_builtin_type_name(s),
+        other => Err(format!("unsupported schema notation {other}")),
+    }
+}
+
+fn parse_builtin_type_name(s: &str) -> Result<dash_luau::SchemaSpec, String> {
+    use dash_luau::SchemaSpec;
+    if let Some(values) = s.strip_prefix("enum:") {
+        let values: Vec<String> = values.split('|').map(str::to_string).collect();
+        if values.iter().any(String::is_empty) {
+            return Err(format!("empty enum value in '{s}'"));
+        }
+        return Ok(SchemaSpec::Enum { values });
+    }
+    if let Some(inner) = s.strip_prefix("map:") {
+        return Ok(SchemaSpec::Map {
+            value: Box::new(parse_builtin_type_name(inner)?),
+        });
+    }
+    if let Some(inner) = s.strip_prefix("list:") {
+        return Ok(SchemaSpec::List {
+            item: Box::new(parse_builtin_type_name(inner)?),
+        });
+    }
+    Ok(match s {
+        "string" => SchemaSpec::String,
+        "number" => SchemaSpec::Number,
+        "integer" => SchemaSpec::Integer,
+        "boolean" => SchemaSpec::Boolean,
+        "any" => SchemaSpec::Any,
+        other => return Err(format!("unknown type '{other}'")),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,7 +385,100 @@ fn builtin_catalog() -> BuiltinCatalog {
     serde_json::from_str(BUILTIN_CATALOG_JSON).expect("builtins/catalog.json must be valid JSON")
 }
 
+macro_rules! builtin_luau_file {
+    ($dir:literal, $file:literal) => {
+        (
+            $file,
+            include_str!(concat!("../../../builtins/luau/", $dir, "/", $file)),
+        )
+    };
+}
+
+/// Built-in Definitions implemented in Luau (`builtins/luau/<dir>/`), compiled into the binary
+/// and loaded exactly like a Package's Definitions under the reserved `dash` Package.
+const BUILTIN_LUAU_DEFINITIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "http_util",
+        &[
+            builtin_luau_file!("http_util", "definition.luau"),
+            builtin_luau_file!("http_util", "runtime.luau"),
+        ],
+    ),
+    (
+        "http",
+        &[
+            builtin_luau_file!("http", "definition.luau"),
+            builtin_luau_file!("http", "runtime.luau"),
+        ],
+    ),
+    (
+        "http_mock",
+        &[
+            builtin_luau_file!("http_mock", "definition.luau"),
+            builtin_luau_file!("http_mock", "runtime.luau"),
+        ],
+    ),
+    (
+        "http_query",
+        &[
+            builtin_luau_file!("http_query", "definition.luau"),
+            builtin_luau_file!("http_query", "runtime.luau"),
+        ],
+    ),
+    (
+        "http_action",
+        &[
+            builtin_luau_file!("http_action", "definition.luau"),
+            builtin_luau_file!("http_action", "runtime.luau"),
+        ],
+    ),
+];
+
+/// `tests.luau` of built-in Luau Definitions, keyed by Definition id. They are not attached to
+/// the Workspace graph (so `dash test` reports only the Workspace's own tests); the engine's
+/// test suite runs them (see `builtin_luau_definition_tests_pass`).
+pub const BUILTIN_LUAU_TESTS: &[(&str, &str)] = &[
+    (
+        "dash.http",
+        include_str!("../../../builtins/luau/http/tests.luau"),
+    ),
+    (
+        "dash.http_query",
+        include_str!("../../../builtins/luau/http_query/tests.luau"),
+    ),
+    (
+        "dash.http_action",
+        include_str!("../../../builtins/luau/http_action/tests.luau"),
+    ),
+];
+
+/// The built-in Luau Definitions, evaluated once per process (their sources are constant).
+fn builtin_luau_definitions() -> &'static BTreeMap<String, LoadedDefinition> {
+    static CELL: std::sync::OnceLock<BTreeMap<String, LoadedDefinition>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut out = BTreeMap::new();
+        for (dir, files) in BUILTIN_LUAU_DEFINITIONS {
+            let sources: BTreeMap<String, Vec<u8>> = files
+                .iter()
+                .map(|(name, src)| (name.to_string(), src.as_bytes().to_vec()))
+                .collect();
+            load_definition_from_sources(
+                RESERVED_PACKAGE_NAME,
+                &Path::new("builtins/luau").join(dir),
+                &sources,
+                &mut out,
+            )
+            .unwrap_or_else(|e| panic!("built-in Luau Definition '{dir}' is invalid: {e}"));
+        }
+        out
+    })
+}
+
 fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
+    for (id, def) in builtin_luau_definitions() {
+        out.insert(id.clone(), def.clone());
+    }
     use dash_luau::{DefinitionManifest, SchemaSpec, UpdateModes};
     let catalog = builtin_catalog();
     let hist_description = catalog
@@ -381,6 +540,11 @@ fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
 
     for entry in &catalog.widget_providers {
         let (wid, desc) = (entry.id.as_str(), entry.description.as_str());
+        let props_schema = match &entry.props {
+            Some(p) => parse_builtin_schema(p)
+                .unwrap_or_else(|e| panic!("builtins/catalog.json: props of '{wid}': {e}")),
+            None => SchemaSpec::Any,
+        };
         let mut m = DefinitionManifest {
             id: wid.into(),
             category: DefinitionCategory::WidgetProvider,
@@ -409,7 +573,7 @@ fn register_builtin_definitions(out: &mut BTreeMap<String, LoadedDefinition>) {
             dashboard_state_reads: vec![],
             accepts_requests: vec![],
             request_schemas: BTreeMap::new(),
-            widget_props: Some(SchemaSpec::Any),
+            widget_props: Some(props_schema),
             widget_asset: Some("builtin".into()),
             updates: UpdateModes::default(),
             triggers: vec![],
@@ -563,145 +727,154 @@ fn load_package_dir(
     def_dirs.sort();
 
     for def_dir in def_dirs {
-        let decl_path = def_dir.join("definition.luau");
         let mut resolved_sources = BTreeMap::new();
         collect_definition_sources(&def_dir, &def_dir, &mut resolved_sources)?;
-        let decl_src = source_text(&resolved_sources, "definition.luau", &decl_path)?
-            .ok_or_else(|| GitError::Workspace(format!("missing {}", decl_path.display())))?;
-
-        let manifest = evaluate_declaration(&decl_src, &resolved_sources).map_err(|e| {
-            GitError::Workspace(format!("declaration '{}': {e}", decl_path.display()))
-        })?;
-        let ctx = |msg: String| {
-            GitError::Workspace(format!("declaration '{}': {msg}", decl_path.display()))
-        };
-
-        // A Definition's ID is `package.definition` and must belong to its containing Package.
-        let def_id = manifest.id.clone();
-        if !def_id.starts_with(&format!("{pkg_name}.")) {
-            return Err(ctx(format!(
-                "definition id '{def_id}' must start with its package name '{pkg_name}.'"
-            )));
-        }
-        if let Some(existing) = out.get(&def_id) {
-            return Err(ctx(format!(
-                "duplicate definition id '{def_id}' (already provided by package '{}')",
-                existing.package_name
-            )));
-        }
-
-        // The runtime module is read from the Definition's own resolved sources, so it is always
-        // confined to the Definition directory and covered by its identity digest.
-        let runtime_rel = if manifest.runtime.is_empty() {
-            "runtime.luau".to_string()
-        } else {
-            manifest.runtime.clone()
-        };
-        let runtime_path = def_dir.join(&runtime_rel);
-        let runtime_source = match source_text(&resolved_sources, &runtime_rel, &runtime_path)? {
-            Some(src) => {
-                dash_luau::declaration::check_runtime_source(&manifest, &src)
-                    .map_err(|e| ctx(e.to_string()))?;
-                src
-            }
-            None if manifest.category == DefinitionCategory::WidgetProvider => "return {}".into(),
-            None => {
-                return Err(ctx(format!(
-                    "{} '{def_id}' requires runtime module '{runtime_rel}', which does not exist",
-                    manifest.category.as_str()
-                )))
-            }
-        };
-
-        let tests_source =
-            source_text(&resolved_sources, "tests.luau", &def_dir.join("tests.luau"))?;
-
-        // Load JSON fixtures (under fixtures/ or declared paths). Declared fixtures must exist and
-        // parse; other JSON files are offered as fixtures when they parse.
-        let mut fixtures = BTreeMap::new();
-        for (fixture_name, rel) in &manifest.fixtures {
-            let Some(bytes) = resolved_sources.get(rel) else {
-                return Err(ctx(format!(
-                    "fixture '{fixture_name}' path '{rel}' does not exist in the Definition directory"
-                )));
-            };
-            let val = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| {
-                ctx(format!(
-                    "fixture '{fixture_name}' ({rel}) is not valid JSON: {e}"
-                ))
-            })?;
-            fixtures.insert(rel.clone(), val);
-        }
-        for (rel, bytes) in &resolved_sources {
-            if rel.ends_with(".json") && !fixtures.contains_key(rel) {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                    fixtures.insert(rel.clone(), val);
-                }
-            }
-        }
-
-        // Load custom widget assets (§10.1): only widget providers publish browser assets, and
-        // only files under `assets/`; the declared entry point must live there and exist.
-        if manifest.category == DefinitionCategory::WidgetProvider {
-            let asset = manifest.widget_asset.as_deref().unwrap_or("");
-            if !is_widget_asset_path(asset) {
-                return Err(ctx(format!(
-                    "widget asset '{asset}' must be a relative path under assets/"
-                )));
-            }
-            if !resolved_sources.contains_key(asset) {
-                return Err(ctx(format!(
-                    "widget_provider '{def_id}' asset '{asset}' does not exist in the Definition directory"
-                )));
-            }
-        }
-        let mut widget_assets = BTreeMap::new();
-        let mut assets_total = 0usize;
-        if manifest.category == DefinitionCategory::WidgetProvider {
-            for (rel, bytes) in &resolved_sources {
-                if !is_widget_asset_path(rel) {
-                    continue;
-                }
-                let ext = Path::new(rel)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase())
-                    .unwrap_or_default();
-                if !ALLOWED_WIDGET_ASSET_EXTENSIONS.contains(&ext.as_str()) {
-                    return Err(ctx(format!(
-                        "widget asset '{rel}' has a disallowed file type (allowed: {})",
-                        ALLOWED_WIDGET_ASSET_EXTENSIONS.join(", ")
-                    )));
-                }
-                if bytes.len() > MAX_WIDGET_ASSET_BYTES {
-                    return Err(ctx(format!(
-                        "widget asset '{rel}' is {} bytes, above the {MAX_WIDGET_ASSET_BYTES}-byte limit",
-                        bytes.len()
-                    )));
-                }
-                assets_total += bytes.len();
-                if assets_total > MAX_WIDGET_ASSETS_TOTAL_BYTES {
-                    return Err(ctx(format!(
-                        "widget assets exceed the {MAX_WIDGET_ASSETS_TOTAL_BYTES}-byte per-Definition limit"
-                    )));
-                }
-                widget_assets.insert(rel.clone(), bytes.clone());
-            }
-        }
-
-        out.insert(
-            def_id,
-            LoadedDefinition {
-                package_name: pkg_name.to_string(),
-                manifest,
-                definition_source: decl_src,
-                runtime_source,
-                tests_source,
-                fixtures,
-                widget_assets,
-            },
-        );
+        load_definition_from_sources(pkg_name, &def_dir, &resolved_sources, out)?;
     }
+    Ok(())
+}
+
+/// Load one Definition from its resolved source files (paths relative to the Definition
+/// directory `def_dir`, which only labels error messages).
+fn load_definition_from_sources(
+    pkg_name: &str,
+    def_dir: &Path,
+    resolved_sources: &BTreeMap<String, Vec<u8>>,
+    out: &mut BTreeMap<String, LoadedDefinition>,
+) -> Result<(), GitError> {
+    let decl_path = def_dir.join("definition.luau");
+    let decl_src = source_text(resolved_sources, "definition.luau", &decl_path)?
+        .ok_or_else(|| GitError::Workspace(format!("missing {}", decl_path.display())))?;
+
+    let manifest = evaluate_declaration(&decl_src, resolved_sources)
+        .map_err(|e| GitError::Workspace(format!("declaration '{}': {e}", decl_path.display())))?;
+    let ctx =
+        |msg: String| GitError::Workspace(format!("declaration '{}': {msg}", decl_path.display()));
+
+    // A Definition's ID is `package.definition` and must belong to its containing Package.
+    let def_id = manifest.id.clone();
+    if !def_id.starts_with(&format!("{pkg_name}.")) {
+        return Err(ctx(format!(
+            "definition id '{def_id}' must start with its package name '{pkg_name}.'"
+        )));
+    }
+    if let Some(existing) = out.get(&def_id) {
+        return Err(ctx(format!(
+            "duplicate definition id '{def_id}' (already provided by package '{}')",
+            existing.package_name
+        )));
+    }
+
+    // The runtime module is read from the Definition's own resolved sources, so it is always
+    // confined to the Definition directory and covered by its identity digest.
+    let runtime_rel = if manifest.runtime.is_empty() {
+        "runtime.luau".to_string()
+    } else {
+        manifest.runtime.clone()
+    };
+    let runtime_path = def_dir.join(&runtime_rel);
+    let runtime_source = match source_text(resolved_sources, &runtime_rel, &runtime_path)? {
+        Some(src) => {
+            dash_luau::declaration::check_runtime_source(&manifest, &src)
+                .map_err(|e| ctx(e.to_string()))?;
+            src
+        }
+        None if manifest.category == DefinitionCategory::WidgetProvider => "return {}".into(),
+        None => {
+            return Err(ctx(format!(
+                "{} '{def_id}' requires runtime module '{runtime_rel}', which does not exist",
+                manifest.category.as_str()
+            )))
+        }
+    };
+
+    let tests_source = source_text(resolved_sources, "tests.luau", &def_dir.join("tests.luau"))?;
+
+    // Load JSON fixtures (under fixtures/ or declared paths). Declared fixtures must exist and
+    // parse; other JSON files are offered as fixtures when they parse.
+    let mut fixtures = BTreeMap::new();
+    for (fixture_name, rel) in &manifest.fixtures {
+        let Some(bytes) = resolved_sources.get(rel) else {
+            return Err(ctx(format!(
+                "fixture '{fixture_name}' path '{rel}' does not exist in the Definition directory"
+            )));
+        };
+        let val = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| {
+            ctx(format!(
+                "fixture '{fixture_name}' ({rel}) is not valid JSON: {e}"
+            ))
+        })?;
+        fixtures.insert(rel.clone(), val);
+    }
+    for (rel, bytes) in resolved_sources {
+        if rel.ends_with(".json") && !fixtures.contains_key(rel) {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                fixtures.insert(rel.clone(), val);
+            }
+        }
+    }
+
+    // Load custom widget assets (§10.1): only widget providers publish browser assets, and
+    // only files under `assets/`; the declared entry point must live there and exist.
+    if manifest.category == DefinitionCategory::WidgetProvider {
+        let asset = manifest.widget_asset.as_deref().unwrap_or("");
+        if !is_widget_asset_path(asset) {
+            return Err(ctx(format!(
+                "widget asset '{asset}' must be a relative path under assets/"
+            )));
+        }
+        if !resolved_sources.contains_key(asset) {
+            return Err(ctx(format!(
+                "widget_provider '{def_id}' asset '{asset}' does not exist in the Definition directory"
+            )));
+        }
+    }
+    let mut widget_assets = BTreeMap::new();
+    let mut assets_total = 0usize;
+    if manifest.category == DefinitionCategory::WidgetProvider {
+        for (rel, bytes) in resolved_sources {
+            if !is_widget_asset_path(rel) {
+                continue;
+            }
+            let ext = Path::new(rel)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !ALLOWED_WIDGET_ASSET_EXTENSIONS.contains(&ext.as_str()) {
+                return Err(ctx(format!(
+                    "widget asset '{rel}' has a disallowed file type (allowed: {})",
+                    ALLOWED_WIDGET_ASSET_EXTENSIONS.join(", ")
+                )));
+            }
+            if bytes.len() > MAX_WIDGET_ASSET_BYTES {
+                return Err(ctx(format!(
+                    "widget asset '{rel}' is {} bytes, above the {MAX_WIDGET_ASSET_BYTES}-byte limit",
+                    bytes.len()
+                )));
+            }
+            assets_total += bytes.len();
+            if assets_total > MAX_WIDGET_ASSETS_TOTAL_BYTES {
+                return Err(ctx(format!(
+                    "widget assets exceed the {MAX_WIDGET_ASSETS_TOTAL_BYTES}-byte per-Definition limit"
+                )));
+            }
+            widget_assets.insert(rel.clone(), bytes.clone());
+        }
+    }
+
+    out.insert(
+        def_id,
+        LoadedDefinition {
+            package_name: pkg_name.to_string(),
+            manifest,
+            definition_source: decl_src,
+            runtime_source,
+            tests_source,
+            fixtures,
+            widget_assets,
+        },
+    );
     Ok(())
 }
 
@@ -1217,6 +1390,131 @@ mod tests {
     }
 
     const QUERY_RT: &str = "local R = {}; function R.query(ctx) return {} end; return R";
+
+    /// The built-in Luau Definitions load into every Workspace graph, and their tests pass.
+    #[tokio::test]
+    async fn builtin_luau_definition_tests_pass() {
+        let tmp = TempDir::new().unwrap();
+        let mut g =
+            load_workspace_graph(tmp.path(), &tmp.path().join("data"), "t", 1, true).unwrap();
+        for id in [
+            "dash.http",
+            "dash.http_mock",
+            "dash.http_query",
+            "dash.http_action",
+            "dash.http_util",
+        ] {
+            let d = g
+                .definitions
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!(d.package_name, "dash");
+            assert!(
+                d.tests_source.is_none(),
+                "built-in tests stay out of `dash test`"
+            );
+        }
+        assert_eq!(
+            g.find_mock_for("dash.http").map(|m| m.manifest.id.clone()),
+            Some("dash.http_mock".to_string())
+        );
+        for (id, src) in BUILTIN_LUAU_TESTS {
+            g.definitions.get_mut(*id).unwrap().tests_source = Some(src.to_string());
+        }
+        let g = std::sync::Arc::new(g);
+        for (id, _) in BUILTIN_LUAU_TESTS {
+            let r = crate::preview::run_definition_tests_against_mocks(g.clone(), id)
+                .await
+                .unwrap();
+            assert!(r.failed == 0 && r.passed > 0, "{id}: {:#?}", r.cases);
+        }
+    }
+
+    #[test]
+    fn builtin_schema_notation_parses_records_lists_and_type_names() {
+        use dash_luau::SchemaSpec;
+        let s = parse_builtin_schema(&serde_json::json!({
+            "title?": "string",
+            "rows": ["map:any"],
+            "kind?": "enum:line|bar",
+            "tags?": "list:string",
+        }))
+        .unwrap();
+        let SchemaSpec::Object { fields } = &s else {
+            panic!("{s:?}")
+        };
+        assert!(matches!(fields["title"], SchemaSpec::Optional { .. }));
+        assert!(matches!(fields["rows"], SchemaSpec::List { .. }));
+        assert!(s
+            .validate_value(&serde_json::json!({ "rows": [{ "a": 1 }], "kind": "bar" }))
+            .is_ok());
+        assert!(
+            s.validate_value(&serde_json::json!({})).is_err(),
+            "rows is required"
+        );
+        assert!(s
+            .validate_value(&serde_json::json!({ "rows": [], "kind": "pie" }))
+            .is_err());
+        assert!(parse_builtin_schema(&serde_json::json!("strin")).is_err());
+        assert!(parse_builtin_schema(&serde_json::json!("enum:a||b")).is_err());
+        assert!(parse_builtin_schema(&serde_json::json!(["a", "b"])).is_err());
+    }
+
+    #[test]
+    fn builtin_widget_providers_declare_props_contracts() {
+        let mut defs = BTreeMap::new();
+        register_builtin_definitions(&mut defs);
+        let check = |wt: &str, props: serde_json::Value| {
+            defs[wt]
+                .manifest
+                .widget_props
+                .as_ref()
+                .unwrap()
+                .validate_value(&props)
+        };
+        // The reference application's props satisfy the contracts.
+        check(
+            "dash.table",
+            serde_json::json!({
+                "title": "Open Pull Requests",
+                "columns": [{ "key": "number", "label": "#" }],
+                "rows": [{ "number": 1 }],
+                "client_sort_state_key": "pr_table_sort",
+                "row_action": { "label": "Merge PR", "request": "merge_requested", "action_instance": "merge_pr" },
+            }),
+        )
+        .unwrap();
+        check(
+            "dash.chart",
+            serde_json::json!({ "title": "t", "series": [], "x_key": "sampled_at", "y_key": "value_num" }),
+        )
+        .unwrap();
+        check(
+            "dash.counter",
+            serde_json::json!({ "label": "Open", "value": 3, "status": "warning" }),
+        )
+        .unwrap();
+        check("dash.container", serde_json::json!({})).unwrap();
+        // Typical Adapter mistakes are caught before they reach a widget.
+        let err = check(
+            "dash.table",
+            serde_json::json!({ "columns": [{ "label": "x" }] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("key"), "{err}");
+        assert!(check("dash.table", serde_json::json!({ "rows": "nope" })).is_err());
+        assert!(check("dash.chart", serde_json::json!({ "kind": "pie" })).is_err());
+        assert!(check(
+            "dash.form",
+            serde_json::json!({ "fields": [{ "label": "no name" }] })
+        )
+        .is_err());
+        // Package Studio autocomplete gets the props type.
+        assert!(defs["dash.table"]
+            .manifest
+            .generated_luau_types
+            .contains("export type WidgetProps = "));
+    }
 
     #[test]
     fn library_edits_change_dependent_identity_only() {

@@ -141,7 +141,7 @@ async fn reference_definition_tests_catch_behaviour_regressions() {
         // Polling stops reporting external merges.
         Mutation {
             file: "github/pull_requests/runtime.luau",
-            from: "if prev_states[key] == \"open\" and pr.state == \"merged\" then",
+            from: "if pr.state == \"merged\" then",
             to: "if false then",
             id: "github.pull_requests",
             catches: "polling emits one durable github.pr_merged when an open PR turns merged",

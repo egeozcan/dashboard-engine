@@ -504,6 +504,7 @@ export const DashboardView: React.FC = () => {
                         dashboardId={rendered.dashboard_id}
                         onWidgetRequest={handleWidgetRequest}
                         onDashboardStateChange={handleDashboardStateChange}
+                        dashboardState={rendered.dashboard_state}
                         designerMode={designerMode}
                         onSelectWidget={setSelectedWidgetId}
                         selectedWidgetId={selectedWidgetId}

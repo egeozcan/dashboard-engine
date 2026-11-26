@@ -1,0 +1,13 @@
+local dash = require("dash")
+local Runtime = require("runtime")
+
+dash.test("closes an open issue once; repeating changes nothing", function(make_ctx)
+    local ctx = make_ctx({ args = { repository = "acme/platform", number = 101, state = "closed" } })
+    local rep = Runtime.dry_run(ctx)
+    dash.assert_eq(rep.effects.from, "open", "currently open")
+    local first = Runtime.execute(ctx)
+    dash.assert_eq(first, { number = 101, state = "closed", changed = true }, "closed")
+    local again = Runtime.execute(ctx)
+    dash.assert(again.changed == false, "idempotent")
+    dash.assert_eq(Runtime.reconcile(ctx).status, "succeeded", "reconcile sees the new state")
+end)

@@ -339,6 +339,61 @@ pub struct HistorySampleRecord {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Aggregate of the samples in one time bucket of a downsampled history read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAggregate {
+    Avg,
+    Min,
+    Max,
+    Sum,
+    Count,
+    First,
+    Last,
+}
+
+impl HistoryAggregate {
+    pub const NAMES: &'static [&'static str] =
+        &["avg", "min", "max", "sum", "count", "first", "last"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "avg" => Self::Avg,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "sum" => Self::Sum,
+            "count" => Self::Count,
+            "first" => Self::First,
+            "last" => Self::Last,
+            _ => return None,
+        })
+    }
+
+    /// `(value expression, extra select column)`. `first`/`last` rely on SQLite's bare-column
+    /// rule: with exactly one `min()`/`max()` aggregate, bare columns come from that row.
+    fn sql(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Avg => ("AVG(value_num)", ""),
+            Self::Min => ("MIN(value_num)", ""),
+            Self::Max => ("MAX(value_num)", ""),
+            Self::Sum => ("SUM(value_num)", ""),
+            Self::Count => ("CAST(COUNT(*) AS REAL)", ""),
+            Self::First => ("value_num", ", MIN(sampled_at)"),
+            Self::Last => ("value_num", ", MAX(sampled_at)"),
+        }
+    }
+}
+
+/// One time bucket of a downsampled history read. `sampled_at` is the bucket start (UTC), so
+/// buckets chart like raw samples (`x_key = "sampled_at"`, `y_key = "value_num"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryBucketRecord {
+    pub series_id: String,
+    pub sampled_at: String,
+    pub value_num: f64,
+    /// Number of samples aggregated into this bucket.
+    pub samples: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitSyncRecord {
     pub active_revision: Option<String>,
@@ -2686,53 +2741,111 @@ impl SqliteStore {
         since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<HistorySampleRecord>, StoreError> {
+        self.query_history_samples_window(series_id, since, None, limit)
+    }
+
+    /// Raw samples with `since <= sampled_at < until`. With `since`, the oldest `limit` samples
+    /// of the window; without it, the newest `limit` (always returned oldest first).
+    pub fn query_history_samples_window(
+        &self,
+        series_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistorySampleRecord>, StoreError> {
         // Query budget (§7.4): one read never returns more than HISTORY_QUERY_BUDGET samples.
         let limit = limit.clamp(1, HISTORY_QUERY_BUDGET);
+        let (filter, mut args) = history_window_filter(series_id, since, until);
+        args.push(rusqlite::types::Value::Integer(limit as i64));
+        let sql = if since.is_some() {
+            format!(
+                "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
+                 FROM history_samples WHERE {filter}
+                 ORDER BY sampled_at ASC, sample_id ASC LIMIT ?"
+            )
+        } else {
+            format!(
+                "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
+                 FROM history_samples
+                 WHERE sample_id IN (
+                    SELECT sample_id FROM history_samples WHERE {filter}
+                    ORDER BY sampled_at DESC, sample_id DESC LIMIT ?)
+                 ORDER BY sampled_at ASC, sample_id ASC"
+            )
+        };
         self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                let meta_raw: Option<String> = r.get(4)?;
+                Ok(HistorySampleRecord {
+                    sample_id: r.get(0)?,
+                    series_id: r.get(1)?,
+                    sampled_at: r.get(2)?,
+                    value_num: r.get(3)?,
+                    metadata: meta_raw.and_then(|s| serde_json::from_str(&s).ok()),
+                })
+            })?;
             let mut out = Vec::new();
-            if let Some(since_ts) = since {
-                let mut stmt = conn.prepare(
-                    "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
-                     FROM history_samples
-                     WHERE series_id = ?1 AND sampled_at >= ?2
-                     ORDER BY sampled_at ASC LIMIT ?3",
-                )?;
-                let rows = stmt.query_map(params![series_id, since_ts, limit as i64], |r| {
-                    let meta_raw: Option<String> = r.get(4)?;
-                    Ok(HistorySampleRecord {
-                        sample_id: r.get(0)?,
-                        series_id: r.get(1)?,
-                        sampled_at: r.get(2)?,
-                        value_num: r.get(3)?,
-                        metadata: meta_raw.and_then(|s| serde_json::from_str(&s).ok()),
-                    })
-                })?;
-                for row in rows {
-                    out.push(row?);
-                }
-            } else {
-                let mut stmt = conn.prepare(
-                    "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
-                     FROM history_samples
-                     WHERE sample_id IN (
-                        SELECT sample_id FROM history_samples
-                        WHERE series_id = ?1
-                        ORDER BY sampled_at DESC, sample_id DESC LIMIT ?2)
-                     ORDER BY sampled_at ASC, sample_id ASC",
-                )?;
-                let rows = stmt.query_map(params![series_id, limit as i64], |r| {
-                    let meta_raw: Option<String> = r.get(4)?;
-                    Ok(HistorySampleRecord {
-                        sample_id: r.get(0)?,
-                        series_id: r.get(1)?,
-                        sampled_at: r.get(2)?,
-                        value_num: r.get(3)?,
-                        metadata: meta_raw.and_then(|s| serde_json::from_str(&s).ok()),
-                    })
-                })?;
-                for row in rows {
-                    out.push(row?);
-                }
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Samples downsampled into `bucket_secs`-wide UTC buckets (aligned to the Unix epoch), one
+    /// `aggregate` value per non-empty bucket. Window and `limit` (in buckets) behave like
+    /// [`Self::query_history_samples_window`].
+    pub fn query_history_buckets(
+        &self,
+        series_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        bucket_secs: i64,
+        aggregate: HistoryAggregate,
+        limit: usize,
+    ) -> Result<Vec<HistoryBucketRecord>, StoreError> {
+        let limit = limit.clamp(1, HISTORY_QUERY_BUDGET);
+        let bucket_secs = bucket_secs.max(1);
+        let (filter, window_args) = history_window_filter(series_id, since, until);
+        let (value_expr, extra) = aggregate.sql();
+        let order = if since.is_some() { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT (CAST(strftime('%s', sampled_at) AS INTEGER) / ?) * ? AS bucket,
+                    {value_expr} AS v, COUNT(*) AS n{extra}
+             FROM history_samples WHERE {filter}
+             GROUP BY bucket HAVING bucket IS NOT NULL
+             ORDER BY bucket {order} LIMIT ?"
+        );
+        let mut args = vec![
+            rusqlite::types::Value::Integer(bucket_secs),
+            rusqlite::types::Value::Integer(bucket_secs),
+        ];
+        args.extend(window_args);
+        args.push(rusqlite::types::Value::Integer(limit as i64));
+        self.with_conn_sync(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                let bucket: i64 = r.get(0)?;
+                let value: Option<f64> = r.get(1)?;
+                let n: i64 = r.get(2)?;
+                Ok((bucket, value.unwrap_or(0.0), n))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (bucket, value_num, samples) = row?;
+                let sampled_at = chrono::DateTime::<Utc>::from_timestamp(bucket, 0)
+                    .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_default();
+                out.push(HistoryBucketRecord {
+                    series_id: series_id.to_string(),
+                    sampled_at,
+                    value_num,
+                    samples,
+                });
+            }
+            if since.is_none() {
+                out.reverse();
             }
             Ok(out)
         })
@@ -3015,6 +3128,25 @@ pub fn hash_token(token_plaintext: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token_plaintext.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// `WHERE` clause (and its arguments) selecting one series' samples in `[since, until)`.
+fn history_window_filter(
+    series_id: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut filter = String::from("series_id = ?");
+    let mut args = vec![rusqlite::types::Value::Text(series_id.to_string())];
+    if let Some(since) = since {
+        filter.push_str(" AND sampled_at >= ?");
+        args.push(rusqlite::types::Value::Text(since.to_string()));
+    }
+    if let Some(until) = until {
+        filter.push_str(" AND sampled_at < ?");
+        args.push(rusqlite::types::Value::Text(until.to_string()));
+    }
+    (filter, args)
 }
 
 #[cfg(test)]
@@ -3922,6 +4054,97 @@ mod tests {
                 .unwrap()
                 .len(),
             10
+        );
+    }
+
+    #[test]
+    fn test_history_window_and_buckets() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_history_series(&HistorySeriesSpec {
+                series_id: "s".into(),
+                instance_id: "open_prs".into(),
+                params: json!({}),
+                aggregator: "count".into(),
+                cadence_secs: 600,
+                retention_days: 30,
+                service_principal: "sp".into(),
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        // Samples every 10 minutes from 00:00 to 02:50 (values 0..17), stored in the
+        // daemon's format (sub-second precision, +00:00 offset).
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.250+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        for i in 0..18 {
+            let ts = (base + chrono::Duration::minutes(10 * i)).to_rfc3339();
+            store
+                .append_history_sample("s", &ts, i as f64, None)
+                .unwrap();
+        }
+
+        let window = store
+            .query_history_samples_window(
+                "s",
+                Some("2026-01-01T01:00:00+00:00"),
+                Some("2026-01-01T02:00:00+00:00"),
+                100,
+            )
+            .unwrap();
+        let values: Vec<f64> = window.iter().map(|r| r.value_num).collect();
+        assert_eq!(values, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+
+        let hourly = |agg| {
+            store
+                .query_history_buckets("s", None, None, 3600, agg, 100)
+                .unwrap()
+        };
+        let avg = hourly(HistoryAggregate::Avg);
+        assert_eq!(
+            avg.iter()
+                .map(|b| b.sampled_at.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+                "2026-01-01T02:00:00Z"
+            ]
+        );
+        assert_eq!(
+            avg.iter().map(|b| b.value_num).collect::<Vec<_>>(),
+            vec![2.5, 8.5, 14.5]
+        );
+        assert!(avg.iter().all(|b| b.samples == 6));
+        let vals = |agg| hourly(agg).iter().map(|b| b.value_num).collect::<Vec<_>>();
+        assert_eq!(vals(HistoryAggregate::Min), vec![0.0, 6.0, 12.0]);
+        assert_eq!(vals(HistoryAggregate::Max), vec![5.0, 11.0, 17.0]);
+        assert_eq!(vals(HistoryAggregate::Sum), vec![15.0, 51.0, 87.0]);
+        assert_eq!(vals(HistoryAggregate::Count), vec![6.0, 6.0, 6.0]);
+        assert_eq!(vals(HistoryAggregate::First), vec![0.0, 6.0, 12.0]);
+        assert_eq!(vals(HistoryAggregate::Last), vec![5.0, 11.0, 17.0]);
+
+        // Without `since`, `limit` keeps the newest buckets (oldest first); with it, the oldest.
+        let newest = store
+            .query_history_buckets("s", None, None, 3600, HistoryAggregate::Max, 2)
+            .unwrap();
+        assert_eq!(
+            newest.iter().map(|b| b.value_num).collect::<Vec<_>>(),
+            vec![11.0, 17.0]
+        );
+        let oldest = store
+            .query_history_buckets(
+                "s",
+                Some("2026-01-01T00:30:00+00:00"),
+                None,
+                3600,
+                HistoryAggregate::Count,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            oldest.iter().map(|b| b.value_num).collect::<Vec<_>>(),
+            vec![3.0, 6.0]
         );
     }
 }

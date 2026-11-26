@@ -1,0 +1,76 @@
+[
+  {
+    "number": 101,
+    "title": "Cache misses spike after deploy",
+    "repository": "acme/platform",
+    "state": "open",
+    "author": "erin",
+    "labels": [
+      "bug",
+      "performance"
+    ],
+    "assignees": [
+      "alice"
+    ],
+    "comments": 3,
+    "created_at": "2026-11-18T08:00:00Z",
+    "updated_at": "2026-11-23T08:00:00Z",
+    "url": "https://github.com/acme/platform/issues/101",
+    "body": "p99 latency doubles for 10 minutes after each deploy."
+  },
+  {
+    "number": 102,
+    "title": "Document delta resync protocol",
+    "repository": "acme/platform",
+    "state": "open",
+    "author": "bob",
+    "labels": [
+      "docs"
+    ],
+    "assignees": [],
+    "comments": 0,
+    "created_at": "2026-11-19T08:00:00Z",
+    "updated_at": "2026-11-19T08:00:00Z",
+    "url": "https://github.com/acme/platform/issues/102",
+    "body": ""
+  },
+  {
+    "number": 95,
+    "title": "Flaky websocket reconnect test",
+    "repository": "acme/platform",
+    "state": "closed",
+    "state_reason": "completed",
+    "author": "carol",
+    "labels": [
+      "test"
+    ],
+    "assignees": [
+      "carol"
+    ],
+    "comments": 5,
+    "created_at": "2026-11-01T08:00:00Z",
+    "updated_at": "2026-11-10T08:00:00Z",
+    "closed_at": "2026-11-10T08:00:00Z",
+    "url": "https://github.com/acme/platform/issues/95",
+    "body": ""
+  },
+  {
+    "number": 12,
+    "title": "Refund webhook retries forever",
+    "repository": "acme/payments",
+    "state": "open",
+    "author": "dave",
+    "labels": [
+      "bug",
+      "critical"
+    ],
+    "assignees": [
+      "dave"
+    ],
+    "comments": 1,
+    "created_at": "2026-11-22T08:00:00Z",
+    "updated_at": "2026-11-23T09:00:00Z",
+    "url": "https://github.com/acme/payments/issues/12",
+    "body": "Retries never back off."
+  }
+]

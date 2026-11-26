@@ -1,0 +1,16 @@
+local dash = require("dash")
+local Runtime = require("runtime")
+
+dash.test("dry_run names the target; execute comments through the Mock", function(make_ctx)
+    local ctx = make_ctx({ args = { repository = "acme/platform", number = 42, body = "LGTM" } })
+    local rep = Runtime.dry_run(ctx)
+    dash.assert(rep.feasible == true, "feasible")
+    dash.assert_eq(rep.effects.target_kind, "pull_request", "PR 42 is a pull request")
+    local res = Runtime.execute(ctx)
+    dash.assert(res.id > 0, "comment id")
+end)
+
+dash.test("dry_run of a missing target fails", function(make_ctx)
+    local ok, err = pcall(Runtime.dry_run, make_ctx({ args = { repository = "acme/platform", number = 9999, body = "x" } }))
+    dash.assert(not ok and string.find(tostring(err), "NOT_FOUND", 1, true) ~= nil, tostring(err))
+end)

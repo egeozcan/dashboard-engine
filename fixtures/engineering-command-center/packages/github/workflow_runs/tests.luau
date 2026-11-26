@@ -1,0 +1,11 @@
+local dash = require("dash")
+local Runtime = require("runtime")
+
+dash.test("workflow runs of a repository, filtered by status", function(make_ctx)
+    local all = Runtime.query(make_ctx({ query = { repository = "acme/platform" } }))
+    dash.assert_eq(#all, 3, "three platform runs")
+    local failed = Runtime.query(make_ctx({ query = { repository = "acme/platform", status = "failure" } }))
+    dash.assert_eq(#failed, 1, "one failed run")
+    dash.assert_eq(failed[1].branch, "feat/delta-resync", "failing branch")
+    dash.assert_eq(failed[1].actor, "bob", "actor")
+end)

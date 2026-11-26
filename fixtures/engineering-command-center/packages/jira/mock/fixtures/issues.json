@@ -4,20 +4,71 @@
     "summary": "Optimize reactive query deduplication",
     "status": "In Review",
     "priority": "High",
-    "assignee": "alice"
+    "assignee": "alice",
+    "id": "10123",
+    "status_category": "in_progress",
+    "issue_type": "Story",
+    "project": "DEV",
+    "labels": [
+      "backend",
+      "performance"
+    ],
+    "reporter": "erin",
+    "created": "2026-11-10T09:00:00.000+0000",
+    "updated": "2026-11-23T10:00:00.000+0000",
+    "description": "Deduplicate identical reactive queries."
   },
   {
     "key": "DEV-124",
     "summary": "Handle WebSocket delta sequence gaps",
     "status": "In Progress",
     "priority": "Medium",
-    "assignee": "bob"
+    "assignee": "bob",
+    "id": "10124",
+    "status_category": "in_progress",
+    "issue_type": "Bug",
+    "project": "DEV",
+    "labels": [
+      "websocket"
+    ],
+    "reporter": "alice",
+    "created": "2026-11-12T09:00:00.000+0000",
+    "updated": "2026-11-22T10:00:00.000+0000",
+    "description": "Resync after a sequence gap."
   },
   {
     "key": "PAY-9",
     "summary": "Enforce idempotency headers",
     "status": "In Review",
     "priority": "Critical",
-    "assignee": "dave"
+    "assignee": "dave",
+    "id": "20009",
+    "status_category": "in_progress",
+    "issue_type": "Bug",
+    "project": "PAY",
+    "labels": [
+      "payments"
+    ],
+    "reporter": "dave",
+    "created": "2026-11-15T09:00:00.000+0000",
+    "updated": "2026-11-23T08:00:00.000+0000",
+    "description": "Reject requests without idempotency keys."
+  },
+  {
+    "key": "DEV-130",
+    "id": "10130",
+    "summary": "Add dashboard export",
+    "status": "To Do",
+    "status_category": "todo",
+    "priority": "Low",
+    "issue_type": "Task",
+    "project": "DEV",
+    "labels": [
+      "frontend"
+    ],
+    "reporter": "bob",
+    "created": "2026-11-20T09:00:00.000+0000",
+    "updated": "2026-11-20T09:00:00.000+0000",
+    "description": ""
   }
 ]

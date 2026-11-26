@@ -51,29 +51,61 @@ export interface PropSpec {
   options?: string[];
 }
 
+/**
+ * Presentation props the Administrator may override per widget. Data props (rows, series,
+ * values, Requests, State keys) stay Adapter-owned.
+ */
 export const CONFIGURABLE_PROPS: Record<string, PropSpec[]> = {
-  "dash.table": [{ key: "title", label: "Title", type: "string" }],
-  "dash.chart": [{ key: "title", label: "Title", type: "string" }],
-  "dash.map": [{ key: "title", label: "Title", type: "string" }],
-  "dash.counter": [{ key: "label", label: "Label", type: "string" }],
+  "dash.table": [
+    { key: "title", label: "Title", type: "string" },
+    { key: "page_size", label: "Rows per page (0 = all)", type: "number" },
+    { key: "empty_message", label: "Empty message", type: "string" },
+  ],
+  "dash.chart": [
+    { key: "title", label: "Title", type: "string" },
+    { key: "kind", label: "Chart kind", type: "enum", options: ["line", "area", "bar"] },
+    { key: "height", label: "Height (px)", type: "number" },
+    { key: "unit", label: "Unit", type: "string" },
+  ],
+  "dash.map": [
+    { key: "title", label: "Title", type: "string" },
+    { key: "height", label: "Height (px)", type: "number" },
+  ],
+  "dash.counter": [
+    { key: "label", label: "Label", type: "string" },
+    { key: "unit", label: "Unit", type: "string" },
+    { key: "description", label: "Description", type: "string" },
+  ],
   "dash.text": [
     { key: "title", label: "Title", type: "string" },
     { key: "text", label: "Text", type: "string" },
+    { key: "variant", label: "Variant", type: "enum", options: ["default", "info", "success", "warning", "danger"] },
   ],
   "dash.container": [
+    { key: "title", label: "Title", type: "string" },
     { key: "direction", label: "Direction", type: "enum", options: ["vertical", "horizontal"] },
     { key: "gap", label: "Gap (px)", type: "number" },
+    { key: "align", label: "Align", type: "enum", options: ["start", "center", "end", "stretch", "baseline"] },
+    { key: "justify", label: "Justify", type: "enum", options: ["start", "center", "end", "between", "around", "evenly"] },
   ],
   "dash.grid": [
+    { key: "title", label: "Title", type: "string" },
     { key: "columns", label: "Columns", type: "number" },
     { key: "gap", label: "Gap (px)", type: "number" },
   ],
-  "dash.button": [{ key: "label", label: "Label", type: "string" }],
+  "dash.tabs": [{ key: "title", label: "Tab list label", type: "string" }],
+  "dash.button": [
+    { key: "label", label: "Label", type: "string" },
+    { key: "variant", label: "Variant", type: "enum", options: ["default", "primary", "danger"] },
+  ],
   "dash.form": [
     { key: "title", label: "Title", type: "string" },
     { key: "submit_label", label: "Submit label", type: "string" },
   ],
-  "dash.filter": [{ key: "label", label: "Label", type: "string" }],
+  "dash.filter": [
+    { key: "label", label: "Label", type: "string" },
+    { key: "all_label", label: "\"All\" option label", type: "string" },
+  ],
 };
 
 export function configurablePropsFor(widgetType: string): PropSpec[] {

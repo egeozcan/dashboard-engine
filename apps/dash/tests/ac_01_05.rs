@@ -2463,7 +2463,7 @@ async fn spawn_echoing_upstream(authed: Arc<AtomicUsize>) -> std::net::SocketAdd
             }),
         )
         .route(
-            "/rest/api/3/search",
+            "/rest/api/3/search/jql",
             get(move |h: HeaderMap| {
                 let a = Arc::clone(&a2);
                 async move {
@@ -2472,9 +2472,18 @@ async fn spawn_echoing_upstream(authed: Arc<AtomicUsize>) -> std::net::SocketAdd
                         return (StatusCode::UNAUTHORIZED, "bad credentials").into_response();
                     }
                     a.fetch_add(1, Ordering::SeqCst);
-                    Json(json!([
-                        { "key": "DEV-7", "status": "In Progress", "summary": format!("echo {auth}") }
-                    ]))
+                    // A real Jira Cloud search page whose summary echoes the credential.
+                    Json(json!({
+                        "issues": [{
+                            "id": "10007",
+                            "key": "DEV-7",
+                            "fields": {
+                                "summary": format!("echo {auth}"),
+                                "status": { "name": "In Progress", "statusCategory": { "key": "indeterminate" } }
+                            }
+                        }],
+                        "isLast": true
+                    }))
                     .into_response()
                 }
             }),

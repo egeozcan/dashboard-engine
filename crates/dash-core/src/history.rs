@@ -9,8 +9,167 @@ use crate::query_engine::QueryEngine;
 use crate::signal::QueryStatus;
 use chrono::Utc;
 use dash_luau::DefinitionCategory;
-use dash_store::{HistorySampleRecord, HistorySeriesSpec, SqliteStore, HISTORY_QUERY_BUDGET};
+use dash_store::{
+    HistoryAggregate, HistorySampleRecord, HistorySeriesSpec, SqliteStore, HISTORY_QUERY_BUDGET,
+};
 use std::sync::Arc;
+
+/// Query parameters of the built-in `dash.history_series` data provider.
+pub const HISTORY_QUERY_PARAMS: &[&str] = &[
+    "series_id",
+    "params",
+    "since",
+    "until",
+    "window",
+    "limit",
+    "bucket_secs",
+    "aggregate",
+];
+
+/// Smallest accepted `bucket_secs` of a downsampled history read.
+pub const HISTORY_MIN_BUCKET_SECS: i64 = 1;
+/// Largest accepted `bucket_secs` (one year).
+pub const HISTORY_MAX_BUCKET_SECS: i64 = 366 * 86_400;
+
+/// Read window, size and downsampling of one `dash.history_series` query (everything but the
+/// series selection, which depends on the Instance's configured series).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryReadOptions {
+    /// Inclusive lower bound, normalized to RFC 3339 UTC.
+    pub since: Option<String>,
+    /// Exclusive upper bound, normalized to RFC 3339 UTC.
+    pub until: Option<String>,
+    /// Requested sample/bucket count (`None`: the provider default).
+    pub limit: Option<usize>,
+    /// Downsampling into `bucket_secs`-wide buckets with an aggregate.
+    pub bucket: Option<(i64, HistoryAggregate)>,
+}
+
+fn as_count(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f as u64)
+    })
+}
+
+/// Seconds of a window/duration: a non-negative number of seconds, or `<n><unit>` with unit
+/// `s`, `m`, `h`, `d` or `w` (`"15m"`, `"24h"`, `"30d"`).
+pub fn parse_history_duration(v: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = as_count(v) {
+        return i64::try_from(n).ok();
+    }
+    let s = v.as_str()?.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = num.parse().ok()?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+fn parse_rfc3339(key: &str, v: &serde_json::Value) -> Result<Option<String>, String> {
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| Some(t.with_timezone(&Utc).to_rfc3339()))
+            .map_err(|e| format!("history_series '{key}' must be an RFC 3339 timestamp: {e}")),
+        _ => Err(format!("history_series '{key}' must be an RFC 3339 string")),
+    }
+}
+
+/// Validate a `dash.history_series` query's parameters (unknown keys rejected) and resolve its
+/// read options; `window` is relative to `now`.
+pub fn parse_history_read_options(
+    params: &serde_json::Map<String, serde_json::Value>,
+    now: chrono::DateTime<Utc>,
+) -> Result<HistoryReadOptions, String> {
+    if let Some(unknown) = params
+        .keys()
+        .find(|k| !HISTORY_QUERY_PARAMS.contains(&k.as_str()))
+    {
+        return Err(format!(
+            "history_series query does not accept parameter '{unknown}' (allowed: {})",
+            HISTORY_QUERY_PARAMS.join(", ")
+        ));
+    }
+    let mut since = match params.get("since") {
+        Some(v) => parse_rfc3339("since", v)?,
+        None => None,
+    };
+    let until = match params.get("until") {
+        Some(v) => parse_rfc3339("until", v)?,
+        None => None,
+    };
+    if let Some(w) = params.get("window").filter(|v| !v.is_null()) {
+        if since.is_some() {
+            return Err("history_series takes 'since' or 'window', not both".into());
+        }
+        let secs = parse_history_duration(w).filter(|s| *s > 0).ok_or_else(|| {
+            format!("history_series 'window' must be a positive duration such as \"24h\" or seconds, got {w}")
+        })?;
+        let start = now
+            .checked_sub_signed(chrono::Duration::seconds(secs))
+            .ok_or_else(|| "history_series 'window' is too large".to_string())?;
+        since = Some(start.to_rfc3339());
+    }
+    if let (Some(a), Some(b)) = (&since, &until) {
+        if a >= b {
+            return Err(format!(
+                "history_series window is empty: since {a} is not before until {b}"
+            ));
+        }
+    }
+    let limit =
+        match params.get("limit") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(as_count(v).ok_or_else(|| {
+                "history_series 'limit' must be a non-negative integer".to_string()
+            })? as usize),
+        };
+    let aggregate = match params.get("aggregate") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(HistoryAggregate::parse)
+                .ok_or_else(|| {
+                    format!(
+                        "history_series 'aggregate' must be one of {}, got {v}",
+                        HistoryAggregate::NAMES.join(", ")
+                    )
+                })?,
+        ),
+    };
+    let bucket = match params.get("bucket_secs").filter(|v| !v.is_null()) {
+        None => {
+            if aggregate.is_some() {
+                return Err("history_series 'aggregate' requires 'bucket_secs'".into());
+            }
+            None
+        }
+        Some(v) => {
+            let secs = parse_history_duration(v)
+                .filter(|s| (HISTORY_MIN_BUCKET_SECS..=HISTORY_MAX_BUCKET_SECS).contains(s))
+                .ok_or_else(|| {
+                    format!(
+                        "history_series 'bucket_secs' must be a duration between {HISTORY_MIN_BUCKET_SECS}s and {HISTORY_MAX_BUCKET_SECS}s, got {v}"
+                    )
+                })?;
+            Some((secs, aggregate.unwrap_or(HistoryAggregate::Avg)))
+        }
+    };
+    Ok(HistoryReadOptions {
+        since,
+        until,
+        limit,
+        bucket,
+    })
+}
 
 /// Pluggable history storage contract (§7.4): series metadata, sample append, retention
 /// compaction and budgeted range reads.
@@ -378,5 +537,42 @@ mod tests {
         let rows = backend.query("s", None, usize::MAX).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value_num, 2.0);
+    }
+
+    #[test]
+    fn history_read_options_parse_windows_and_buckets() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let parse = |v: serde_json::Value| parse_history_read_options(v.as_object().unwrap(), now);
+        let o = parse(
+            json!({ "window": "24h", "bucket_secs": "1h", "aggregate": "max", "limit": 48.0 }),
+        )
+        .unwrap();
+        assert_eq!(o.since.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert_eq!(o.bucket, Some((3600, HistoryAggregate::Max)));
+        assert_eq!(o.limit, Some(48));
+        let o = parse(json!({ "since": "2026-01-01T01:00:00+01:00", "until": "2026-01-01T12:00:00Z", "bucket_secs": 300 }))
+            .unwrap();
+        assert_eq!(o.since.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert_eq!(o.until.as_deref(), Some("2026-01-01T12:00:00+00:00"));
+        assert_eq!(o.bucket, Some((300, HistoryAggregate::Avg)));
+        assert_eq!(parse(json!({})).unwrap().bucket, None);
+
+        for bad in [
+            json!({ "since": "yesterday" }),
+            json!({ "since": "2026-01-01T00:00:00Z", "window": "1h" }),
+            json!({ "since": "2026-01-02T00:00:00Z", "until": "2026-01-01T00:00:00Z" }),
+            json!({ "window": "-5m" }),
+            json!({ "window": "5 parsecs" }),
+            json!({ "bucket_secs": 0 }),
+            json!({ "bucket_secs": "1y" }),
+            json!({ "aggregate": "median", "bucket_secs": 60 }),
+            json!({ "aggregate": "avg" }),
+            json!({ "limit": -1 }),
+            json!({ "step": 60 }),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad} should be rejected");
+        }
     }
 }

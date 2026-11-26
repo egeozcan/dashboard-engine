@@ -6,3 +6,12 @@ dash.test("empty key list returns empty array without connector call", function(
     local res = Runtime.query(ctx)
     dash.assert_eq(#res, 0, "expected empty array")
 end)
+
+dash.test("returns normalized issues in key order and skips unknown keys", function(make_ctx)
+    local res = Runtime.query(make_ctx({ query = { keys = { "PAY-9", "NOPE-1", "dev-123" } } }))
+    dash.assert_eq(#res, 2, "unknown key skipped")
+    dash.assert_eq(res[1].key, "PAY-9", "requested order")
+    dash.assert_eq(res[2].key, "DEV-123", "keys are case-insensitive")
+    dash.assert_eq(res[2].status_category, "in_progress", "status category")
+    dash.assert_eq(res[2].url, "https://jira.example.com/browse/DEV-123", "browse URL")
+end)

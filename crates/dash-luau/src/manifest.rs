@@ -842,6 +842,9 @@ impl DefinitionManifest {
                 r.to_luau_type()
             ));
         }
+        if let Some(ref p) = self.widget_props {
+            out.push_str(&format!("export type WidgetProps = {}\n", p.to_luau_type()));
+        }
         self.generated_luau_types = out;
     }
 }

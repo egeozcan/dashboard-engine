@@ -181,6 +181,34 @@ fn origin_of(url: &Url) -> Origin {
     }
 }
 
+/// Lower-cased path with the percent-encoded separators and dots that servers commonly decode
+/// (`%2f`, `%5c`, `%2e`) turned into their literal form, for confinement checks.
+fn decoded_path_for_confinement(path: &str) -> String {
+    path.to_ascii_lowercase()
+        .replace("%2f", "/")
+        .replace("%5c", "/")
+        .replace('\\', "/")
+        .replace("%2e", ".")
+}
+
+/// Whether `url` stays under the `confine_to` prefix: same origin, and a path equal to the
+/// prefix path or below it, with no `.`/`..` segment even after decoding encoded separators.
+fn within_confinement(url: &Url, prefix: &Url) -> bool {
+    if origin_of(url) != origin_of(prefix) {
+        return false;
+    }
+    let path = decoded_path_for_confinement(url.path());
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return false;
+    }
+    let base = decoded_path_for_confinement(prefix.path());
+    let base = base.trim_end_matches('/');
+    base.is_empty() || path == base || path.starts_with(&format!("{base}/"))
+}
+
 /// `scheme://host:port/path` — never the query string, which may carry credentials.
 fn audit_destination(url: &Url) -> String {
     format!(
@@ -401,6 +429,13 @@ impl HttpBroker {
 
         let mut current_url = Url::parse(&req.url)
             .map_err(|e| HttpBrokerError::InvalidUrl(req.url.clone(), e.to_string()))?;
+        let confine = match req.confine_to.as_deref() {
+            Some(prefix) => Some(
+                Url::parse(prefix)
+                    .map_err(|e| HttpBrokerError::InvalidUrl(prefix.to_string(), e.to_string()))?,
+            ),
+            None => None,
+        };
         let mut method = reqwest::Method::from_bytes(method_upper.as_bytes())
             .map_err(|e| HttpBrokerError::InvalidUrl(req.url.clone(), e.to_string()))?;
         let mut body = req.body.clone().filter(|b| !b.is_null());
@@ -408,6 +443,22 @@ impl HttpBroker {
         let mut credential_active = credential.is_some();
 
         for redirect_hop in 0..=MAX_REDIRECTS {
+            if let Some(prefix) = &confine {
+                if !within_confinement(&current_url, prefix) {
+                    return Err(HttpBrokerError::PolicyDenied(
+                        audit_destination(&current_url),
+                        format!(
+                            "{} leaves the connector's base URL {}",
+                            if redirect_hop == 0 {
+                                "request"
+                            } else {
+                                "redirect"
+                            },
+                            audit_destination(prefix)
+                        ),
+                    ));
+                }
+            }
             let pinned = vet_destination(&current_url, &policy).await?;
             let host = host_for_policy(&current_url)?;
 
@@ -1167,6 +1218,72 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn confinement_requires_the_prefix_path_and_rejects_encoded_traversal() {
+        let prefix = Url::parse("https://api.example.com/api/v1/").unwrap();
+        let ok = |u: &str| within_confinement(&Url::parse(u).unwrap(), &prefix);
+        assert!(ok("https://api.example.com/api/v1"));
+        assert!(ok("https://api.example.com/api/v1/items?page=2"));
+        assert!(ok("https://API.example.com:443/api/v1/a%2Fb"));
+        assert!(!ok("https://api.example.com/api/v10/items"));
+        assert!(!ok("https://api.example.com/admin"));
+        assert!(!ok("https://api.example.com/api/v1/..%2Fadmin"));
+        assert!(!ok("https://api.example.com/api/v1/%2e%2e/admin"));
+        assert!(!ok("http://api.example.com/api/v1/items"));
+        assert!(!ok("https://other.example.com/api/v1/items"));
+        let root = Url::parse("https://api.github.com").unwrap();
+        assert!(within_confinement(
+            &Url::parse("https://api.github.com/repositories/9/pulls?page=2").unwrap(),
+            &root
+        ));
+    }
+
+    /// A same-origin redirect out of the confinement prefix is refused before it is followed
+    /// (so the credential never reaches it).
+    #[tokio::test]
+    async fn confined_requests_refuse_redirects_out_of_the_prefix() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let addr = serve(
+            Router::new()
+                .route(
+                    "/api/v1/start",
+                    get(|| async { (StatusCode::FOUND, [("location", "/admin")]) }),
+                )
+                .route(
+                    "/admin",
+                    get(move || {
+                        h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async { "admin" }
+                    }),
+                ),
+        )
+        .await;
+        let store = SqliteStore::open_in_memory().unwrap();
+        grant_loopback_ceiling(&store);
+        let broker = HttpBroker::new(store.clone()).unwrap();
+        let mut req = get_req(
+            format!("http://127.0.0.1:{}/api/v1/start", addr.port()),
+            None,
+        );
+        req.confine_to = Some(format!("http://127.0.0.1:{}/api/v1", addr.port()));
+        let err = broker
+            .execute(
+                &Principal::administrator(),
+                &conn_inst(None),
+                None,
+                &loopback_graph(),
+                req,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("leaves the connector's base URL"),
+            "{err}"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     fn get_req(url: String, credential: Option<&str>) -> HttpHostRequest {
         HttpHostRequest {
             method: "GET".into(),
@@ -1174,6 +1291,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             credential: credential.map(str::to_string),
+            confine_to: None,
         }
     }
 
@@ -1386,6 +1504,7 @@ mod tests {
             headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
             body: Some(json!({ "merge": true })),
             credential: None,
+            confine_to: None,
         };
         let resp = broker
             .execute(&admin, &conn_inst(None), None, &g, post_req)
@@ -1654,6 +1773,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: Some(json!({ "merge": true })),
             credential: None,
+            confine_to: None,
         };
         let admin = Principal::administrator();
         let inst = conn_inst(None);

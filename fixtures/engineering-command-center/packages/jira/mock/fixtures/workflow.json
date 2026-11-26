@@ -1,0 +1,58 @@
+{
+  "statuses": {
+    "To Do": "todo",
+    "In Progress": "in_progress",
+    "In Review": "in_progress",
+    "Done": "done"
+  },
+  "transitions": {
+    "To Do": [
+      {
+        "id": "11",
+        "name": "Start Progress",
+        "to": "In Progress"
+      },
+      {
+        "id": "31",
+        "name": "Done",
+        "to": "Done"
+      }
+    ],
+    "In Progress": [
+      {
+        "id": "21",
+        "name": "Request Review",
+        "to": "In Review"
+      },
+      {
+        "id": "31",
+        "name": "Done",
+        "to": "Done"
+      },
+      {
+        "id": "41",
+        "name": "Stop Progress",
+        "to": "To Do"
+      }
+    ],
+    "In Review": [
+      {
+        "id": "31",
+        "name": "Done",
+        "to": "Done"
+      },
+      {
+        "id": "51",
+        "name": "Back to Progress",
+        "to": "In Progress"
+      }
+    ],
+    "Done": [
+      {
+        "id": "61",
+        "name": "Reopen",
+        "to": "To Do"
+      }
+    ]
+  }
+}
