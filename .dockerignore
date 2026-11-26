@@ -10,3 +10,5 @@ web/dist/
 *.db
 *.db-wal
 *.db-shm
+# README images are not needed to build the image.
+docs/screenshots/
