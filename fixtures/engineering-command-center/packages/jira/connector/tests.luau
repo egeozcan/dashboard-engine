@@ -246,3 +246,29 @@ dash.test("comments and issue creation use ADF on v3 and plain text on v2", func
     dash.assert_eq(Runtime.call(updated), { key = "DEV-1", updated = true }, "updated")
     dash.assert_eq(updated.sent[1].body.fields.assignee, { name = "jdoe" }, "Server assignee by name")
 end)
+
+dash.test("a category target never picks Won't Do among several done statuses", function(_)
+    local both = fake({
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+            { id = "71", name = "Won't do", to = { name = "Won't Do", statusCategory = { key = "done" } } },
+            { id = "31", name = "Finish", to = { name = "Done", statusCategory = { key = "done" } } },
+        } } },
+        ["POST " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 204, body = "" },
+    }, "transition_issue", { key = "DEV-1", status_category = "done" })
+    local res = Runtime.call(both)
+    dash.assert_eq(both.sent[3].body.transition, { id = "31" }, "the conventional Done status wins")
+    dash.assert_eq(res.status, "Done", "result status")
+
+    local ambiguous = fake({
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+            { id = "71", name = "Won't do", to = { name = "Won't Do", statusCategory = { key = "done" } } },
+            { id = "81", name = "Cancel", to = { name = "Canceled", statusCategory = { key = "done" } } },
+        } } },
+    }, "transition_issue", { key = "DEV-1" })
+    local ok, err = pcall(Runtime.call, ambiguous)
+    dash.assert(not ok and string.find(tostring(err), "NO_TRANSITION", 1, true) ~= nil
+        and string.find(tostring(err), "pass `status`", 1, true) ~= nil, tostring(err))
+    dash.assert_eq(#ambiguous.sent, 2, "nothing written")
+end)

@@ -48,3 +48,8 @@ dash.test("query calls the connector's get operation", function(_)
     dash.assert_eq(seen.op, "get", "read operation")
     dash.assert_eq(seen.args.path, "/services/core", "filled path")
 end)
+
+dash.test("forwarded parameters never replace configured query parameters", function(_)
+    local args = Runtime.request_args({ path = "/items", query = { project = "public" } }, { project = "internal", page = 2 })
+    dash.assert_eq(args.query, { project = "public", page = 2 }, "configured project kept")
+end)

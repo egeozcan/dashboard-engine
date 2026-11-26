@@ -13,6 +13,20 @@ local function v(x: any): any
 end
 M.v = v
 
+-- A copy of an argument/query table without its JSON nulls (userdata sentinels), so an
+-- optional value sent as null reads as absent. Shallow: nested values are kept as they are.
+function M.clean(t: any): any
+    local out = {}
+    if type(t) == "table" then
+        for k, x in pairs(t) do
+            if type(x) ~= "userdata" then
+                out[k] = x
+            end
+        end
+    end
+    return out
+end
+
 local function str(x: any): string?
     x = v(x)
     if x == nil then

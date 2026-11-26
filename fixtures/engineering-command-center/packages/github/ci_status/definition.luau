@@ -4,6 +4,7 @@ return dash.data_provider {
     id = "github.ci_status",
     description = "Combined CI state (success, failure, pending, neutral or unknown) of a branch, tag or commit from commit statuses and check runs",
     runtime = "runtime.luau",
+    libraries = { "github.model" },
     handler = "query",
     inputs = {
         github = dash.connector_ref("github.connector", { required_capabilities = { "checks.read" } }),

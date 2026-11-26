@@ -1,4 +1,6 @@
 --!strict
+local model = require("jira.model")
+
 local Runtime = {}
 
 local function problems(args: any): { string }
@@ -13,32 +15,34 @@ local function problems(args: any): { string }
 end
 
 function Runtime.dry_run(ctx: any): any
-    local p = problems(ctx.args)
+    local args = model.clean(ctx.args)
+    local p = problems(args)
     return {
         feasible = #p == 0,
         warnings = p,
         effects = {
-            project = ctx.args.project,
-            issue_type = ctx.args.issue_type or "Task",
-            summary = ctx.args.summary,
-            labels = ctx.args.labels,
+            project = args.project,
+            issue_type = args.issue_type or "Task",
+            summary = args.summary,
+            labels = args.labels,
         },
     }
 end
 
 function Runtime.execute(ctx: any): any
-    local p = problems(ctx.args)
+    local args = model.clean(ctx.args)
+    local p = problems(args)
     if #p > 0 then
         error("INVALID_ARGS: " .. table.concat(p, "; "))
     end
     local res = ctx:await(ctx.inputs.jira:call("create_issue", {
-        project = ctx.args.project,
-        issue_type = ctx.args.issue_type or "Task",
-        summary = ctx.args.summary,
-        description = ctx.args.description,
-        labels = ctx.args.labels,
-        priority = ctx.args.priority,
-        assignee_id = ctx.args.assignee_id,
+        project = args.project,
+        issue_type = args.issue_type or "Task",
+        summary = args.summary,
+        description = args.description,
+        labels = args.labels,
+        priority = args.priority,
+        assignee_id = args.assignee_id,
     }))
     return { key = res.key, url = res.url }
 end

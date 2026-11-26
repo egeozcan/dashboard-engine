@@ -4,6 +4,7 @@ return dash.action_provider {
     id = "jira.add_comment",
     description = "Adds a comment to a Jira issue; the Dry run checks that the issue exists",
     runtime = "runtime.luau",
+    libraries = { "jira.model" },
     handler = "execute",
     dry_run = "dry_run",
     inputs = {

@@ -17,8 +17,10 @@ function Util.v(x: any): any
 end
 
 -- Remove JSON nulls (userdata sentinels) from a table, recursively and in place (so JSON
--- arrays keep their array marker). nil or null becomes an empty table.
-function Util.clean(x: any): any
+-- arrays keep their array marker). nil or null becomes an empty table. Top-level keys in
+-- `keep` (e.g. `{ body = true }`) keep their value untouched: a null inside a request body is
+-- data (PATCH and merge-patch APIs clear fields with it), not an absent option.
+function Util.clean(x: any, keep: { [string]: boolean }?): any
     if x == nil or type(x) == "userdata" then
         return {}
     end
@@ -34,7 +36,13 @@ function Util.clean(x: any): any
             end
         end
     end
-    walk(x)
+    for k, val in pairs(x) do
+        if type(val) == "userdata" then
+            x[k] = nil
+        elseif type(val) == "table" and not (keep ~= nil and keep[k]) then
+            walk(val)
+        end
+    end
     return x
 end
 
@@ -152,6 +160,30 @@ function Util.resolve_link(link: string, current: string, base: string): string
 end
 
 -- Shallow merge: later tables win; nil tables are skipped.
+-- Header tables merged left to right with case-insensitive names (later wins), so `accept`
+-- replaces the default `Accept` instead of sending both. Nulls are skipped.
+function Util.merge_headers(...: any): { [string]: any }
+    local out = {}
+    local name_of = {}
+    for i = 1, select("#", ...) do
+        local t = select(i, ...)
+        if type(t) == "table" then
+            for k, v in pairs(t) do
+                if type(k) == "string" and type(v) ~= "userdata" then
+                    local lk = string.lower(k)
+                    local prev = name_of[lk]
+                    if prev ~= nil then
+                        out[prev] = nil
+                    end
+                    name_of[lk] = k
+                    out[k] = v
+                end
+            end
+        end
+    end
+    return out
+end
+
 function Util.merge(...: any): { [string]: any }
     local out = {}
     for i = 1, select("#", ...) do
@@ -217,7 +249,7 @@ function Util.fill_template(template: string, params: any): (string, { [string]:
     local p = params or {}
     local out = string.gsub(template, "{([%w_]+)}", function(name)
         local v = p[name]
-        if v == nil or v == "" or type(v) == "table" then
+        if v == nil or v == "" or type(v) == "table" or type(v) == "userdata" then
             error("INVALID_ARGS: path parameter '" .. name .. "' is required (template " .. template .. ")")
         end
         Util.check_segment_value(v, name)

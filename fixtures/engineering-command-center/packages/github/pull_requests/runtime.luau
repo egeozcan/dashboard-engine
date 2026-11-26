@@ -12,11 +12,12 @@ local function is_not_found(err: any): boolean
 end
 
 function Runtime.query(ctx: any): any
-    local repo = ctx.query.repository
+    local query = model.clean(ctx.query)
+    local repo = query.repository
     if repo == nil or repo == "" then
         error("github.pull_requests requires query.repository")
     end
-    local req_state = ctx.query.state or "open"
+    local req_state = query.state or "open"
     -- Always list without the `base` filter (applied to the returned rows below): merge
     -- detection then sees every open PR of the repository, whatever the query's base.
     local prs = ctx:await(ctx.inputs.github:call("list_prs", {
@@ -80,7 +81,7 @@ function Runtime.query(ctx: any): any
         }, true))
     end
 
-    local base = ctx.query.base
+    local base = query.base
     local filtered = {}
     for _, pr in ipairs(prs) do
         local state_ok = req_state == "all" or pr.state == req_state or (req_state == "closed" and pr.state == "merged")

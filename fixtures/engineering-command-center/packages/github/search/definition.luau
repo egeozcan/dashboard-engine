@@ -4,6 +4,7 @@ return dash.data_provider {
     id = "github.search",
     description = "Issues and pull requests matching a GitHub search query (e.g. 'org:acme is:pr is:open review-requested:octocat')",
     runtime = "runtime.luau",
+    libraries = { "github.model" },
     handler = "query",
     inputs = {
         github = dash.connector_ref("github.connector", { required_capabilities = { "issues.read" } }),

@@ -4,6 +4,7 @@ return dash.data_provider {
     id = "github.issues",
     description = "Lists issues of a repository (pull requests excluded), filtered by state, labels, assignee or creator",
     runtime = "runtime.luau",
+    libraries = { "github.model" },
     handler = "query",
     inputs = {
         github = dash.connector_ref("github.connector", { required_capabilities = { "issues.read" } }),

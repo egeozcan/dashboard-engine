@@ -21,7 +21,9 @@ All three behave the same way at runtime:
   time), `UPSTREAM_ERROR`, `INVALID_ARGS`, `INVALID_RESPONSE`, `CONFIG`, and connector-specific
   ones (`NOT_MERGEABLE`, `NO_TRANSITION`). The upstream's own error message is appended.
 - **Lost writes are `unknown`, not `failed`.** A 5xx answer to a write (other than 501) means
-  `UNKNOWN_OUTCOME`. The action execution becomes `unknown` instead of `failed`, and it is never
+  `UNKNOWN_OUTCOME`. So does a redirect answer to a write that dash will not follow: a 301 or
+  302 (a browser would re-send it as a GET), or any redirect out of `base_url`. A 303 is followed
+  with a GET, and a 307 or 308 re-sends the same request. The action execution becomes `unknown` instead of `failed`, and it is never
   retried blindly. Actions with a `reconcile` handler resolve it.
 - **Requests stay under `base_url`.** Every request, pagination link and redirect hop must stay
   under the connector's `base_url`: same origin and path prefix, and no `.`/`..` segments, even
@@ -30,7 +32,8 @@ All three behave the same way at runtime:
 - **Paging is capped.** Pagination follows the API's own scheme (Link headers, which may be
   relative, plus cursors, tokens and offsets). It stops at `max_pages` (default 5, hard cap 50).
 - **JSON nulls read as absent.** An optional argument or config value sent as `null` means the
-  same as leaving it out.
+  same as leaving it out. Inside a request body a `null` is data and is sent as is (PATCH APIs
+  clear fields with it).
 - **Mind the time budget.** A provider query, including its connector calls, runs within the
   Instance's Luau wall budget (5 s by default). Big lists need a larger budget for the data
   provider Instance and its connector Instance, e.g. `[resources.instances.<id>]
@@ -58,8 +61,8 @@ All three behave the same way at runtime:
    ```
 2. **Allow the host.** Add the API host to `[network] allowed_hosts` in `dashboard.toml`, and to
    the Administrator network ceiling (`dash network grant`). Writes need their methods in
-   `allowed_methods`: GitHub uses `PUT` (merge) and `PATCH` (issue updates); Jira and REST writes
-   use `POST`/`PUT`.
+   `allowed_methods`: GitHub uses `PUT` (merge), `PATCH` (issue updates) and `POST` (issues and
+   comments); Jira and REST writes use `POST`/`PUT`.
 3. **Declare the connector Instance.** Grant it only the capabilities it needs (least
    privilege: separate reader and writer Instances).
 4. **Bind data providers and actions** to the Instance, in `instances/data.yaml` and
@@ -211,7 +214,11 @@ of:
 
 - `status`: a status name (case-insensitive).
 - `status_category`: `todo`, `in_progress` or `done`. Use it when workflows call the final
-  status Done, Closed, Resolved or a translation of these.
+  status Done, Closed, Resolved or a translation of these. When several statuses of the category
+  are reachable (Done, Won't Do and Canceled are all `done`), the conventional one wins (`done`:
+  Done, Resolved, Closed, Complete(d), Fixed; `in_progress`: In Progress; `todo`: To Do, Open,
+  Backlog). Without one, the call fails with `NO_TRANSITION` and asks for `status`, and the Dry
+  run reports it as infeasible: a category never picks Won't Do by workflow order.
 - `transition_id`: an explicit transition.
 - Neither: a status of category `done`. The reference `engineering.complete_work` automation
   relies on this default.
@@ -256,8 +263,8 @@ connectors:
     capabilities: [http.read]                     # http.write for writes
     config:
       base_url: https://status.example.com/api/v1
-      headers: { X-Team: core }                   # static, non-secret headers
-      query: { api-version: "2" }                 # static query parameters
+      headers: { X-Team: core }                   # static, non-secret headers (per-call ones cannot replace them)
+      query: { api-version: "2" }                 # static query parameters (per-call ones cannot replace them)
       # auth: none   (anonymous), max_pages: 5
       # mock:  responses for Preview and tests (see below)
 ```
@@ -298,7 +305,8 @@ data:
         id: id
         name: attributes.name
         healthy: attributes.healthy
-      # forward_params: true   (other query parameters become query-string parameters)
+      # forward_params: true   (other query parameters become query-string parameters; they
+      #                         never replace a configured `query` parameter)
       # result_path, headers, max_pages, allow_not_found, keep_warm
 ```
 
@@ -320,7 +328,8 @@ actions:
 ```
 
 `args = { service = "api", ref = "v1.2.3" }` sends `POST /services/api/deploys` with body
-`{"env": "prod", "ref": "v1.2.3"}`. An explicit `body` argument replaces the merged body. The
+`{"env": "prod", "ref": "v1.2.3"}`. An explicit `body` argument replaces the merged body. A `null`
+argument is sent as JSON `null` in the body; a `null` path parameter counts as missing. The
 Dry run shows the exact method, path and body without sending anything. A write invalidates
 every `dash.http_query` Instance.
 

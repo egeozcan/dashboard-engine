@@ -12,6 +12,20 @@ local function v(x: any): any
 end
 M.v = v
 
+-- A copy of an argument/query table without its JSON nulls (userdata sentinels), so an
+-- optional value sent as null reads as absent. Shallow: nested values are kept as they are.
+function M.clean(t: any): any
+    local out = {}
+    if type(t) == "table" then
+        for k, x in pairs(t) do
+            if type(x) ~= "userdata" then
+                out[k] = x
+            end
+        end
+    end
+    return out
+end
+
 local function str(x: any): string?
     x = v(x)
     if x == nil then
@@ -199,11 +213,19 @@ function M.transition(raw: any): any
     }
 end
 
--- The transition to use: by `transition_id`, else the first one into a status of
--- `target_category` (todo | in_progress | done), else the one into the status named
+-- Conventional status names of each category, in order of preference (lower case).
+local PREFERRED_STATUS = {
+    done = { "done", "resolved", "closed", "complete", "completed", "fixed" },
+    in_progress = { "in progress" },
+    todo = { "to do", "open", "backlog" },
+}
+
+-- The transition to use (plus, when there is none, an optional reason): by `transition_id`,
+-- else the one into the single (or conventional) status of `target_category` (todo |
+-- in_progress | done), else the one into the status named
 -- `target_status` (case-insensitive). Transitions are never matched by their own name, so a
 -- target always identifies the resulting status (idempotency and reconcile depend on that).
-function M.pick_transition(transitions: { any }, target_status: string?, transition_id: string?, target_category: string?): any
+function M.pick_transition(transitions: { any }, target_status: string?, transition_id: string?, target_category: string?): (any, string?)
     if transition_id ~= nil then
         for _, t in ipairs(transitions) do
             if t.id == transition_id then
@@ -213,12 +235,38 @@ function M.pick_transition(transitions: { any }, target_status: string?, transit
         return nil
     end
     if target_category ~= nil then
+        -- Workflows often have several statuses of one category (Done, Won't Do, Canceled,
+        -- Duplicate are all `done`): never pick one of those by workflow order. One distinct
+        -- target status is used as is; otherwise the conventional status of the category wins,
+        -- and anything else is ambiguous (the caller must name `status`).
+        local candidates = {}
+        local by_status = {}
         for _, t in ipairs(transitions) do
             if t.to_category == target_category then
-                return t
+                local s = string.lower(t.to_status)
+                if by_status[s] == nil then
+                    by_status[s] = t
+                    table.insert(candidates, t)
+                end
             end
         end
-        return nil
+        if #candidates == 0 then
+            return nil
+        end
+        if #candidates == 1 then
+            return candidates[1]
+        end
+        for _, name in ipairs(PREFERRED_STATUS[target_category] or {}) do
+            if by_status[name] ~= nil then
+                return by_status[name]
+            end
+        end
+        local names = {}
+        for _, t in ipairs(candidates) do
+            table.insert(names, t.to_status)
+        end
+        return nil, "several statuses of category '" .. target_category .. "' are reachable ("
+            .. table.concat(names, ", ") .. "); pass `status` to choose one"
     end
     local want = string.lower(target_status or "")
     for _, t in ipairs(transitions) do

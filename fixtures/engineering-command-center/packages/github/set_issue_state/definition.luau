@@ -4,6 +4,7 @@ return dash.action_provider {
     id = "github.set_issue_state",
     description = "Closes or reopens a GitHub issue (idempotent), with Dry run and reconcile",
     runtime = "runtime.luau",
+    libraries = { "github.model" },
     handler = "execute",
     dry_run = "dry_run",
     reconcile = "reconcile",

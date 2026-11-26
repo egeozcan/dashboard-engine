@@ -17,13 +17,15 @@ local WARN = {
 }
 
 local function method_of(ctx: any): string
-    return ctx.args.merge_method or "squash"
+    local args = model.clean(ctx.args)
+    return args.merge_method or "squash"
 end
 
 function Runtime.dry_run(ctx: any): any
+    local args = model.clean(ctx.args)
     local pr = ctx:await(ctx.inputs.github:call("get_pr", {
-        repository = ctx.args.repository,
-        number = ctx.args.number,
+        repository = args.repository,
+        number = args.number,
     }))
     local warnings = {}
     local feasible = (pr.state == "open")
@@ -33,10 +35,10 @@ function Runtime.dry_run(ctx: any): any
     local preconditions = {
         { check = "pr_state", expected = "open", actual = pr.state },
     }
-    if pr.state == "open" and ctx.args.expected_head_sha ~= nil and pr.head_sha ~= nil
-        and ctx.args.expected_head_sha ~= pr.head_sha then
+    if pr.state == "open" and args.expected_head_sha ~= nil and pr.head_sha ~= nil
+        and args.expected_head_sha ~= pr.head_sha then
         feasible = false
-        table.insert(warnings, "the head moved to " .. pr.head_sha .. " since " .. ctx.args.expected_head_sha .. " was reviewed")
+        table.insert(warnings, "the head moved to " .. pr.head_sha .. " since " .. args.expected_head_sha .. " was reviewed")
     end
     if pr.state == "open" then
         if pr.draft == true then
@@ -64,8 +66,8 @@ function Runtime.dry_run(ctx: any): any
         warnings = warnings,
         preconditions = preconditions,
         effects = {
-            repository = ctx.args.repository,
-            number = ctx.args.number,
+            repository = args.repository,
+            number = args.number,
             title = pr.title,
             head_sha = pr.head_sha,
             action = method_of(ctx) .. "_and_merge",
@@ -74,27 +76,28 @@ function Runtime.dry_run(ctx: any): any
 end
 
 function Runtime.execute(ctx: any): any
+    local args = model.clean(ctx.args)
     local pr = ctx:await(ctx.inputs.github:call("get_pr", {
-        repository = ctx.args.repository,
-        number = ctx.args.number,
+        repository = args.repository,
+        number = args.number,
     }))
     -- Merge exactly the reviewed head: `expected_head_sha` (what the Dry run showed) or the head
     -- just read. Commits pushed in between make GitHub refuse (409) instead of merging them.
-    local expected = ctx.args.expected_head_sha
+    local expected = args.expected_head_sha
     if expected ~= nil and pr.head_sha ~= nil and expected ~= pr.head_sha then
-        error("CONFLICT: the head of " .. ctx.args.repository .. "#" .. ctx.args.number
+        error("CONFLICT: the head of " .. args.repository .. "#" .. args.number
             .. " moved from " .. expected .. " to " .. pr.head_sha .. " since it was reviewed")
     end
     local res = ctx:await(ctx.inputs.github:call("merge_pr", {
-        repository = ctx.args.repository,
-        number = ctx.args.number,
+        repository = args.repository,
+        number = args.number,
         merge_method = method_of(ctx),
         sha = expected or pr.head_sha,
     }))
-    local jira_key = ctx.args.issue_key or model.issue_key(pr.title)
+    local jira_key = args.issue_key or model.issue_key(pr.title)
     ctx:await(ctx:emit("github.pr_merged", {
-        repository = ctx.args.repository,
-        number = ctx.args.number,
+        repository = args.repository,
+        number = args.number,
         title = pr.title,
         issue_key = jira_key,
         source = "action",
@@ -106,9 +109,10 @@ function Runtime.execute(ctx: any): any
 end
 
 function Runtime.reconcile(ctx: any): any
+    local args = model.clean(ctx.args)
     local pr = ctx:await(ctx.inputs.github:call("get_pr", {
-        repository = ctx.args.repository,
-        number = ctx.args.number,
+        repository = args.repository,
+        number = args.number,
     }))
     if pr.state == "merged" or pr.merged == true then
         return { status = "succeeded", merged = true, number = pr.number }

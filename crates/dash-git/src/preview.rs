@@ -1407,14 +1407,14 @@ mod mock_test_bridge_tests {
             assert_eq!(r.failed, 0, "definition test failed: {r:?}");
         }
         // connector input -> github.mock fixtures (and Mock state within one test)
-        // 5 Mock-backed cases + 5 self-contained reconcile/dry_run/execute cases
-        assert_eq!(report_for(&reports, "github.merge_pr").passed, 10);
-        // 3 Mock-backed cases + 4 scripted polling/merge-detection cases
-        assert_eq!(report_for(&reports, "github.pull_requests").passed, 7);
+        // 6 Mock-backed cases + 5 self-contained reconcile/dry_run/execute cases
+        assert_eq!(report_for(&reports, "github.merge_pr").passed, 11);
+        // 4 Mock-backed cases + 4 scripted polling/merge-detection cases
+        assert_eq!(report_for(&reports, "github.pull_requests").passed, 8);
         // Every GitHub data provider and action reaches the Mock's operations.
         for (id, cases) in [
             ("github.connector", 13),
-            ("jira.connector", 11),
+            ("jira.connector", 12),
             ("jira.search", 1),
             ("jira.issues_by_keys", 2),
             ("jira.transition_issue", 4),
@@ -1422,7 +1422,7 @@ mod mock_test_bridge_tests {
             ("jira.create_issue", 1),
             ("github.issues", 2),
             ("github.search", 1),
-            ("github.workflow_runs", 1),
+            ("github.workflow_runs", 2),
             ("github.ci_status", 1),
             ("github.create_issue", 2),
             ("github.comment", 2),

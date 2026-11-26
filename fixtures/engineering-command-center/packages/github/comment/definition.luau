@@ -4,6 +4,7 @@ return dash.action_provider {
     id = "github.comment",
     description = "Comments on a GitHub issue or pull request; the Dry run checks that the target exists",
     runtime = "runtime.luau",
+    libraries = { "github.model" },
     handler = "execute",
     dry_run = "dry_run",
     inputs = {

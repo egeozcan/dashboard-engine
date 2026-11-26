@@ -297,6 +297,16 @@ function ops.get_ci_status(ctx: any, a: any): any
     return nil
 end
 
+-- Like the API's `/actions/workflows/{workflow_id}/runs`: a workflow id or its file name.
+local function workflow_matches(raw: any, run: any, workflow: any): boolean
+    local w = tostring(workflow)
+    if tostring(run.workflow_id) == w then
+        return true
+    end
+    local path = model.v(raw.path)
+    return type(path) == "string" and string.match(path, "([^/]+)$") == w
+end
+
 function ops.list_workflow_runs(ctx: any, a: any): any
     local repo = model.check_repository(a.repository)
     local out = {}
@@ -307,7 +317,7 @@ function ops.list_workflow_runs(ctx: any, a: any): any
             and (a.status == nil or run.status == a.status or run.conclusion == a.status)
             and (a.event == nil or run.event == a.event)
             and (a.actor == nil or run.actor == a.actor)
-            and (a.workflow == nil or tostring(run.workflow_id) == a.workflow or run.name == a.workflow)
+            and (a.workflow == nil or workflow_matches(raw, run, a.workflow))
         if ok then
             table.insert(out, run)
         end
@@ -320,7 +330,7 @@ function Runtime.call(ctx: any): any
     if op == nil then
         error("unknown github mock operation: " .. tostring(ctx.operation))
     end
-    return op(ctx, ctx.args or {})
+    return op(ctx, model.clean(ctx.args))
 end
 
 return Runtime

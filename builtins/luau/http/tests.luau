@@ -203,3 +203,32 @@ dash.test("an object where a list of items is expected is an error, not zero row
     }, "get", { path = "/e", paginate = { mode = "cursor", items_path = "data", size_param = "limit" } }))
     dash.assert(not ok and string.find(tostring(err), "INVALID_RESPONSE", 1, true) ~= nil, tostring(err))
 end)
+
+dash.test("JSON nulls inside a request body are sent, not dropped", function(_)
+    local w = fake({ base_url = "https://x.test" }, {
+        ["PATCH https://x.test/issues/7"] = { status = 200, headers = {}, body = {} },
+    }, "request", dash.json.decode('{"method":"PATCH","path":"/issues/7","body":{"milestone":null,"title":"x"}}'))
+    Runtime.call(w)
+    dash.assert_eq(dash.json.encode(w.sent[1].body), '{"milestone":null,"title":"x"}', "null kept in the body")
+end)
+
+dash.test("the Instance's static query and headers win over per-call ones", function(_)
+    local ctx = fake({ base_url = "https://x.test", query = { project = "public" }, headers = { ["X-Tenant"] = "a" } }, {
+        ["GET https://x.test/items?project=public"] = { status = 200, headers = {}, body = {} },
+    }, "get", { path = "/items", query = { project = "internal" }, headers = { ["x-tenant"] = "b", accept = "text/csv" } })
+    Runtime.call(ctx)
+    local h = ctx.sent[1].headers
+    dash.assert_eq(h["X-Tenant"], "a", "static header kept")
+    dash.assert(h["x-tenant"] == nil, "per-call header with the same name dropped")
+    dash.assert_eq(h.accept, "text/csv", "the default Accept can be replaced")
+    dash.assert(h.Accept == nil, "no second Accept")
+end)
+
+dash.test("link pagination keeps going when the next URL contains commas", function(_)
+    local base = "https://x.test"
+    local ctx = fake({ base_url = base }, {
+        ["GET " .. base .. "/items"] = { status = 200, headers = { link = '<' .. base .. '/items?fields=a,b&page=2>; rel="next"' }, body = { 1 } },
+        ["GET " .. base .. "/items?fields=a,b&page=2"] = { status = 200, headers = {}, body = { 2 } },
+    }, "get", { path = "/items", paginate = { mode = "link" } })
+    dash.assert_eq(Runtime.call(ctx), { 1, 2 }, "both pages")
+end)

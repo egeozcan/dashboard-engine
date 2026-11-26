@@ -11,8 +11,9 @@ local function describe(target: string?, category: string?): string
 end
 
 function Runtime.dry_run(ctx: any): any
-    local target, category = model.target_of(ctx.args)
-    local issue = ctx:await(ctx.inputs.jira:call("get_issue", { key = ctx.args.key }))
+    local args = model.clean(ctx.args)
+    local target, category = model.target_of(args)
+    local issue = ctx:await(ctx.inputs.jira:call("get_issue", { key = args.key }))
     local warnings = {}
     local feasible = true
     local via, to_status = nil, nil
@@ -20,9 +21,12 @@ function Runtime.dry_run(ctx: any): any
         table.insert(warnings, "already in '" .. issue.status .. "'; nothing to change")
         to_status = issue.status
     else
-        local transitions = ctx:await(ctx.inputs.jira:call("get_transitions", { key = ctx.args.key }))
-        local chosen = model.pick_transition(transitions, target, nil, category)
-        if chosen == nil then
+        local transitions = ctx:await(ctx.inputs.jira:call("get_transitions", { key = args.key }))
+        local chosen, why = model.pick_transition(transitions, target, nil, category)
+        if chosen == nil and why ~= nil then
+            feasible = false
+            table.insert(warnings, why)
+        elseif chosen == nil then
             feasible = false
             table.insert(warnings, "no transition from '" .. issue.status .. "' to " .. describe(target, category)
                 .. " (available: " .. model.transition_names(transitions) .. ")")
@@ -48,20 +52,22 @@ function Runtime.dry_run(ctx: any): any
 end
 
 function Runtime.execute(ctx: any): any
-    local target, category = model.target_of(ctx.args)
+    local args = model.clean(ctx.args)
+    local target, category = model.target_of(args)
     local res = ctx:await(ctx.inputs.jira:call("transition_issue", {
-        key = ctx.args.key,
+        key = args.key,
         status = target,
         status_category = category,
-        comment = ctx.args.comment,
-        resolution = ctx.args.resolution,
+        comment = args.comment,
+        resolution = args.resolution,
     }))
     return { key = res.key, status = res.status, transitioned = res.transitioned }
 end
 
 function Runtime.reconcile(ctx: any): any
-    local target, category = model.target_of(ctx.args)
-    local issue = ctx:await(ctx.inputs.jira:call("get_issue", { key = ctx.args.key }))
+    local args = model.clean(ctx.args)
+    local target, category = model.target_of(args)
+    local issue = ctx:await(ctx.inputs.jira:call("get_issue", { key = args.key }))
     if model.at_target(issue, target, category) then
         return { status = "succeeded", key = issue.key, transitioned = true }
     end

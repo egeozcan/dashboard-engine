@@ -16,30 +16,32 @@ local function validate(args: any): { string }
 end
 
 function Runtime.dry_run(ctx: any): any
-    local problems = validate(ctx.args)
+    local args = model.clean(ctx.args)
+    local problems = validate(args)
     return {
         feasible = #problems == 0,
         warnings = problems,
         effects = {
-            repository = ctx.args.repository,
-            title = ctx.args.title,
-            labels = ctx.args.labels,
-            assignees = ctx.args.assignees,
+            repository = args.repository,
+            title = args.title,
+            labels = args.labels,
+            assignees = args.assignees,
         },
     }
 end
 
 function Runtime.execute(ctx: any): any
-    local problems = validate(ctx.args)
+    local args = model.clean(ctx.args)
+    local problems = validate(args)
     if #problems > 0 then
         error("INVALID_ARGS: " .. table.concat(problems, "; "))
     end
     local issue = ctx:await(ctx.inputs.github:call("create_issue", {
-        repository = ctx.args.repository,
-        title = ctx.args.title,
-        body = ctx.args.body,
-        labels = ctx.args.labels,
-        assignees = ctx.args.assignees,
+        repository = args.repository,
+        title = args.title,
+        body = args.body,
+        labels = args.labels,
+        assignees = args.assignees,
     }))
     return { number = issue.number, url = issue.url, id = issue.id }
 end

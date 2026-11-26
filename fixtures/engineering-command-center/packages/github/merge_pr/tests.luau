@@ -127,3 +127,12 @@ dash.test("execute merges, emits github.pr_merged and returns the typed result",
     dash.assert_eq(ctx.emitted[1].event_type, "github.pr_merged", "emits merge event")
     dash.assert_eq(ctx.emitted[1].payload.issue_key, "DEV-123", "derives Jira key from title")
 end)
+
+dash.test("null optional args read as absent in dry_run and execute", function(make_ctx)
+    local args = dash.json.decode('{"repository":"acme/platform","number":42,"merge_method":null,"expected_head_sha":null,"issue_key":null}')
+    local report = Runtime.dry_run(make_ctx({ args = args }))
+    dash.assert(report.feasible == true, "feasible")
+    dash.assert_eq(report.effects.action, "squash_and_merge", "default merge method")
+    local res = Runtime.execute(make_ctx({ args = args }))
+    dash.assert(res.merged == true, "merged")
+end)

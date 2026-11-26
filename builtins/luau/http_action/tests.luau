@@ -38,3 +38,23 @@ dash.test("execute forwards the idempotency key when configured", function(_)
     dash.assert_eq(sent.req.idempotency_key, "exec-1", "key")
     dash.assert_eq(sent.req.idempotency_header, "Idempotency-Key", "header")
 end)
+
+dash.test("null arguments merged into the body are sent as JSON null", function(_)
+    local sent
+    local ctx = {
+        config = { method = "PATCH", path = "/issues/{id}" },
+        args = dash.json.decode('{"id":7,"milestone":null,"title":"x"}'),
+        inputs = { api = { call = function(_self, _op, req)
+            sent = req
+            return { status = 200, body = {} }
+        end } },
+    }
+    function ctx:await(v)
+        return v
+    end
+    Runtime.execute(ctx)
+    dash.assert_eq(sent.path, "/issues/7", "path")
+    dash.assert_eq(dash.json.encode(sent.body), '{"milestone":null,"title":"x"}', "null kept")
+    local ok, err = pcall(Runtime.build, { path = "/issues/{id}" }, dash.json.decode('{"id":null}'))
+    dash.assert(not ok and string.find(tostring(err), "INVALID_ARGS", 1, true) ~= nil, "a null path parameter is missing: " .. tostring(err))
+end)

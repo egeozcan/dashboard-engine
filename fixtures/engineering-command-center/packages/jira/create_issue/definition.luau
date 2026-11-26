@@ -4,6 +4,7 @@ return dash.action_provider {
     id = "jira.create_issue",
     description = "Creates a Jira issue; the Dry run validates the request and shows the issue to be created",
     runtime = "runtime.luau",
+    libraries = { "jira.model" },
     handler = "execute",
     dry_run = "dry_run",
     inputs = {

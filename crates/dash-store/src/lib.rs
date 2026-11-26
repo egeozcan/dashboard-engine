@@ -2741,7 +2741,7 @@ impl SqliteStore {
         since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<HistorySampleRecord>, StoreError> {
-        self.query_history_samples_window(series_id, since, None, limit)
+        self.query_history_samples_window(series_id, since, None, limit, since.is_none())
     }
 
     /// Raw samples with `since <= sampled_at < until`. With `since`, the oldest `limit` samples
@@ -2752,12 +2752,13 @@ impl SqliteStore {
         since: Option<&str>,
         until: Option<&str>,
         limit: usize,
+        newest: bool,
     ) -> Result<Vec<HistorySampleRecord>, StoreError> {
         // Query budget (§7.4): one read never returns more than HISTORY_QUERY_BUDGET samples.
         let limit = limit.clamp(1, HISTORY_QUERY_BUDGET);
         let (filter, mut args) = history_window_filter(series_id, since, until);
         args.push(rusqlite::types::Value::Integer(limit as i64));
-        let sql = if since.is_some() {
+        let sql = if !newest {
             format!(
                 "SELECT sample_id, series_id, sampled_at, value_num, metadata_json
                  FROM history_samples WHERE {filter}
@@ -2804,12 +2805,13 @@ impl SqliteStore {
         bucket_secs: i64,
         aggregate: HistoryAggregate,
         limit: usize,
+        newest: bool,
     ) -> Result<Vec<HistoryBucketRecord>, StoreError> {
         let limit = limit.clamp(1, HISTORY_QUERY_BUDGET);
         let bucket_secs = bucket_secs.max(1);
         let (filter, window_args) = history_window_filter(series_id, since, until);
         let (value_expr, extra) = aggregate.sql();
-        let order = if since.is_some() { "ASC" } else { "DESC" };
+        let order = if newest { "DESC" } else { "ASC" };
         let sql = format!(
             "SELECT (CAST(strftime('%s', sampled_at) AS INTEGER) / ?) * ? AS bucket,
                     {value_expr} AS v, COUNT(*) AS n{extra}
@@ -2844,7 +2846,7 @@ impl SqliteStore {
                     samples,
                 });
             }
-            if since.is_none() {
+            if newest {
                 out.reverse();
             }
             Ok(out)
@@ -4090,6 +4092,7 @@ mod tests {
                 Some("2026-01-01T01:00:00+00:00"),
                 Some("2026-01-01T02:00:00+00:00"),
                 100,
+                false,
             )
             .unwrap();
         let values: Vec<f64> = window.iter().map(|r| r.value_num).collect();
@@ -4097,7 +4100,7 @@ mod tests {
 
         let hourly = |agg| {
             store
-                .query_history_buckets("s", None, None, 3600, agg, 100)
+                .query_history_buckets("s", None, None, 3600, agg, 100, true)
                 .unwrap()
         };
         let avg = hourly(HistoryAggregate::Avg);
@@ -4126,7 +4129,7 @@ mod tests {
 
         // Without `since`, `limit` keeps the newest buckets (oldest first); with it, the oldest.
         let newest = store
-            .query_history_buckets("s", None, None, 3600, HistoryAggregate::Max, 2)
+            .query_history_buckets("s", None, None, 3600, HistoryAggregate::Max, 2, true)
             .unwrap();
         assert_eq!(
             newest.iter().map(|b| b.value_num).collect::<Vec<_>>(),
@@ -4140,6 +4143,7 @@ mod tests {
                 3600,
                 HistoryAggregate::Count,
                 2,
+                false,
             )
             .unwrap();
         assert_eq!(

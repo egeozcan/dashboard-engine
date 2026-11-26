@@ -35,15 +35,23 @@ end
 
 -- A configured value as a response: envelopes as given, anything else a 200 with that body.
 local function response(v: any): any
-    if type(v) == "table" and type(v.status) == "number" and v.body ~= nil then
-        return { status = v.status, headers = v.headers or {}, body = v.body }
+    if type(v) == "table" and type(v.status) == "number" then
+        local envelope = true
+        for k in pairs(v) do
+            if k ~= "status" and k ~= "headers" and k ~= "body" then
+                envelope = false
+            end
+        end
+        if envelope then
+            return { status = v.status, headers = v.headers or {}, body = util.v(v.body) }
+        end
     end
     return { status = 200, headers = {}, body = v }
 end
 
 function Runtime.call(ctx: any): any
-    local cfg = util.clean(ctx.config)
-    local args = util.clean(ctx.args)
+    local cfg = util.clean(ctx.config, { mock = true })
+    local args = util.clean(ctx.args, { body = true })
     local path = util.check_path(args.path)
     if ctx.operation == "get" then
         local found, v = lookup(cfg, "GET", path, args.query)

@@ -181,14 +181,16 @@ fn origin_of(url: &Url) -> Origin {
     }
 }
 
-/// Lower-cased path with the percent-encoded separators and dots that servers commonly decode
+/// Path with the percent-encoded separators and dots that servers commonly decode
 /// (`%2f`, `%5c`, `%2e`) turned into their literal form, for confinement checks.
 fn decoded_path_for_confinement(path: &str) -> String {
-    path.to_ascii_lowercase()
-        .replace("%2f", "/")
+    path.replace("%2f", "/")
+        .replace("%2F", "/")
         .replace("%5c", "/")
+        .replace("%5C", "/")
         .replace('\\', "/")
         .replace("%2e", ".")
+        .replace("%2E", ".")
 }
 
 /// Whether `url` stays under the `confine_to` prefix: same origin, and a path equal to the
@@ -441,26 +443,44 @@ impl HttpBroker {
         let mut body = req.body.clone().filter(|b| !b.is_null());
         let first_origin = origin_of(&current_url);
         let mut credential_active = credential.is_some();
+        // Set once a non-safe request (POST, PUT, ...) has been sent and answered with a
+        // redirect: the upstream may already have applied it, so any refusal to follow the
+        // redirect afterwards loses the write's outcome instead of proving it had no effect.
+        let mut write_sent = false;
+        let lost = |write_sent: bool, e: HttpBrokerError| -> HttpBrokerError {
+            match e {
+                e @ HttpBrokerError::OutcomeUnknown(_) => e,
+                e if write_sent => HttpBrokerError::OutcomeUnknown(format!(
+                    "{e} (after the write was sent and answered with a redirect, so its outcome is unknown)"
+                )),
+                e => e,
+            }
+        };
 
         for redirect_hop in 0..=MAX_REDIRECTS {
             if let Some(prefix) = &confine {
                 if !within_confinement(&current_url, prefix) {
-                    return Err(HttpBrokerError::PolicyDenied(
-                        audit_destination(&current_url),
-                        format!(
-                            "{} leaves the connector's base URL {}",
-                            if redirect_hop == 0 {
-                                "request"
-                            } else {
-                                "redirect"
-                            },
-                            audit_destination(prefix)
+                    return Err(lost(
+                        write_sent,
+                        HttpBrokerError::PolicyDenied(
+                            audit_destination(&current_url),
+                            format!(
+                                "{} leaves the connector's base URL {}",
+                                if redirect_hop == 0 {
+                                    "request"
+                                } else {
+                                    "redirect"
+                                },
+                                audit_destination(prefix)
+                            ),
                         ),
                     ));
                 }
             }
-            let pinned = vet_destination(&current_url, &policy).await?;
-            let host = host_for_policy(&current_url)?;
+            let pinned = vet_destination(&current_url, &policy)
+                .await
+                .map_err(|e| lost(write_sent, e))?;
+            let host = host_for_policy(&current_url).map_err(|e| lost(write_sent, e))?;
 
             let mut request_url = current_url.clone();
             let mut cred_header: Option<(String, String)> = None;
@@ -468,10 +488,13 @@ impl HttpBroker {
                 if !cred.allowed_hosts.is_empty()
                     && !NetworkPolicy::pattern_list_matches(&cred.allowed_hosts, &host)
                 {
-                    return Err(HttpBrokerError::CredentialError(
-                        cred.secret_name.clone(),
-                        format!(
-                            "secret access policy does not allow attaching it to host '{host}'"
+                    return Err(lost(
+                        write_sent,
+                        HttpBrokerError::CredentialError(
+                            cred.secret_name.clone(),
+                            format!(
+                                "secret access policy does not allow attaching it to host '{host}'"
+                            ),
                         ),
                     ));
                 }
@@ -479,9 +502,10 @@ impl HttpBroker {
             }
 
             let client = match &pinned {
-                Pinned::Domain(domain, addrs) => build_client(Some((domain.as_str(), addrs)))?,
-                Pinned::IpLiteral => build_client(None)?,
-            };
+                Pinned::Domain(domain, addrs) => build_client(Some((domain.as_str(), addrs))),
+                Pinned::IpLiteral => build_client(None),
+            }
+            .map_err(|e| lost(write_sent, e))?;
             // Kept only to scrub it (query credentials included) out of transport error text.
             let request_url_for_errors = request_url.to_string();
             let mut builder = client.request(method.clone(), request_url);
@@ -512,7 +536,7 @@ impl HttpBroker {
                 Err(e) => {
                     let not_sent = request_provably_not_sent(&e);
                     let msg = self.transport_error_message(e, &request_url_for_errors, &hop_dest);
-                    let err = if not_sent || is_safe_method(method.as_str()) {
+                    let err = if (not_sent || is_safe_method(method.as_str())) && !write_sent {
                         HttpBrokerError::Transport(msg)
                     } else {
                         HttpBrokerError::OutcomeUnknown(msg)
@@ -539,13 +563,22 @@ impl HttpBroker {
 
             if resp.status().is_redirection() {
                 if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
-                    let next = current_url
-                        .join(loc)
-                        .map_err(|e| HttpBrokerError::InvalidUrl(loc.to_string(), e.to_string()))?;
+                    if !is_safe_method(method.as_str()) {
+                        write_sent = true;
+                    }
+                    let next = current_url.join(loc).map_err(|e| {
+                        lost(
+                            write_sent,
+                            HttpBrokerError::InvalidUrl(loc.to_string(), e.to_string()),
+                        )
+                    })?;
                     if current_url.scheme() == "https" && next.scheme() != "https" {
-                        return Err(HttpBrokerError::PolicyDenied(
-                            audit_destination(&next),
-                            "redirect downgrades https to an insecure scheme".into(),
+                        return Err(lost(
+                            write_sent,
+                            HttpBrokerError::PolicyDenied(
+                                audit_destination(&next),
+                                "redirect downgrades https to an insecure scheme".into(),
+                            ),
                         ));
                     }
                     // Credentials (and Luau-supplied credential headers) never follow a redirect
@@ -556,9 +589,27 @@ impl HttpBroker {
                     let status = resp.status().as_u16();
                     let not_get_or_head =
                         method != reqwest::Method::GET && method != reqwest::Method::HEAD;
-                    if (status == 303 && method != reqwest::Method::HEAD)
-                        || ((status == 301 || status == 302) && not_get_or_head)
-                    {
+                    if (status == 301 || status == 302) && not_get_or_head {
+                        // Browsers re-issue these as a GET, which would report the GET's answer
+                        // as the write's result. The upstream may or may not have applied the
+                        // write (302 is also the legacy Post/Redirect/Get answer), so the
+                        // outcome is unknown; only 303 (applied, see other) and 307/308
+                        // (re-send the same request) are followed for writes.
+                        return Err(if is_safe_method(method.as_str()) {
+                            HttpBrokerError::Transport(format!(
+                                "{} answered {status} to a {method} request",
+                                audit_destination(&current_url)
+                            ))
+                        } else {
+                            HttpBrokerError::OutcomeUnknown(format!(
+                                "{} answered {status} (redirect to {}) to a {method} request; \
+                                 the write may or may not have been applied",
+                                audit_destination(&current_url),
+                                audit_destination(&next)
+                            ))
+                        });
+                    }
+                    if status == 303 && method != reqwest::Method::HEAD {
                         method = reqwest::Method::GET;
                         body = None;
                     }
@@ -572,7 +623,21 @@ impl HttpBroker {
             for (k, v) in resp.headers() {
                 if let Ok(vs) = v.to_str() {
                     let safe_v = self.store.redactor().redact_str(vs);
-                    resp_headers.insert(k.to_string(), safe_v);
+                    // A repeated header (e.g. one `Link` line per relation) is one
+                    // comma-separated list (RFC 9110 §5.3); `Set-Cookie` cannot be joined.
+                    match resp_headers.entry(k.to_string()) {
+                        std::collections::btree_map::Entry::Occupied(mut e)
+                            if k != reqwest::header::SET_COOKIE =>
+                        {
+                            let joined: &mut String = e.get_mut();
+                            joined.push_str(", ");
+                            joined.push_str(&safe_v);
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => {}
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(safe_v);
+                        }
+                    }
                 }
             }
 
@@ -587,7 +652,7 @@ impl HttpBroker {
             let mut bytes: Vec<u8> = Vec::new();
             while let Some(chunk) = resp.chunk().await.map_err(|e| {
                 let msg = self.transport_error_message(e, &request_url_for_errors, &hop_dest);
-                if is_safe_method(method.as_str()) {
+                if is_safe_method(method.as_str()) && !write_sent {
                     HttpBrokerError::Transport(msg)
                 } else {
                     HttpBrokerError::OutcomeUnknown(msg)
@@ -618,7 +683,7 @@ impl HttpBroker {
             ));
         }
 
-        Err(HttpBrokerError::TooManyRedirects)
+        Err(lost(write_sent, HttpBrokerError::TooManyRedirects))
     }
 
     /// Error text of a failed hop: reqwest's message *without* the request URL (whose query may
@@ -1282,6 +1347,102 @@ mod tests {
             "{err}"
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A write answered with a redirect the broker will not follow (out of the confinement
+    /// prefix, or a 301/302 that would turn it into a GET) may already have been applied: the
+    /// outcome is unknown, never a definitive (retry-safe) failure or the GET's answer.
+    #[tokio::test]
+    async fn redirects_after_a_write_lose_its_outcome_instead_of_failing_or_succeeding() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h1, h2) = (hits.clone(), hits.clone());
+        let addr = serve(
+            Router::new()
+                .route(
+                    "/api/v1/orders",
+                    axum::routing::post(move || {
+                        h1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async { (StatusCode::SEE_OTHER, [("location", "/orders/1")]) }
+                    }),
+                )
+                .route(
+                    "/api/v1/slash",
+                    axum::routing::post(move || {
+                        h2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async {
+                            (
+                                StatusCode::MOVED_PERMANENTLY,
+                                [("location", "/api/v1/slash/")],
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/api/v1/slash/",
+                    get(|| async { Json(json!([{ "id": 1 }])) }),
+                ),
+        )
+        .await;
+        let store = SqliteStore::open_in_memory().unwrap();
+        grant_loopback_ceiling(&store);
+        let broker = HttpBroker::new(store.clone()).unwrap();
+        for path in ["/api/v1/orders", "/api/v1/slash"] {
+            let req = HttpHostRequest {
+                method: "POST".into(),
+                url: format!("http://127.0.0.1:{}{path}", addr.port()),
+                headers: BTreeMap::new(),
+                body: Some(json!({ "n": 1 })),
+                credential: None,
+                confine_to: Some(format!("http://127.0.0.1:{}/api/v1", addr.port())),
+            };
+            let err = broker
+                .execute(
+                    &Principal::administrator(),
+                    &conn_inst(None),
+                    None,
+                    &loopback_graph(),
+                    req,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, HttpBrokerError::OutcomeUnknown(_)),
+                "{path}: {err:?}"
+            );
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// One `Link` line per relation: both reach Luau as one comma-separated header.
+    #[tokio::test]
+    async fn repeated_response_headers_are_joined() {
+        let addr = serve(Router::new().route(
+            "/items",
+            get(|| async {
+                let mut h = HeaderMap::new();
+                h.append("link", "</items?page=2>; rel=\"next\"".parse().unwrap());
+                h.append("link", "</items?page=9>; rel=\"last\"".parse().unwrap());
+                (h, Json(json!([])))
+            }),
+        ))
+        .await;
+        let store = SqliteStore::open_in_memory().unwrap();
+        grant_loopback_ceiling(&store);
+        let broker = HttpBroker::new(store.clone()).unwrap();
+        let resp = broker
+            .execute(
+                &Principal::administrator(),
+                &conn_inst(None),
+                None,
+                &loopback_graph(),
+                get_req(format!("http://127.0.0.1:{}/items", addr.port()), None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers["link"],
+            "</items?page=2>; rel=\"next\", </items?page=9>; rel=\"last\""
+        );
     }
 
     fn get_req(url: String, credential: Option<&str>) -> HttpHostRequest {

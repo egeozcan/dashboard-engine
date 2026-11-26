@@ -262,8 +262,11 @@ function ops.transition_issue(ctx: any, a: any): any
         return { key = key, status = from, from_status = from, transitioned = false }
     end
     local available = transitions_of(ctx, key)
-    local chosen = model.pick_transition(available, target, a.transition_id, category)
+    local chosen, why = model.pick_transition(available, target, a.transition_id, category)
     if chosen == nil then
+        if why ~= nil then
+            error(string.format("NO_TRANSITION: Jira issue %s: %s", key, why))
+        end
         local wanted = a.transition_id or target or ("a status of category '" .. tostring(category) .. "'")
         error(string.format("NO_TRANSITION: Jira issue %s cannot move from '%s' to %s (available: %s)",
             key, from, tostring(wanted), model.transition_names(available)))

@@ -1,8 +1,11 @@
 --!strict
+local model = require("jira.model")
+
 local Runtime = {}
 
 function Runtime.query(ctx)
-    local keys = ctx.query.keys or {}
+    local query = model.clean(ctx.query)
+    local keys = query.keys or {}
     if #keys == 0 then
         return {}
     end

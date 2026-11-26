@@ -40,7 +40,8 @@ function Runtime.request_args(cfg: any, params: any): any
     local query = util.merge(cfg.query)
     if cfg.forward_params ~= false then
         for k, v in pairs(p) do
-            if not used[k] then
+            -- A forwarded parameter never replaces a configured one.
+            if not used[k] and query[k] == nil then
                 query[k] = v
             end
         end

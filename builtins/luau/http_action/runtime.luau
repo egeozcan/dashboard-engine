@@ -15,13 +15,13 @@ function Runtime.build(cfg: any, args: any): any
     local path, used = util.fill_template(cfg.path, a)
     util.check_path(path)
     local body = nil
-    if a.body ~= nil then
+    if util.v(a.body) ~= nil then
         body = a.body
     else
         local rest = {}
         local any = false
         for k, v in pairs(a) do
-            if not used[k] then
+            if not used[k] and k ~= "body" then
                 rest[k] = v
                 any = true
             end
@@ -40,8 +40,22 @@ function Runtime.build(cfg: any, args: any): any
     }
 end
 
+-- Config without nulls, except inside the static body (nulls there are sent).
+local function config_of(ctx: any): any
+    return util.clean(ctx.config, { body = true })
+end
+
+-- The arguments as given: a null argument merged into the body is sent as JSON null (PATCH
+-- APIs clear fields with it); a null path parameter is refused as missing.
+local function args_of(ctx: any): any
+    if type(ctx.args) ~= "table" then
+        return {}
+    end
+    return ctx.args
+end
+
 function Runtime.dry_run(ctx: any): any
-    local req = Runtime.build(util.clean(ctx.config), util.clean(ctx.args))
+    local req = Runtime.build(config_of(ctx), args_of(ctx))
     return {
         feasible = true,
         warnings = {},
@@ -57,8 +71,8 @@ function Runtime.dry_run(ctx: any): any
 end
 
 function Runtime.execute(ctx: any): any
-    local cfg = util.clean(ctx.config)
-    local req = Runtime.build(cfg, util.clean(ctx.args))
+    local cfg = config_of(ctx)
+    local req = Runtime.build(cfg, args_of(ctx))
     if cfg.idempotency_header ~= nil and ctx.idempotency_key ~= nil then
         req.idempotency_key = ctx.idempotency_key
         req.idempotency_header = cfg.idempotency_header

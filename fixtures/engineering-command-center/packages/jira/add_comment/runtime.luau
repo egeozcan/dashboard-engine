@@ -1,9 +1,12 @@
 --!strict
+local model = require("jira.model")
+
 local Runtime = {}
 
 function Runtime.dry_run(ctx: any): any
-    local issue = ctx:await(ctx.inputs.jira:call("get_issue", { key = ctx.args.key }))
-    local empty = type(ctx.args.body) ~= "string" or string.match(ctx.args.body, "^%s*$") ~= nil
+    local args = model.clean(ctx.args)
+    local issue = ctx:await(ctx.inputs.jira:call("get_issue", { key = args.key }))
+    local empty = type(args.body) ~= "string" or string.match(args.body, "^%s*$") ~= nil
     return {
         feasible = not empty,
         warnings = if empty then { "comment body must not be empty" } else {},
@@ -12,7 +15,8 @@ function Runtime.dry_run(ctx: any): any
 end
 
 function Runtime.execute(ctx: any): any
-    local res = ctx:await(ctx.inputs.jira:call("add_comment", { key = ctx.args.key, body = ctx.args.body }))
+    local args = model.clean(ctx.args)
+    local res = ctx:await(ctx.inputs.jira:call("add_comment", { key = args.key, body = args.body }))
     return { id = res.id, key = res.key }
 end
 

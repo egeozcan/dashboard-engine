@@ -43,6 +43,9 @@ pub struct HistoryReadOptions {
     pub limit: Option<usize>,
     /// Downsampling into `bucket_secs`-wide buckets with an aggregate.
     pub bucket: Option<(i64, HistoryAggregate)>,
+    /// When more than `limit` samples/buckets fall in the range, keep the newest ones (a
+    /// sliding `window`, or no lower bound) instead of the oldest (an explicit `since`).
+    pub newest: bool,
 }
 
 fn as_count(v: &serde_json::Value) -> Option<u64> {
@@ -98,6 +101,7 @@ pub fn parse_history_read_options(
             HISTORY_QUERY_PARAMS.join(", ")
         ));
     }
+    let explicit_since = params.get("since").is_some_and(|v| !v.is_null());
     let mut since = match params.get("since") {
         Some(v) => parse_rfc3339("since", v)?,
         None => None,
@@ -113,8 +117,8 @@ pub fn parse_history_read_options(
         let secs = parse_history_duration(w).filter(|s| *s > 0).ok_or_else(|| {
             format!("history_series 'window' must be a positive duration such as \"24h\" or seconds, got {w}")
         })?;
-        let start = now
-            .checked_sub_signed(chrono::Duration::seconds(secs))
+        let start = chrono::Duration::try_seconds(secs)
+            .and_then(|d| now.checked_sub_signed(d))
             .ok_or_else(|| "history_series 'window' is too large".to_string())?;
         since = Some(start.to_rfc3339());
     }
@@ -168,6 +172,7 @@ pub fn parse_history_read_options(
         until,
         limit,
         bucket,
+        newest: !explicit_since,
     })
 }
 
@@ -552,11 +557,16 @@ mod tests {
         assert_eq!(o.since.as_deref(), Some("2026-01-01T00:00:00+00:00"));
         assert_eq!(o.bucket, Some((3600, HistoryAggregate::Max)));
         assert_eq!(o.limit, Some(48));
+        assert!(o.newest, "a sliding window keeps the newest samples");
         let o = parse(json!({ "since": "2026-01-01T01:00:00+01:00", "until": "2026-01-01T12:00:00Z", "bucket_secs": 300 }))
             .unwrap();
         assert_eq!(o.since.as_deref(), Some("2026-01-01T00:00:00+00:00"));
         assert_eq!(o.until.as_deref(), Some("2026-01-01T12:00:00+00:00"));
         assert_eq!(o.bucket, Some((300, HistoryAggregate::Avg)));
+        assert!(
+            !o.newest,
+            "an explicit since keeps the oldest samples after it"
+        );
         assert_eq!(parse(json!({})).unwrap().bucket, None);
 
         for bad in [
@@ -571,6 +581,9 @@ mod tests {
             json!({ "aggregate": "avg" }),
             json!({ "limit": -1 }),
             json!({ "step": 60 }),
+            // Out of chrono's range: refused, never a panic.
+            json!({ "window": 1e18 }),
+            json!({ "window": "9223372036854775807s" }),
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad} should be rejected");
         }

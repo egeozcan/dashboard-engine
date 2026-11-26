@@ -161,3 +161,10 @@ dash.test("confirmations per poll are bounded", function(_make_ctx)
     Runtime.query(ctx)
     dash.assert_eq(#ctx.lookups, 15, "nothing is looked up twice")
 end)
+
+dash.test("null state and base read as absent", function(make_ctx)
+    local prs = Runtime.query(make_ctx({
+        query = dash.json.decode('{"repository":"acme/platform","state":null,"base":null}'),
+    }))
+    dash.assert_eq(#prs, 3, "open PRs, unfiltered by base")
+end)

@@ -4,6 +4,7 @@ return dash.data_provider {
     id = "github.workflow_runs",
     description = "Recent GitHub Actions workflow runs of a repository, optionally for one workflow, branch, status or event",
     runtime = "runtime.luau",
+    libraries = { "github.model" },
     handler = "query",
     inputs = {
         github = dash.connector_ref("github.connector", { required_capabilities = { "actions.read" } }),

@@ -4,6 +4,7 @@ return dash.data_provider {
     id = "jira.issues_by_keys",
     description = "Fetches Jira issues by issue key list (unknown keys are skipped)",
     runtime = "runtime.luau",
+    libraries = { "jira.model" },
     handler = "query",
     inputs = {
         jira = dash.connector_ref("jira.connector", {

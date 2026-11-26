@@ -4,6 +4,7 @@ return dash.data_provider {
     id = "jira.search",
     description = "Jira issues matching a JQL query (e.g. 'project = DEV AND statusCategory != Done ORDER BY priority DESC')",
     runtime = "runtime.luau",
+    libraries = { "jira.model" },
     handler = "query",
     inputs = {
         jira = dash.connector_ref("jira.connector", { required_capabilities = { "issues.read" } }),

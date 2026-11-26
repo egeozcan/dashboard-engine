@@ -7,8 +7,9 @@ local Runtime = {}
 local DEFAULT_MAX_PAGES = 5
 
 local function headers_for(cfg: any, extra: any): { [string]: string }
-    local h = util.merge({ Accept = "application/json" }, cfg.headers, extra)
-    return h
+    -- The Instance's configured headers are fixed by its author: per-call headers cannot
+    -- replace them (only the default Accept).
+    return util.merge_headers({ Accept = "application/json" }, extra, cfg.headers)
 end
 
 local function send(ctx: any, cfg: any, method: string, url: string, headers: any, body: any): any
@@ -50,7 +51,8 @@ local function get(ctx: any, cfg: any, args: any): any
     local base = util.base_url(cfg)
     local path = util.check_path(args.path)
     local headers = headers_for(cfg, args.headers)
-    local query = util.merge(cfg.query, args.query)
+    -- Static query parameters of the Instance (e.g. a scoping `project`) win over per-call ones.
+    local query = util.merge(args.query, cfg.query)
     local pg = args.paginate or {}
     local mode = pg.mode or "none"
     local what = "GET " .. path
@@ -149,9 +151,9 @@ local function request(ctx: any, cfg: any, args: any): any
     local path = util.check_path(args.path)
     local headers = headers_for(cfg, args.headers)
     if args.idempotency_key ~= nil and args.idempotency_key ~= "" then
-        headers[args.idempotency_header or "Idempotency-Key"] = args.idempotency_key
+        headers = util.merge_headers(headers, { [args.idempotency_header or "Idempotency-Key"] = args.idempotency_key })
     end
-    local query = util.merge(cfg.query, args.query)
+    local query = util.merge(args.query, cfg.query)
     local method = args.method
     local resp = send(ctx, cfg, method, util.url(base, path, query), headers, args.body)
     if not util.is_success(resp) then
@@ -171,7 +173,7 @@ end
 function Runtime.call(ctx: any): any
     -- Optional values may arrive as JSON null: drop them so they read as absent.
     local cfg = util.clean(ctx.config)
-    local args = util.clean(ctx.args)
+    local args = util.clean(ctx.args, { body = true })
     if type(args.paginate) ~= "table" then
         args.paginate = nil
     end

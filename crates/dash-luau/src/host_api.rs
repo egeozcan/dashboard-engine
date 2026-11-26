@@ -1028,15 +1028,32 @@ pub fn build_query_string(params: &serde_json::Value) -> Result<String, String> 
 /// Parse an RFC 8288 `Link` header (`<url>; rel="next", <url>; rel="last"`) into `rel -> url`.
 pub fn parse_link_header(header: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for part in header.split(',') {
-        let mut segs = part.split(';');
-        let Some(target) = segs.next().map(str::trim) else {
-            continue;
+    let mut rest = header;
+    // Tokenize by `<...>` first: a target URL may itself contain `,` or `;`.
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('>') else {
+            break;
         };
-        let Some(url) = target.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
-            continue;
+        let url = &after[..close];
+        let tail = &after[close + 1..];
+        // The parameters run up to the next link-value: a `,` followed by `<`.
+        let params_end = {
+            let mut end = tail.len();
+            let mut in_quotes = false;
+            for (i, c) in tail.char_indices() {
+                match c {
+                    '"' => in_quotes = !in_quotes,
+                    ',' if !in_quotes && tail[i + 1..].trim_start().starts_with('<') => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            end
         };
-        for param in segs {
+        for param in tail[..params_end].split(';') {
             let Some((name, value)) = param.split_once('=') else {
                 continue;
             };
@@ -1047,6 +1064,7 @@ pub fn parse_link_header(header: &str) -> BTreeMap<String, String> {
                 }
             }
         }
+        rest = &tail[params_end..];
     }
     out
 }
@@ -1134,6 +1152,11 @@ mod tests {
             "https://api.github.com/repos/a/b/pulls?page=5"
         );
         assert!(parse_link_header("garbage").is_empty());
+        let links = parse_link_header(
+            r#"</items?fields=a,b;c&page=2>; rel="next"; title="x, y", </items?page=9>; rel=last"#,
+        );
+        assert_eq!(links["next"], "/items?fields=a,b;c&page=2");
+        assert_eq!(links["last"], "/items?page=9");
 
         let lua = Lua::new();
         lua.globals()

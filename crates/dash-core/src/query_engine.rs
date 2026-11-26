@@ -1066,12 +1066,19 @@ impl QueryEngine {
                                 bucket_secs,
                                 aggregate,
                                 limit,
+                                read.newest,
                             )
                             .map_err(|e| e.to_string())?,
                     ),
                     None => serde_json::to_value(
                         self.store
-                            .query_history_samples_window(series_id, since, until, limit)
+                            .query_history_samples_window(
+                                series_id,
+                                since,
+                                until,
+                                limit,
+                                read.newest,
+                            )
                             .map_err(|e| e.to_string())?,
                     ),
                 }
