@@ -272,3 +272,40 @@ dash.test("a category target never picks Won't Do among several done statuses", 
         and string.find(tostring(err), "pass `status`", 1, true) ~= nil, tostring(err))
     dash.assert_eq(#ambiguous.sent, 2, "nothing written")
 end)
+
+dash.test("a category target never cancels work when Cancel is the only done status reachable", function(_)
+    local ctx = fake({
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+            { id = "21", name = "Send to QA", to = { name = "QA", statusCategory = { key = "indeterminate" } } },
+            { id = "91", name = "Cancel", to = { name = "Canceled", statusCategory = { key = "done" } } },
+            { id = "92", name = "Reject", to = { name = "Won’t Do", statusCategory = { key = "done" } } },
+        } } },
+    }, "transition_issue", { key = "DEV-1", status_category = "done" })
+    local ok, err = pcall(Runtime.call, ctx)
+    dash.assert(not ok and string.find(tostring(err), "NO_TRANSITION", 1, true) ~= nil
+        and string.find(tostring(err), "Canceled", 1, true) ~= nil, tostring(err))
+    dash.assert_eq(#ctx.sent, 2, "nothing written")
+
+    -- A single non-negative done status (e.g. a localized one) is still used.
+    local localized = fake({
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+            { id = "91", name = "Cancel", to = { name = "Canceled", statusCategory = { key = "done" } } },
+            { id = "31", name = "Fertig", to = { name = "Erledigt", statusCategory = { key = "done" } } },
+        } } },
+        ["POST " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 204, body = "" },
+    }, "transition_issue", { key = "DEV-1" })
+    dash.assert_eq(Runtime.call(localized).status, "Erledigt", "localized done status")
+    dash.assert_eq(localized.sent[3].body.transition, { id = "31" }, "not the Cancel transition")
+
+    -- An explicit status may still name a negative one.
+    local explicit = fake({
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+            { id = "91", name = "Cancel", to = { name = "Canceled", statusCategory = { key = "done" } } },
+        } } },
+        ["POST " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 204, body = "" },
+    }, "transition_issue", { key = "DEV-1", status = "Canceled" })
+    dash.assert_eq(Runtime.call(explicit).status, "Canceled", "explicit status")
+end)

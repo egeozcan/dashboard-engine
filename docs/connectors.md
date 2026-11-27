@@ -23,7 +23,8 @@ All three behave the same way at runtime:
 - **Lost writes are `unknown`, not `failed`.** A 5xx answer to a write (other than 501) means
   `UNKNOWN_OUTCOME`. So does a redirect answer to a write that dash will not follow: a 301 or
   302 (a browser would re-send it as a GET), or any redirect out of `base_url`. A 303 is followed
-  with a GET, and a 307 or 308 re-sends the same request. The action execution becomes `unknown` instead of `failed`, and it is never
+  with a GET (the write was applied; if that GET fails, the outcome is `unknown`), and a 307 or
+  308 re-sends the same request. The action execution becomes `unknown` instead of `failed`, and it is never
   retried blindly. Actions with a `reconcile` handler resolve it.
 - **Requests stay under `base_url`.** Every request, pagination link and redirect hop must stay
   under the connector's `base_url`: same origin and path prefix, and no `.`/`..` segments, even
@@ -218,10 +219,13 @@ of:
   are reachable (Done, Won't Do and Canceled are all `done`), the conventional one wins (`done`:
   Done, Resolved, Closed, Complete(d), Fixed; `in_progress`: In Progress; `todo`: To Do, Open,
   Backlog). Without one, the call fails with `NO_TRANSITION` and asks for `status`, and the Dry
-  run reports it as infeasible: a category never picks Won't Do by workflow order.
+  run reports it as infeasible: a category never picks Won't Do by workflow order. Statuses that
+  mean the work was not done (Won't Do, Won't Fix, Canceled, Declined, Rejected, Duplicate,
+  Obsolete, Abandoned, Invalid, ...) are never picked by a category, even when they are the only
+  ones reachable; name them with `status` to use them.
 - `transition_id`: an explicit transition.
-- Neither: a status of category `done`. The reference `engineering.complete_work` automation
-  relies on this default.
+- Neither: a status of category `done`, the same as `status_category: done` (what the
+  reference `engineering.complete_work` automation sends).
 
 The steps:
 

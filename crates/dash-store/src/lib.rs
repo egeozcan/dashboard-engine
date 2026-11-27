@@ -2797,6 +2797,7 @@ impl SqliteStore {
     /// Samples downsampled into `bucket_secs`-wide UTC buckets (aligned to the Unix epoch), one
     /// `aggregate` value per non-empty bucket. Window and `limit` (in buckets) behave like
     /// [`Self::query_history_samples_window`].
+    #[allow(clippy::too_many_arguments)]
     pub fn query_history_buckets(
         &self,
         series_id: &str,

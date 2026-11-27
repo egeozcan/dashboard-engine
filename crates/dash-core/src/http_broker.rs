@@ -447,6 +447,9 @@ impl HttpBroker {
         // redirect: the upstream may already have applied it, so any refusal to follow the
         // redirect afterwards loses the write's outcome instead of proving it had no effect.
         let mut write_sent = false;
+        // Set once a write was answered 303 See Other: the upstream applied it, and the rest is a
+        // GET of the result, whose failure cannot make the write definitively failed.
+        let mut applied_via_see_other = false;
         let lost = |write_sent: bool, e: HttpBrokerError| -> HttpBrokerError {
             match e {
                 e @ HttpBrokerError::OutcomeUnknown(_) => e,
@@ -610,6 +613,9 @@ impl HttpBroker {
                         });
                     }
                     if status == 303 && method != reqwest::Method::HEAD {
+                        if !is_safe_method(method.as_str()) {
+                            applied_via_see_other = true;
+                        }
                         method = reqwest::Method::GET;
                         body = None;
                     }
@@ -619,6 +625,12 @@ impl HttpBroker {
             }
 
             let status = resp.status().as_u16();
+            if applied_via_see_other && !(200..300).contains(&status) {
+                return Err(HttpBrokerError::OutcomeUnknown(format!(
+                    "the write was answered 303 See Other, but reading its result from {} answered {status}",
+                    audit_destination(&current_url)
+                )));
+            }
             let mut resp_headers = BTreeMap::new();
             for (k, v) in resp.headers() {
                 if let Ok(vs) = v.to_str() {
@@ -1380,13 +1392,19 @@ mod tests {
                 .route(
                     "/api/v1/slash/",
                     get(|| async { Json(json!([{ "id": 1 }])) }),
+                )
+                .route(
+                    "/api/v1/gone",
+                    axum::routing::post(|| async {
+                        (StatusCode::SEE_OTHER, [("location", "/api/v1/missing")])
+                    }),
                 ),
         )
         .await;
         let store = SqliteStore::open_in_memory().unwrap();
         grant_loopback_ceiling(&store);
         let broker = HttpBroker::new(store.clone()).unwrap();
-        for path in ["/api/v1/orders", "/api/v1/slash"] {
+        for path in ["/api/v1/orders", "/api/v1/slash", "/api/v1/gone"] {
             let req = HttpHostRequest {
                 method: "POST".into(),
                 url: format!("http://127.0.0.1:{}{path}", addr.port()),

@@ -213,6 +213,25 @@ function M.transition(raw: any): any
     }
 end
 
+-- Statuses of the `done` category that mean the work was not done: a status-category target
+-- never picks them (only an explicit `status` or `transition_id` does). Compared lower case,
+-- with apostrophes and separators removed.
+local NEGATIVE_STATUS = {
+    "wontdo", "wontfix", "cancel", "canceled", "cancelled", "declined", "rejected", "duplicate",
+    "obsolete", "abandoned", "invalid", "notabug", "cannotreproduce", "notreproducible",
+    "incomplete", "outofscope",
+}
+
+local function is_negative_status(lower_name: string): boolean
+    local squashed = string.gsub(lower_name, "[%s%p\226\128\153]", "")
+    for _, n in ipairs(NEGATIVE_STATUS) do
+        if squashed == n then
+            return true
+        end
+    end
+    return false
+end
+
 -- Conventional status names of each category, in order of preference (lower case).
 local PREFERRED_STATUS = {
     done = { "done", "resolved", "closed", "complete", "completed", "fixed" },
@@ -241,16 +260,25 @@ function M.pick_transition(transitions: { any }, target_status: string?, transit
         -- and anything else is ambiguous (the caller must name `status`).
         local candidates = {}
         local by_status = {}
+        local negative = {}
         for _, t in ipairs(transitions) do
             if t.to_category == target_category then
                 local s = string.lower(t.to_status)
-                if by_status[s] == nil then
+                if is_negative_status(s) then
+                    table.insert(negative, t.to_status)
+                elseif by_status[s] == nil then
                     by_status[s] = t
                     table.insert(candidates, t)
                 end
             end
         end
         if #candidates == 0 then
+            if #negative > 0 then
+                -- Only "closed without doing it" statuses are reachable (e.g. a global Cancel
+                -- transition): never cancel finished work by category.
+                return nil, "only " .. table.concat(negative, ", ") .. " (category '" .. target_category
+                    .. "') is reachable, which a category target never picks; pass `status` to choose it"
+            end
             return nil
         end
         if #candidates == 1 then

@@ -17,7 +17,7 @@ local Runtime = {}
 local function lookup(cfg: any, method: string, path: string, query: any): (boolean, any)
     local mock = cfg.mock or {}
     local only_path = string.match(path, "^([^?]*)") or path
-    local qs = dash.url.query(util.merge(cfg.query, query))
+    local qs = dash.url.query(util.merge(query, cfg.query))
     local candidates = {}
     if qs ~= "" then
         table.insert(candidates, method .. " " .. only_path .. "?" .. qs)
