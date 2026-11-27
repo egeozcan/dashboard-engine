@@ -147,6 +147,54 @@ describe("DashboardView", () => {
     expect(dispatches[0].body).toMatchObject({ dry_run_token: "wdr_confirmed" });
   });
 
+  it("clears a failed load once a pushed render succeeds, but keeps Request errors", async () => {
+    mockFetch([
+      ["/api/dashboards", "GET", () => [doc()]],
+      [
+        "/api/dashboards/ops",
+        "GET",
+        () => {
+          // e.g. the Dashboard was opened just before the Administrator granted the network ceiling
+          throw new Error("network policy denied destination");
+        },
+      ],
+      [
+        "/api/widget-request/dry-run",
+        "POST",
+        () => {
+          throw new Error("adapter refused the request");
+        },
+      ],
+    ]);
+    render(<DashboardView />);
+    await screen.findByText(/network policy denied destination/);
+
+    const ws = MockWebSocket.latest();
+    act(() => ws.open());
+    const push = (title: string, generation: number) =>
+      act(() =>
+        ws.receive({
+          type: "dashboard_render",
+          protocol: "dash.render/1",
+          dashboard_id: "ops",
+          generation,
+          reason: "query",
+          signals: { items: { status: "fresh", updated_at: "2026-11-27T09:52:53Z", version: generation, generation } },
+          data: { document: doc(), rendered: renderedWith([{ id: generation, title }], generation) },
+        })
+      );
+    push("first", 8);
+    await screen.findByText("first");
+    expect(screen.queryByText(/network policy denied destination/)).not.toBeInTheDocument();
+
+    // A failed Request is the user's own outcome: later pushed renders do not hide it.
+    fireEvent.click(screen.getByRole("button", { name: "Ship it" }));
+    await screen.findByText(/adapter refused the request/);
+    push("second", 9);
+    await screen.findByText("second");
+    expect(screen.getByText(/adapter refused the request/)).toBeInTheDocument();
+  });
+
   it("runs Requests that resolve to a refresh without confirmation", async () => {
     const { calls } = mockFetch([
       ["/api/dashboards", "GET", () => [doc()]],

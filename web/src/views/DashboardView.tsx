@@ -44,6 +44,10 @@ export const DashboardView: React.FC = () => {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [rendered, setRendered] = useState<RenderedDashboard | null>(null);
   const [doc, setDoc] = useState<DashboardDoc | null>(null);
+  // `loadError` is a failed load of the Dashboard list or render: a later successful render
+  // (HTTP or a pushed Signal) supersedes it. `error` is the outcome of a user operation
+  // (Request, State write, Designer save) and stays until the user's next operation.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [designerMode, setDesignerMode] = useState(false);
@@ -66,20 +70,20 @@ export const DashboardView: React.FC = () => {
       setDashboards(list);
       setActiveId((cur) => (cur && list.some((d) => d.id === cur) ? cur : list[0]?.id ?? null));
     } catch (e) {
-      setError(String(e));
+      setLoadError(String(e));
     }
   };
 
   const loadActiveDashboard = useCallback(async (id: string) => {
     try {
-      setError(null);
       const resp = await apiFetch<{ document: DashboardDoc | null; rendered: RenderedDashboard }>(
         `/api/dashboards/${encodeURIComponent(id)}`
       );
       setDoc(resp.document);
       setRendered(resp.rendered);
+      setLoadError(null);
     } catch (e) {
-      setError(String(e));
+      setLoadError(String(e));
     }
   }, []);
 
@@ -90,6 +94,7 @@ export const DashboardView: React.FC = () => {
   useEffect(() => {
     setEdits([]);
     setSelectedWidgetId(null);
+    setError(null);
     if (activeId) {
       void loadActiveDashboard(activeId);
     }
@@ -102,6 +107,9 @@ export const DashboardView: React.FC = () => {
       if (msg.dashboard_id !== activeId) return;
       setRendered(msg.data.rendered);
       if (msg.data.document) setDoc(msg.data.document);
+      // A successful render supersedes an earlier failed load (e.g. one made just before a
+      // network grant); per-Adapter failures still show in the render's diagnostics.
+      setLoadError(null);
     },
     [activeId]
   );
@@ -357,7 +365,10 @@ export const DashboardView: React.FC = () => {
           <button
             type="button"
             className="btn"
-            onClick={() => activeId && void loadActiveDashboard(activeId)}
+            onClick={() => {
+              setError(null);
+              if (activeId) void loadActiveDashboard(activeId);
+            }}
           >
             Refresh
           </button>
@@ -459,6 +470,7 @@ export const DashboardView: React.FC = () => {
         </div>
       )}
 
+      {loadError && <div className="card badge danger" style={{ display: "block" }}>{loadError}</div>}
       {error && <div className="card badge danger" style={{ display: "block" }}>{error}</div>}
       {banner && <div className="card badge ok" style={{ display: "block" }}>{banner}</div>}
 
