@@ -76,6 +76,12 @@ export const CONFIGURABLE_PROPS: Record<string, PropSpec[]> = {
     { key: "unit", label: "Unit", type: "string" },
     { key: "description", label: "Description", type: "string" },
   ],
+  "dash.list": [
+    { key: "title", label: "Title", type: "string" },
+    { key: "subtitle", label: "Subtitle", type: "string" },
+    { key: "footer", label: "Footer", type: "string" },
+    { key: "empty_message", label: "Empty message", type: "string" },
+  ],
   "dash.text": [
     { key: "title", label: "Title", type: "string" },
     { key: "text", label: "Text", type: "string" },

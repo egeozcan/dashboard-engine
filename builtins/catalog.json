@@ -133,6 +133,30 @@
       }
     },
     {
+      "id": "dash.list",
+      "category": "widget_provider",
+      "description": "Titled list of linked items with a subtitle, a marker and a live relative time, for activity feeds and short lists",
+      "props": {
+        "title?": "string",
+        "subtitle?": "string",
+        "items?": [
+          {
+            "title": "string",
+            "url?": "string",
+            "subtitle?": "string",
+            "subtitle_time?": "any",
+            "marker?": "enum:none|dot|pull_request",
+            "tone?": "string",
+            "meta?": "string",
+            "time?": "any"
+          }
+        ],
+        "show_date?": "boolean",
+        "empty_message?": "string",
+        "footer?": "string"
+      }
+    },
+    {
       "id": "dash.form",
       "category": "widget_provider",
       "description": "Typed, validated parameter or action input form that submits one Request",

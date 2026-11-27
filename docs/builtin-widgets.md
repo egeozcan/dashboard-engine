@@ -1,6 +1,6 @@
 # Built-in widget providers and `dash.history_series`
 
-The engine ships 11 host-rendered widget providers (`dash.*`) and one data provider. Their
+The engine ships 12 host-rendered widget providers (`dash.*`) and one data provider. Their
 contracts live in [`builtins/catalog.json`](../builtins/catalog.json). That file is compiled into
 the binary, so rebuild after you edit it.
 
@@ -142,6 +142,30 @@ min and max per series).
 `markdown = true` (or `format = "markdown"`) enables a Markdown subset: `#`–`####` headings, lists,
 `>` quotes, fenced code, `---` rules, and inline `code`, `**bold**`, `*italic*` and `[links](url)`.
 Error nodes created by the server render as `danger` alerts.
+
+## `dash.list`
+
+A titled list of linked items, for activity feeds and short lists.
+
+| Prop | Type | Notes |
+| --- | --- | --- |
+| `title`, `subtitle` | string | The header. The subtitle shows in small capitals, for example the source. |
+| `items` | list of item | See below |
+| `show_date` | boolean | Shows each item's `time` as a date under its relative time. |
+| `empty_message`, `footer` | string | |
+
+Each item:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `title` | string | **Required** |
+| `url` | string | Makes the whole row one link that opens in a new tab. |
+| `subtitle` | string | Muted line under the title. |
+| `subtitle_time` | timestamp | Appended to the subtitle as a date and time in the viewer's time zone ("5 commits since" + "Nov 20, 5:54 AM"). |
+| `marker` | `none` \| `dot` \| `pull_request` | Icon before the title. Default `none`. |
+| `meta` | string | A word on the right, for example `Opened`. The relative `time` moves under it. |
+| `tone` | status word | Colors `meta` (`info`, `ok`, `warning`, `critical`, ...). |
+| `time` | timestamp | Shown on the right as a compact relative time ("14h ago", "8mo ago"). It updates every minute. |
 
 ## `dash.form`
 

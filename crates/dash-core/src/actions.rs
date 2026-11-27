@@ -275,6 +275,7 @@ const BUILTIN_SILENT_WIDGETS: &[&str] = &[
     "dash.counter",
     "dash.filter",
     "dash.grid",
+    "dash.list",
     "dash.tabs",
     "dash.text",
 ];

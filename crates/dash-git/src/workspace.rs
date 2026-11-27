@@ -1564,6 +1564,13 @@ mod tests {
             serde_json::json!({ "label": "Open", "value": 3, "status": "warning" }),
         )
         .unwrap();
+        check(
+            "dash.list",
+            serde_json::json!({ "title": "Open PRs", "items": [{ "title": "Fix", "url": "https://x", "marker": "pull_request", "time": "2026-11-27T00:00:00Z" }] }),
+        )
+        .unwrap();
+        assert!(check("dash.list", serde_json::json!({ "items": [{ "url": "https://x" }] })).is_err());
+        assert!(check("dash.list", serde_json::json!({ "items": [{ "title": "t", "marker": "star" }] })).is_err());
         check("dash.container", serde_json::json!({})).unwrap();
         // Typical Adapter mistakes are caught before they reach a widget.
         let err = check(

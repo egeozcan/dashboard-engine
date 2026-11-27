@@ -14,6 +14,7 @@ import {
   counterStatus,
   normalizeCounterThresholds,
 } from "./DisplayWidgets";
+import { ListWidget, normalizeListItems } from "./ListWidget";
 import { ButtonWidget, FilterWidget, FormWidget, type FilterControl } from "./InputWidgets";
 import { MapWidget, normalizePoints } from "./MapWidget";
 import { TableWidget, normalizeColumns, normalizeRowActions, type SortState } from "./TableWidget";
@@ -363,6 +364,18 @@ const WidgetRendererImpl: React.FC<RendererProps> = (rp) => {
           markdown={props.markdown === true || props.format === "markdown"}
           variant={typeof props.variant === "string" ? props.variant : undefined}
           renderError={Boolean(node.render_error)}
+        />
+      );
+
+    case "dash.list":
+      return wrap(
+        <ListWidget
+          title={props.title ? String(props.title) : undefined}
+          subtitle={props.subtitle ? String(props.subtitle) : undefined}
+          items={normalizeListItems(props.items)}
+          showDate={props.show_date === true}
+          emptyMessage={props.empty_message ? String(props.empty_message) : undefined}
+          footer={props.footer ? String(props.footer) : undefined}
         />
       );
 
