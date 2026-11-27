@@ -22,7 +22,8 @@ All three behave the same way at runtime:
   ones (`NOT_MERGEABLE`, `NO_TRANSITION`). The upstream's own error message is appended.
 - **Lost writes are `unknown`, not `failed`.** A 5xx answer to a write (other than 501) means
   `UNKNOWN_OUTCOME`. So does a redirect answer to a write that dash will not follow: a 301 or
-  302 (a browser would re-send it as a GET), or any redirect out of `base_url`. A 303 is followed
+  302 (a browser would re-send it as a GET), a 3xx without a `Location`, or any redirect out of
+  `base_url`. A 303 is followed
   with a GET (the write was applied; if that GET fails, the outcome is `unknown`), and a 307 or
   308 re-sends the same request. The action execution becomes `unknown` instead of `failed`, and it is never
   retried blindly. Actions with a `reconcile` handler resolve it.
@@ -220,9 +221,10 @@ of:
   Done, Resolved, Closed, Complete(d), Fixed; `in_progress`: In Progress; `todo`: To Do, Open,
   Backlog). Without one, the call fails with `NO_TRANSITION` and asks for `status`, and the Dry
   run reports it as infeasible: a category never picks Won't Do by workflow order. Statuses that
-  mean the work was not done (Won't Do, Won't Fix, Canceled, Declined, Rejected, Duplicate,
-  Obsolete, Abandoned, Invalid, ...) are never picked by a category, even when they are the only
-  ones reachable; name them with `status` to use them.
+  mean the work was not done (names containing Won't, Cancel, Reject, Declin(ed), Duplicate,
+  Invalid, Obsolete, Abandon(ed), Not Doing, ... in any spelling or apostrophe) are never picked
+  by a category, even when they are the only ones reachable; name them with `status` to use
+  them.
 - `transition_id`: an explicit transition.
 - Neither: a status of category `done`, the same as `status_category: done` (what the
   reference `engineering.complete_work` automation sends).
@@ -233,7 +235,11 @@ The steps:
    `transitioned = false` and sends no write.
 2. It reads the available transitions and picks one whose resulting status matches the target.
    Transitions are never matched by their own name, so a target always names the resulting
-   status, and repeating the call or reconciling it is reliable.
+   status, and repeating the call or reconciling it is reliable. When several transitions lead
+   into that status, one named like "Won't Do" or "Cancel" (whose post-function usually sets a
+   Won't Do resolution) is never picked unless the target status itself is such a status; a
+   transition named like the status wins, else the first in workflow order. If only such
+   transitions lead there, the call fails with `NO_TRANSITION`; pass `transition_id` to use one.
 3. It posts `{transition: {id}}`, plus the optional resolution and comment (atomically, in the
    same request).
 

@@ -565,7 +565,13 @@ impl HttpBroker {
             );
 
             if resp.status().is_redirection() {
-                if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
+                // A raw non-ASCII Location (e.g. a UTF-8 slug) is still a Location: `Url::join`
+                // percent-encodes it.
+                let location = resp
+                    .headers()
+                    .get("location")
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+                if let Some(loc) = location.as_deref() {
                     if !is_safe_method(method.as_str()) {
                         write_sent = true;
                     }
@@ -592,25 +598,26 @@ impl HttpBroker {
                     let status = resp.status().as_u16();
                     let not_get_or_head =
                         method != reqwest::Method::GET && method != reqwest::Method::HEAD;
-                    if (status == 301 || status == 302) && not_get_or_head {
+                    if (status == 301 || status == 302)
+                        && not_get_or_head
+                        && !is_safe_method(method.as_str())
+                    {
                         // Browsers re-issue these as a GET, which would report the GET's answer
                         // as the write's result. The upstream may or may not have applied the
                         // write (302 is also the legacy Post/Redirect/Get answer), so the
                         // outcome is unknown; only 303 (applied, see other) and 307/308
                         // (re-send the same request) are followed for writes.
-                        return Err(if is_safe_method(method.as_str()) {
-                            HttpBrokerError::Transport(format!(
-                                "{} answered {status} to a {method} request",
-                                audit_destination(&current_url)
-                            ))
-                        } else {
-                            HttpBrokerError::OutcomeUnknown(format!(
-                                "{} answered {status} (redirect to {}) to a {method} request; \
-                                 the write may or may not have been applied",
-                                audit_destination(&current_url),
-                                audit_destination(&next)
-                            ))
-                        });
+                        return Err(HttpBrokerError::OutcomeUnknown(format!(
+                            "{} answered {status} (redirect to {}) to a {method} request; \
+                             the write may or may not have been applied",
+                            audit_destination(&current_url),
+                            audit_destination(&next)
+                        )));
+                    }
+                    if (status == 301 || status == 302) && not_get_or_head {
+                        // OPTIONS: re-issued as a GET, like a browser would.
+                        method = reqwest::Method::GET;
+                        body = None;
                     }
                     if status == 303 && method != reqwest::Method::HEAD {
                         if !is_safe_method(method.as_str()) {
@@ -625,6 +632,19 @@ impl HttpBroker {
             }
 
             let status = resp.status().as_u16();
+            // A redirect answer to a write that is not followed (no Location, or a 3xx that is
+            // not a redirect to follow) leaves the write's outcome unknown, like any redirect
+            // the broker refuses to follow.
+            if (300..400).contains(&status)
+                && status != 304
+                && (write_sent || !is_safe_method(method.as_str()))
+            {
+                return Err(HttpBrokerError::OutcomeUnknown(format!(
+                    "{} answered {status} to a {method} request without a redirect to follow; \
+                     the write may or may not have been applied",
+                    audit_destination(&current_url)
+                )));
+            }
             if applied_via_see_other && !(200..300).contains(&status) {
                 return Err(HttpBrokerError::OutcomeUnknown(format!(
                     "the write was answered 303 See Other, but reading its result from {} answered {status}",
@@ -1394,6 +1414,10 @@ mod tests {
                     get(|| async { Json(json!([{ "id": 1 }])) }),
                 )
                 .route(
+                    "/api/v1/noloc",
+                    axum::routing::post(|| async { StatusCode::FOUND }),
+                )
+                .route(
                     "/api/v1/gone",
                     axum::routing::post(|| async {
                         (StatusCode::SEE_OTHER, [("location", "/api/v1/missing")])
@@ -1404,7 +1428,12 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         grant_loopback_ceiling(&store);
         let broker = HttpBroker::new(store.clone()).unwrap();
-        for path in ["/api/v1/orders", "/api/v1/slash", "/api/v1/gone"] {
+        for path in [
+            "/api/v1/orders",
+            "/api/v1/slash",
+            "/api/v1/gone",
+            "/api/v1/noloc",
+        ] {
             let req = HttpHostRequest {
                 method: "POST".into(),
                 url: format!("http://127.0.0.1:{}{path}", addr.port()),

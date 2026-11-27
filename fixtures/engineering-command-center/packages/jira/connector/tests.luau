@@ -263,8 +263,8 @@ dash.test("a category target never picks Won't Do among several done statuses", 
     local ambiguous = fake({
         ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
         ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
-            { id = "71", name = "Won't do", to = { name = "Won't Do", statusCategory = { key = "done" } } },
-            { id = "81", name = "Cancel", to = { name = "Canceled", statusCategory = { key = "done" } } },
+            { id = "71", name = "Release", to = { name = "Released", statusCategory = { key = "done" } } },
+            { id = "81", name = "Ship", to = { name = "Shipped", statusCategory = { key = "done" } } },
         } } },
     }, "transition_issue", { key = "DEV-1" })
     local ok, err = pcall(Runtime.call, ambiguous)
@@ -308,4 +308,44 @@ dash.test("a category target never cancels work when Cancel is the only done sta
         ["POST " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 204, body = "" },
     }, "transition_issue", { key = "DEV-1", status = "Canceled" })
     dash.assert_eq(Runtime.call(explicit).status, "Canceled", "explicit status")
+end)
+
+dash.test("a Won't Do transition into Done is never picked, by category or by status", function(_)
+    local function routes()
+        return {
+            ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+            ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+                { id = "71", name = "Won't Do", to = { name = "Done", statusCategory = { key = "done" } } },
+                { id = "31", name = "Done", to = { name = "Done", statusCategory = { key = "done" } } },
+            } } },
+            ["POST " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 204, body = "" },
+        }
+    end
+    for _, args in ipairs({ { key = "DEV-1" }, { key = "DEV-1", status = "Done" } }) do
+        local ctx = fake(routes(), "transition_issue", args)
+        Runtime.call(ctx)
+        dash.assert_eq(ctx.sent[3].body.transition, { id = "31" }, "the Done transition, not Won't Do")
+    end
+
+    local only_cancel = fake({
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1?fields=status"] = { status = 200, body = jira_issue("DEV-1", "In Review") },
+        ["GET " .. CLOUD .. "/rest/api/3/issue/DEV-1/transitions"] = { status = 200, body = { transitions = {
+            { id = "91", name = "Cancel", to = { name = "Closed", statusCategory = { key = "done" } } },
+        } } },
+    }, "transition_issue", { key = "DEV-1" })
+    local ok, err = pcall(Runtime.call, only_cancel)
+    dash.assert(not ok and string.find(tostring(err), "NO_TRANSITION", 1, true) ~= nil
+        and string.find(tostring(err), "transition_id", 1, true) ~= nil, tostring(err))
+    dash.assert_eq(#only_cancel.sent, 2, "nothing written")
+end)
+
+dash.test("negative status and transition names are recognized in their variants", function(_)
+    local model = require("jira.model")
+    for _, name in ipairs({ "Won't Do", "Won’t Do", "Won‘t Do", "Won´t Do", "Won't\u{a0}Do", "Won't Implement",
+        "Closed - Won't Fix", "Not Doing", "Cancelled by customer", "Rejected (Duplicate)", "Canceled", "Declined", "Obsolete" }) do
+        dash.assert(model.is_negative(name), "negative: " .. name)
+    end
+    for _, name in ipairs({ "Done", "Complete", "Completed", "Validated", "Resolved", "Closed", "Released", "Fixed", "Erledigt", "Terminé" }) do
+        dash.assert(not model.is_negative(name), "not negative: " .. name)
+    end
 end)

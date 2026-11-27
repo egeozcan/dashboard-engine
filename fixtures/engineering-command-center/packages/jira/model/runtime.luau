@@ -213,37 +213,50 @@ function M.transition(raw: any): any
     }
 end
 
--- Statuses of the `done` category that mean the work was not done: a status-category target
--- never picks them (only an explicit `status` or `transition_id` does). Compared lower case,
--- with apostrophes and separators removed.
-local NEGATIVE_STATUS = {
-    "wontdo", "wontfix", "cancel", "canceled", "cancelled", "declined", "rejected", "duplicate",
-    "obsolete", "abandoned", "invalid", "notabug", "cannotreproduce", "notreproducible",
-    "incomplete", "outofscope",
+-- Words that mark a status or transition as "closed without doing the work" (Won't Do, Won't
+-- Fix, Canceled, Declined, Duplicate, Not Doing, ...). Matched as substrings of the name reduced
+-- to ASCII letters and digits, so apostrophe variants (', ’, ‘, ´), spaces, punctuation and
+-- suffixes ("Closed - Won't Fix", "Cancelled by customer") all match.
+local NEGATIVE_WORDS = {
+    "wont", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
+    "notdoing", "notneeded", "notabug", "notfix", "cannotrepro", "notrepro", "incomplete",
+    "outofscope", "nofix", "withdrawn", "discard",
 }
 
-local function is_negative_status(lower_name: string): boolean
-    local squashed = string.gsub(lower_name, "[%s%p\226\128\153]", "")
-    for _, n in ipairs(NEGATIVE_STATUS) do
-        if squashed == n then
+local function squash(name: string?): string
+    return (string.gsub(string.lower(name or ""), "[^a-z0-9]", ""))
+end
+
+-- Whether a status or transition name means the work was not done.
+function M.is_negative(name: string?): boolean
+    local s = squash(name)
+    for _, w in ipairs(NEGATIVE_WORDS) do
+        if string.find(s, w, 1, true) ~= nil then
             return true
         end
     end
     return false
 end
 
--- Conventional status names of each category, in order of preference (lower case).
+-- Conventional status names of each category, in order of preference (squashed).
 local PREFERRED_STATUS = {
     done = { "done", "resolved", "closed", "complete", "completed", "fixed" },
-    in_progress = { "in progress" },
-    todo = { "to do", "open", "backlog" },
+    in_progress = { "inprogress" },
+    todo = { "todo", "open", "backlog" },
 }
 
--- The transition to use (plus, when there is none, an optional reason): by `transition_id`,
--- else the one into the single (or conventional) status of `target_category` (todo |
--- in_progress | done), else the one into the status named
--- `target_status` (case-insensitive). Transitions are never matched by their own name, so a
--- target always identifies the resulting status (idempotency and reconcile depend on that).
+-- The transition to use (plus, when there is none, an optional reason). The target is one of:
+-- - `transition_id`: exactly that transition.
+-- - `target_category` (todo | in_progress | done): a status of that category. For `done`,
+--   statuses that mean the work was not done (see `is_negative`) are never candidates. One
+--   distinct status is used as is; with several, the conventional one of the category wins;
+--   otherwise it is ambiguous.
+-- - `target_status`: the status with that name (case-insensitive).
+-- Transitions are matched by their resulting status, never by their own name, so a target
+-- always identifies the resulting status (idempotency and reconcile depend on that). Among
+-- several transitions into the chosen status, one with a negative name ("Won't Do" into Done,
+-- whose post-function sets resolution Won't Do) is never picked unless the target status is
+-- itself negative; a transition named like the status wins, else the first in workflow order.
 function M.pick_transition(transitions: { any }, target_status: string?, transition_id: string?, target_category: string?): (any, string?)
     if transition_id ~= nil then
         for _, t in ipairs(transitions) do
@@ -253,56 +266,71 @@ function M.pick_transition(transitions: { any }, target_status: string?, transit
         end
         return nil
     end
-    if target_category ~= nil then
-        -- Workflows often have several statuses of one category (Done, Won't Do, Canceled,
-        -- Duplicate are all `done`): never pick one of those by workflow order. One distinct
-        -- target status is used as is; otherwise the conventional status of the category wins,
-        -- and anything else is ambiguous (the caller must name `status`).
-        local candidates = {}
-        local by_status = {}
-        local negative = {}
-        for _, t in ipairs(transitions) do
-            if t.to_category == target_category then
-                local s = string.lower(t.to_status)
-                if is_negative_status(s) then
-                    table.insert(negative, t.to_status)
-                elseif by_status[s] == nil then
-                    by_status[s] = t
-                    table.insert(candidates, t)
-                end
-            end
-        end
-        if #candidates == 0 then
-            if #negative > 0 then
-                -- Only "closed without doing it" statuses are reachable (e.g. a global Cancel
-                -- transition): never cancel finished work by category.
-                return nil, "only " .. table.concat(negative, ", ") .. " (category '" .. target_category
-                    .. "') is reachable, which a category target never picks; pass `status` to choose it"
-            end
-            return nil
-        end
-        if #candidates == 1 then
-            return candidates[1]
-        end
-        for _, name in ipairs(PREFERRED_STATUS[target_category] or {}) do
-            if by_status[name] ~= nil then
-                return by_status[name]
-            end
-        end
-        local names = {}
-        for _, t in ipairs(candidates) do
-            table.insert(names, t.to_status)
-        end
-        return nil, "several statuses of category '" .. target_category .. "' are reachable ("
-            .. table.concat(names, ", ") .. "); pass `status` to choose one"
-    end
-    local want = string.lower(target_status or "")
+
+    -- Candidate transitions grouped by resulting status, in workflow order.
+    local groups: { [string]: { any } } = {}
+    local order: { string } = {}
+    local excluded: { string } = {}
+    local want = squash(target_status)
     for _, t in ipairs(transitions) do
-        if string.lower(t.to_status) == want then
+        local key = squash(t.to_status)
+        local matches
+        if target_category ~= nil then
+            matches = t.to_category == target_category
+            if matches and target_category == "done" and M.is_negative(t.to_status) then
+                matches = false
+                table.insert(excluded, t.name .. " -> " .. t.to_status)
+            end
+        else
+            matches = key ~= "" and key == want
+        end
+        if matches and not M.is_negative(t.to_status) and M.is_negative(t.name) then
+            matches = false
+            table.insert(excluded, t.name .. " -> " .. t.to_status)
+        end
+        if matches then
+            if groups[key] == nil then
+                groups[key] = {}
+                table.insert(order, key)
+            end
+            table.insert(groups[key], t)
+        end
+    end
+
+    local chosen_key: string? = nil
+    if #order == 1 then
+        chosen_key = order[1]
+    elseif #order > 1 then
+        for _, name in ipairs(PREFERRED_STATUS[target_category or ""] or {}) do
+            if groups[name] ~= nil then
+                chosen_key = name
+                break
+            end
+        end
+        if chosen_key == nil then
+            local names = {}
+            for _, k in ipairs(order) do
+                table.insert(names, groups[k][1].to_status)
+            end
+            return nil, "several statuses of category '" .. tostring(target_category) .. "' are reachable ("
+                .. table.concat(names, ", ") .. "); pass `status` to choose one"
+        end
+    end
+    if chosen_key == nil then
+        if #excluded > 0 then
+            return nil, "only " .. table.concat(excluded, ", ")
+                .. " would get there, which means the work was not done and is never picked automatically;"
+                .. " pass `transition_id` (or a `status` that names it) to use it"
+        end
+        return nil
+    end
+    local group = groups[chosen_key]
+    for _, t in ipairs(group) do
+        if squash(t.name) == chosen_key then
             return t
         end
     end
-    return nil
+    return group[1]
 end
 
 -- Whether an issue already satisfies a transition target (status name or category).
