@@ -460,12 +460,44 @@ const BUILTIN_LUAU_DEFINITIONS: &[(&str, &[(&str, &str)])] = &[
             builtin_luau_file!("hacker_news", "runtime.luau"),
         ],
     ),
+    (
+        "weather",
+        &[
+            builtin_luau_file!("weather", "definition.luau"),
+            builtin_luau_file!("weather", "runtime.luau"),
+        ],
+    ),
+    (
+        "weather_mock",
+        &[
+            builtin_luau_file!("weather_mock", "definition.luau"),
+            builtin_luau_file!("weather", "runtime.luau"),
+        ],
+    ),
+    (
+        "currency",
+        &[
+            builtin_luau_file!("currency", "definition.luau"),
+            builtin_luau_file!("currency", "runtime.luau"),
+        ],
+    ),
+    (
+        "currency_mock",
+        &[
+            builtin_luau_file!("currency_mock", "definition.luau"),
+            builtin_luau_file!("currency", "runtime.luau"),
+        ],
+    ),
 ];
 
 /// `tests.luau` of built-in Luau Definitions, keyed by Definition id. They are not attached to
 /// the Workspace graph (so `dash test` reports only the Workspace's own tests); the engine's
 /// test suite runs them (see `builtin_luau_definition_tests_pass`).
 pub const BUILTIN_LUAU_TESTS: &[(&str, &str)] = &[
+    (
+        "dash.weather",
+        include_str!("../../../builtins/luau/weather/tests.luau"),
+    ),
     (
         "dash.http",
         include_str!("../../../builtins/luau/http/tests.luau"),
@@ -1435,6 +1467,10 @@ mod tests {
             "dash.fal_mock",
             "dash.hacker_news",
             "dash.hacker_news_mock",
+            "dash.weather",
+            "dash.weather_mock",
+            "dash.currency",
+            "dash.currency_mock",
         ] {
             let d = g
                 .definitions

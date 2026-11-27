@@ -26,6 +26,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+flate2 = "1"
 axum.workspace = true
 base64.workspace = true
 futures-util.workspace = true

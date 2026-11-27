@@ -422,8 +422,8 @@ function Util.mock_response(mock: any, method: string, path: string, query: any)
     return if mock[key] ~= nil then response(mock[key]) else nil
 end
 
--- The service connectors and their Mocks use the same paths, query encoding and error mapping.
-function Util.request_json(ctx: any, default_base: string, req: any, mock: boolean): any
+-- Live and Preview use the same path and query. Keep status and headers for conditional GETs.
+function Util.http_response(ctx: any, default_base: string, req: any, mock: boolean): any
     local cfg = Util.v(ctx.config) or {}
     local path = Util.check_path(req.path)
     local resp
@@ -439,12 +439,17 @@ function Util.request_json(ctx: any, default_base: string, req: any, mock: boole
             url = Util.url(base, path, req.query),
             confine_to = base,
             credential = req.credential,
-            headers = { Accept = "application/json" },
+            headers = Util.merge_headers({ Accept = "application/json" }, req.headers),
             body = req.body,
         }))
     end
+    return resp
+end
+
+function Util.request_json(ctx: any, default_base: string, req: any, mock: boolean): any
+    local resp = Util.http_response(ctx, default_base, req, mock)
     if not Util.is_success(resp) then
-        Util.fail("HTTP", req.method .. " " .. path, resp, req.method ~= "GET")
+        Util.fail("HTTP", req.method .. " " .. req.path, resp, req.method ~= "GET")
     end
     return resp.body
 end

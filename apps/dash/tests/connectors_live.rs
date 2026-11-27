@@ -427,6 +427,8 @@ async fn start_upstream() -> (Up, String) {
         .nest("/jira", jira_cloud())
         .nest("/jdc", jira_dc())
         .nest("/api", rest_api())
+        .nest("/met", weather_api())
+        .nest("/fx", currency_api())
         .nest("/fal", fal_api())
         .nest("/hn/api/v1", hn_api())
         .layer(axum::middleware::from_fn_with_state(up.clone(), recorder))
@@ -1340,6 +1342,280 @@ async fn fal_and_hacker_news_use_http_fixtures_in_preview() {
     assert!(
         err.contains("RATE_LIMITED") && err.contains("retry after 10s"),
         "{err}"
+    );
+    assert!(up.seen.lock().unwrap().is_empty());
+}
+
+fn met_forecast() -> Value {
+    let period = |time: &str, temperature: i32| {
+        json!({
+            "time": time,
+            "data": {
+                "instant": { "details": { "air_temperature": temperature } },
+                "next_6_hours": { "summary": { "symbol_code": "cloudy" }, "details": { "precipitation_amount": 1.2 } }
+            }
+        })
+    };
+    json!({
+        "type": "Feature", "geometry": { "type": "Point", "coordinates": [-13.4051, 52.52, 30] },
+        "properties": {
+            "meta": { "updated_at": "2026-11-02T03:45:00Z",
+                      "units": { "air_temperature": "celsius", "precipitation_amount": "mm" } },
+            "timeseries": [
+                period("2026-11-02T04:00:00Z", 8), period("2026-11-02T05:00:00Z", 10),
+                period("2026-11-02T06:00:00Z", 11)
+            ]
+        }
+    })
+}
+
+fn weather_api() -> Router<Up> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    Router::new().route(
+        "/compact",
+        get(|| async {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+            gzip.write_all(&serde_json::to_vec(&met_forecast()).unwrap())
+                .unwrap();
+            (
+                [
+                    ("content-encoding", "gzip"),
+                    ("content-type", "application/json"),
+                ],
+                gzip.finish().unwrap(),
+            )
+        }),
+    )
+}
+
+fn fx_rate() -> Value {
+    json!({ "date": "2026-10-30", "base": "EUR", "quote": "USD", "rate": 1.125 })
+}
+
+fn currency_api() -> Router<Up> {
+    Router::new()
+        .route("/rate/eur/usd", get(|| async { Json(fx_rate()) }))
+        .route(
+            "/providers/ecb/rate/eur/usd",
+            get(|| async { Json(fx_rate()) }),
+        )
+        .route(
+            "/providers/ecb/rates",
+            get(|| async { Json(json!([fx_rate()])) }),
+        )
+        .route("/rates", get(|| async { Json(json!([fx_rate()])) }))
+        .route(
+            "/currencies",
+            get(|| async {
+                Json(json!([
+                    { "iso_code": "EUR", "name": "Euro", "type": "currency" }
+                ]))
+            }),
+        )
+}
+
+fn weather_currency_workspace(base: &str) -> Workspace {
+    let w = workspace(base);
+    let sample = met_forecast();
+    let rate = fx_rate();
+    w.append_instances(
+        "connectors.yaml",
+        &format!(
+            r#"  weather:
+    definition: dash.weather
+    capabilities: [forecast.read]
+    config:
+      base_url: {base}/met
+      user_agent: WeatherTest/1 https://example.com/contact
+      mock_now: "2026-11-02T05:30:00Z"
+      mock:
+        "GET /compact?lat=52.52&lon=-13.4051": {sample}
+  fx:
+    definition: dash.currency
+    capabilities: [rates.read]
+    config:
+      base_url: {base}/fx
+      mock:
+        "GET /providers/ecb/rate/eur/usd?date=2026-11-01": {rate}
+        "GET /rates": []
+        "GET /currencies": {{ status: 429, headers: {{ retry-after: "15" }} }}
+"#
+        ),
+    );
+    w
+}
+
+#[tokio::test]
+async fn weather_normalizes_coordinates_decompresses_and_caches_by_location() {
+    let (up, base) = start_upstream().await;
+    let w = weather_currency_workspace(&base);
+    let b = boot(&w, false, ResourceBudget::default()).await;
+    let args = json!({ "latitude": 52.52009, "longitude": -13.40519 });
+    let forecast = connector(&b, "weather", "forecast", args).await.unwrap();
+    assert_eq!(
+        forecast["location"],
+        json!({"latitude":52.52, "longitude":-13.4051, "altitude":30})
+    );
+    assert_eq!(
+        forecast["timeseries"][0]["next_6_hours"]["summary"]["symbol_code"],
+        "cloudy"
+    );
+    assert_eq!(forecast["units"]["air_temperature"], "celsius");
+
+    connector(
+        &b,
+        "weather",
+        "forecast",
+        json!({ "latitude": 52.52, "longitude": -13.4051 }),
+    )
+    .await
+    .unwrap();
+    let sent = up.find("GET", "/met/compact");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].uri, "/met/compact?lat=52.52&lon=-13.4051");
+    assert_eq!(
+        sent[0].headers["user-agent"],
+        "WeatherTest/1 https://example.com/contact"
+    );
+    assert!(sent[0].headers["accept-encoding"].contains("gzip"));
+    assert!(!sent[0].headers.contains_key("authorization"));
+
+    connector(
+        &b,
+        "weather",
+        "forecast",
+        json!({ "latitude": 52.52, "longitude": -13.4051, "altitude": 120 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(up.find("GET", "/met/compact?altitude=120").len(), 1);
+    let err = connector(
+        &b,
+        "weather",
+        "forecast",
+        json!({ "latitude": -91, "longitude": 12 }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("INVALID_ARGS"), "{err}");
+    assert_eq!(up.find("GET", "/met/compact").len(), 2);
+}
+
+#[tokio::test]
+async fn frankfurter_reads_converts_and_preserves_observation_dates() {
+    let (up, base) = start_upstream().await;
+    let w = weather_currency_workspace(&base);
+    let b = boot(&w, false, ResourceBudget::default()).await;
+    let pair = json!({ "base": "eur", "quote": "Usd" });
+    assert_eq!(connector(&b, "fx", "rate", pair).await.unwrap(), fx_rate());
+    let converted = connector(
+        &b,
+        "fx",
+        "convert",
+        json!({
+            "base": "EUR", "quote": "USD", "date": "2026-11-01", "provider": "ECB", "amount": -10
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(converted["date"], "2026-10-30");
+    assert_eq!(converted["converted_amount"], -11.25);
+    assert_eq!(
+        up.find("GET", "/fx/providers/ecb/rate/eur/usd?date=2026-11-01")
+            .len(),
+        1
+    );
+
+    let rates = connector(
+        &b,
+        "fx",
+        "rates",
+        json!({ "base": "eur", "quotes": ["usd", "gbp"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rates, json!([fx_rate()]));
+    assert_eq!(
+        up.find("GET", "/fx/rates?base=EUR&quotes=USD%2CGBP").len(),
+        1
+    );
+    let series = connector(&b, "fx", "time_series", json!({
+        "base": "EUR", "quotes": ["USD"], "from": "2026-10-29", "to": "2026-11-01", "provider": "ecb"
+    })).await.unwrap();
+    assert_eq!(series[0]["date"], "2026-10-30");
+    assert_eq!(
+        up.find(
+            "GET",
+            "/fx/providers/ecb/rates?base=EUR&from=2026-10-29&quotes=USD&to=2026-11-01"
+        )
+        .len(),
+        1
+    );
+    let currencies = connector(&b, "fx", "currencies", json!({})).await.unwrap();
+    assert_eq!(currencies[0]["iso_code"], "EUR");
+    let before = up.find("GET", "/fx");
+    assert!(before
+        .iter()
+        .all(|r| !r.headers.contains_key("authorization")));
+    for args in [
+        json!({ "base": "EUR", "quote": "USD", "date": "2026-02-30" }),
+        json!({ "base": "EUR", "quote": "../USD" }),
+        json!({ "base": "EUR", "quote": "USD", "provider": "ecb/other" }),
+    ] {
+        let err = connector(&b, "fx", "rate", args).await.unwrap_err();
+        assert!(err.contains("INVALID_ARGS"), "{err}");
+    }
+    assert_eq!(up.find("GET", "/fx").len(), before.len());
+}
+
+#[tokio::test]
+async fn weather_and_currency_preview_use_offline_fixtures() {
+    let (up, base) = start_upstream().await;
+    let w = weather_currency_workspace(&base);
+    let b = boot(&w, true, ResourceBudget::default()).await;
+    let current = connector(
+        &b,
+        "weather",
+        "current",
+        json!({ "latitude":52.52, "longitude":-13.4051 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(current["period"]["details"]["air_temperature"], 10);
+    assert_eq!(current["attribution"], "Based on data from MET Norway");
+    let missing = connector(
+        &b,
+        "weather",
+        "forecast",
+        json!({ "latitude":0, "longitude":0 }),
+    )
+    .await
+    .unwrap_err();
+    assert!(missing.contains("MOCK_NOT_CONFIGURED"), "{missing}");
+    let converted = connector(
+        &b,
+        "fx",
+        "convert",
+        json!({
+            "base": "EUR", "quote": "USD", "amount": 4, "date": "2026-11-01", "provider": "ecb"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(converted["converted_amount"], 4.5);
+    assert_eq!(
+        connector(&b, "fx", "rates", json!({ "base": "EUR" }))
+            .await
+            .unwrap(),
+        json!([])
+    );
+    let limited = connector(&b, "fx", "currencies", json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        limited.contains("RATE_LIMITED") && limited.contains("retry after 15s"),
+        "{limited}"
     );
     assert!(up.seen.lock().unwrap().is_empty());
 }

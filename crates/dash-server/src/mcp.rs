@@ -741,7 +741,7 @@ const DOC_TOPICS: &[(&str, &str, &str)] = &[
     ),
     (
         "connectors",
-        "Setup and operations for GitHub, Jira, fal.ai, Hacker News (Algolia) and generic REST/JSON connectors",
+        "Setup and operations for GitHub, Jira, fal.ai, Hacker News (Algolia), MET Norway, Frankfurter and generic REST/JSON connectors",
         include_str!("../../../docs/connectors.md"),
     ),
     (

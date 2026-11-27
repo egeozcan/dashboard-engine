@@ -141,7 +141,7 @@ dash serve                          # without --use-mocks, the real connectors a
 To change configuration on disk, edit the Workspace files (for example `instances/connectors.yaml` → `config.base_url`, or the `[network]` section of `dashboard.toml`). Then run `dash reload`. It turns your working-tree changes into a Draft, then validates, tests, commits and activates it. You can also make the change in the UI or over MCP.
 
 > [!NOTE]
-> The GitHub and Jira connectors speak the real APIs: github.com or GitHub Enterprise Server, Jira Cloud (v3) or Server/Data Center (v2). They handle pagination, rate limits and error codes. Every Workspace also includes `dash.fal` for queued inference, `dash.hacker_news` for Algolia HN Search, and `dash.http` for other JSON APIs. See [docs/connectors.md](./docs/connectors.md) for credential schemes, capabilities, operations and examples.
+> The GitHub and Jira connectors speak the real APIs: github.com or GitHub Enterprise Server, Jira Cloud (v3) or Server/Data Center (v2). They handle pagination, rate limits and error codes. Every Workspace also includes `dash.fal` for queued inference, `dash.hacker_news` for Algolia HN Search, `dash.weather` for MET Norway forecasts, `dash.currency` for Frankfurter exchange rates, and `dash.http` for other JSON APIs. See [docs/connectors.md](./docs/connectors.md) for credential schemes, capabilities, operations and examples.
 
 ### Private access over Tailscale
 
@@ -279,8 +279,8 @@ web/                       React 19 + TypeScript + Vite UI (embedded into the bi
                            widgetFormat.ts, formFields.ts, markdown.tsx (built-in widget helpers)
 builtins/catalog.json      Built-in Definitions (11 widget providers with props contracts,
                            dash.history_series); compiled in. Reference: docs/builtin-widgets.md
-builtins/luau/             Built-in connectors (dash.http, dash.fal, dash.hacker_news), their Mocks,
-                           dash.http_query, dash.http_action and dash.http_util
+builtins/luau/             Built-in connectors (dash.http, dash.fal, dash.hacker_news, dash.weather,
+                           dash.currency), their Mocks, dash.http_query, dash.http_action and dash.http_util
 fixtures/engineering-command-center/   Reference Workspace (§16); the canonical authoring example
 specs/                     Product specification (v0.2 current)
 docs/adr/                  Architectural Decision Records (also served as MCP resources)

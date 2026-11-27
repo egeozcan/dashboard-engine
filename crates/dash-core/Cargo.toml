@@ -18,7 +18,7 @@ futures-util.workspace = true
 hex.workspace = true
 lru.workspace = true
 rand.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["gzip"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

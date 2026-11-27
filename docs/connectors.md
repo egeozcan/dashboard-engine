@@ -8,6 +8,8 @@ The following connectors ship with dash.
 | `jira.connector` | `jira` Package (in the reference Workspace) | Jira Cloud (REST v3) or Jira Server/Data Center (REST v2) |
 | `dash.fal` | built in (every Workspace) | fal.ai asynchronous inference queue |
 | `dash.hacker_news` | built in (every Workspace) | public Hacker News search and items via Algolia |
+| `dash.weather` | built in (every Workspace) | MET Norway Locationforecast 2.0 |
+| `dash.currency` | built in (every Workspace) | Frankfurter v2 reference exchange rates |
 | `dash.http` | built in (every Workspace) | any REST/JSON API under one base URL |
 
 The connectors share these runtime conventions.
@@ -53,7 +55,7 @@ The connectors share these runtime conventions.
    | Jira Cloud | `email@company.com:API_TOKEN` | `basic` |
    | Jira Server/Data Center | personal access token | `bearer` (default) |
    | fal.ai | the raw fal API key | `key` (sends `Authorization: Key <value>`) |
-   | Hacker News (Algolia) | anonymous | no secret binding |
+   | Hacker News (Algolia), MET Norway, Frankfurter | anonymous | no secret binding |
    | REST API with an API-key header | the key | `header:X-Api-Key` (any header name) |
    | REST API with an API-key query parameter | the key | `query:api_key` |
 
@@ -343,7 +345,77 @@ local page = ctx:await(ctx.inputs.hn:call("search", {
 return page.hits
 ```
 
-### Preview fixtures for fal and Hacker News
+## Weather forecasts from MET Norway (`dash.weather`)
+
+Allow GET requests to `api.met.no`. Before live use, the deployment operator must accept
+MET Norway's terms and configure an identifying `User-Agent` with real contact details.
+Credit MET Norway beside the displayed data, link to CC BY 4.0, and identify any changes.
+The connector includes `attribution` and `license_url` in its results. [Locationforecast API](https://api.met.no/weatherapi/locationforecast/2.0/documentation) · [Service terms](https://api.met.no/doc/TermsOfService) · [Attribution](https://api.met.no/doc/License)
+
+```yaml
+# instances/connectors.yaml
+connectors:
+  weather:
+    definition: dash.weather
+    capabilities: [forecast.read]
+    config:
+      user_agent: "ExampleDashboard/1.0 https://example.org/contact"
+```
+
+Both operations take `latitude`, `longitude` and optional integer `altitude` in metres.
+Coordinates are truncated to four decimal places before lookup. The result includes the
+forecast grid point, `updated_at` and the upstream units for each measurement.
+
+| Operation | Returns |
+| --- | --- |
+| `forecast` | A `timeseries` array. Each period has its UTC `time` and instantaneous `details`. Available `next_1_hours`, `next_6_hours` and `next_12_hours` retain their own summaries and measurements. |
+| `current` | The forecast `period` covering the request time. A time outside the series raises `NO_FORECAST`. |
+
+A data provider can bind `dash.connector_ref("dash.weather", { required_capabilities = { "forecast.read" } })`.
+
+```luau
+local forecast = ctx:await(ctx.inputs.weather:call("current", { latitude = 52.52, longitude = 13.405 }))
+return { temperature = forecast.period.details.air_temperature, unit = forecast.units.air_temperature,
+         time = forecast.period.time, attribution = forecast.attribution, license_url = forecast.license_url }
+```
+
+Both operations share a persistent cache per connector Instance, coordinate and altitude.
+Live requests wait at least three hours worldwide, and longer when the HTTP `Expires`
+header specifies it. A refresh sends the saved `Last-Modified` validator when available.
+For reproducible Preview of `current`, set `config.mock_now` to a UTC timestamp in the fixture's time series.
+
+## Reference exchange rates from Frankfurter v2 (`dash.currency`)
+
+Allow GET requests to `api.frankfurter.dev`. Frankfurter provides daily reference rates with
+no API key. The default series blends sources. Pass an optional `provider` such as `ecb` to
+use that institution's rates and data terms. Display the returned observation `date`, which
+can precede the requested date on a weekend or holiday. [Frankfurter API](https://frankfurter.dev/) · [Provider terms](https://frankfurter.dev/license/)
+
+```yaml
+# instances/connectors.yaml
+connectors:
+  fx:
+    definition: dash.currency
+    capabilities: [rates.read]
+```
+
+| Operation | Returns |
+| --- | --- |
+| `currencies {}` | Frankfurter’s catalogue entries, including `iso_code`, `name` and asset `type`. |
+| `rate {base, quote, date?, provider?}` | One `{date, base, quote, rate}` observation. |
+| `convert {amount, base, quote, date?, provider?}` | The observation, original amount and `converted_amount` (amount × rate, before display rounding). |
+| `rates {base, quotes?, date?, provider?}` | A list of latest or single-date observations. `quotes` is an optional list of currency codes. |
+| `time_series {base, quotes?, from, to, provider?}` | Observations for an inclusive range of calendar dates in `YYYY-MM-DD` format. |
+
+Bind `dash.connector_ref("dash.currency", { required_capabilities = { "rates.read" } })` in a data provider and call it by slot name.
+
+```luau
+return ctx:await(ctx.inputs.fx:call("time_series", {
+    base = "EUR", quotes = { "USD", "GBP" }, from = "2026-10-01", to = "2026-10-31", provider = "ecb",
+}))
+```
+
+### Preview fixtures for fal, Hacker News, weather and currency
 
 Set `config.mock` on the connector Instance to supply upstream response bodies. Keys use the
 HTTP method and path relative to the API base. An exact query-string match takes precedence
@@ -358,6 +430,18 @@ over a path-only match. You can also supply a response envelope with a numeric H
 
 # In hn.config.mock
 "GET /search_by_date": { hits: [], page: 0, hitsPerPage: 10, nbPages: 0, nbHits: 0 }
+
+# In weather.config.mock (set mock_now to 2026-11-02T05:30:00Z for current)
+"GET /compact?lat=52.52&lon=13.405":
+  geometry: { type: Point, coordinates: [13.405, 52.52, 30] }
+  properties:
+    meta: { updated_at: "2026-11-02T04:00:00Z", units: { air_temperature: celsius } }
+    timeseries:
+      - { time: "2026-11-02T05:00:00Z", data: { instant: { details: { air_temperature: 10 } } } }
+      - { time: "2026-11-02T06:00:00Z", data: { instant: { details: { air_temperature: 11 } } } }
+
+# In fx.config.mock
+"GET /providers/ecb/rate/eur/usd?date=2026-11-01": { date: "2026-10-30", base: EUR, quote: USD, rate: 1.125 }
 ```
 
 ## Generic REST/JSON (`dash.http`, built in)
@@ -478,4 +562,4 @@ A Workspace Package can reuse the shared helpers with `libraries = { "dash.http_
 - `max_pages`.
 
 The runtime SDK also offers `dash.url.encode`, `dash.url.query(table)` (sorted,
-percent-encoded, lists repeated), `dash.url.parse_links(link_header)` and `dash.array()`.
+percent-encoded, lists repeated), `dash.url.parse_links(link_header)` and `dash.array()`. `dash.parse_timestamp(text)` returns Unix seconds for RFC 3339 timestamps and RFC 2822 dates (including HTTP dates in GMT), or nil for invalid input.

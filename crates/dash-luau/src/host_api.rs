@@ -921,6 +921,16 @@ pub fn build_dash_runtime_sdk(lua: &Lua) -> mlua::Result<Table> {
     )?;
     dash.set("json", json)?;
     dash.set("url", build_url_helpers(lua)?)?;
+    // Both ctx.now and upstream HTTP cache dates can be compared on the same UTC clock.
+    dash.set(
+        "parse_timestamp",
+        lua.create_function(|_, text: String| {
+            Ok(chrono::DateTime::parse_from_rfc3339(&text)
+                .or_else(|_| chrono::DateTime::parse_from_rfc2822(&text))
+                .ok()
+                .map(|t| t.timestamp()))
+        })?,
+    )?;
     // An empty table that serializes as a JSON array (`[]`) rather than an object (`{}`), for
     // list results built up in Luau that may stay empty.
     dash.set(
