@@ -221,10 +221,12 @@ of:
   Done, Resolved, Closed, Complete(d), Fixed; `in_progress`: In Progress; `todo`: To Do, Open,
   Backlog). Without one, the call fails with `NO_TRANSITION` and asks for `status`, and the Dry
   run reports it as infeasible: a category never picks Won't Do by workflow order. Statuses that
-  mean the work was not done (names containing Won't, Cancel, Reject, Declin(ed), Duplicate,
-  Invalid, Obsolete, Abandon(ed), Not Doing, ... in any spelling or apostrophe) are never picked
-  by a category, even when they are the only ones reachable; name them with `status` to use
-  them.
+  mean the work was not done (a word starting with Won't, Cancel, Reject, Declin(ed),
+  Duplicate, Invalid, Obsolete, Abandon(ed), or a phrase such as Not Doing, Will Not, Cannot
+  Reproduce, Out of Scope, in any apostrophe spelling) are never picked by a category, even when
+  they are the only ones reachable; name them with `status` to use them. This word list is
+  English: with localized status names, two or more reachable statuses of the category are
+  ambiguous (pass `status`), and status names match in any script.
 - `transition_id`: an explicit transition.
 - Neither: a status of category `done`, the same as `status_category: done` (what the
   reference `engineering.complete_work` automation sends).
@@ -239,7 +241,8 @@ The steps:
    into that status, one named like "Won't Do" or "Cancel" (whose post-function usually sets a
    Won't Do resolution) is never picked unless the target status itself is such a status; a
    transition named like the status wins, else the first in workflow order. If only such
-   transitions lead there, the call fails with `NO_TRANSITION`; pass `transition_id` to use one.
+   transitions lead there, the call fails with `NO_TRANSITION`: move the issue in Jira, or call
+   the connector operation `transition_issue` with that `transition_id`.
 3. It posts `{transition: {id}}`, plus the optional resolution and comment (atomically, in the
    same request).
 

@@ -377,7 +377,7 @@ function Util.fail(service: string, what: string, resp: any, write: boolean?)
     end
     -- A write answered 5xx (other than 501) or with an unfollowed redirect may have been
     -- applied: its outcome is unknown, never a definitive (retry-safe) failure.
-    if write and ((status >= 500 and status ~= 501) or (status >= 300 and status < 400 and status ~= 304)) then
+    if write and ((status >= 500 and status ~= 501) or (status >= 300 and status < 400)) then
         error("UNKNOWN_OUTCOME: " .. text)
     end
     error(code .. ": " .. text)

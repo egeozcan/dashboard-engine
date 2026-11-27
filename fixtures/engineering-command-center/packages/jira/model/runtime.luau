@@ -213,25 +213,55 @@ function M.transition(raw: any): any
     }
 end
 
--- Words that mark a status or transition as "closed without doing the work" (Won't Do, Won't
--- Fix, Canceled, Declined, Duplicate, Not Doing, ...). Matched as substrings of the name reduced
--- to ASCII letters and digits, so apostrophe variants (', ’, ‘, ´), spaces, punctuation and
--- suffixes ("Closed - Won't Fix", "Cancelled by customer") all match.
-local NEGATIVE_WORDS = {
-    "wont", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
-    "notdoing", "notneeded", "notabug", "notfix", "cannotrepro", "notrepro", "incomplete",
-    "outofscope", "nofix", "withdrawn", "discard",
-}
-
-local function squash(name: string?): string
-    return (string.gsub(string.lower(name or ""), "[^a-z0-9]", ""))
+-- Lower-cased name without apostrophes (', ’, ‘, ´) and with every other ASCII space or
+-- punctuation run turned into one space (also a no-break space). Non-ASCII letters (Решено,
+-- 完了, Erledigt) are kept, so names in any script stay distinct.
+local function words_of(name: string?): string
+    local s = string.lower(name or "")
+    s = string.gsub(s, "\u{2019}", "")
+    s = string.gsub(s, "\u{2018}", "")
+    s = string.gsub(s, "\u{b4}", "")
+    s = string.gsub(s, "'", "")
+    s = string.gsub(s, "\u{a0}", " ")
+    s = string.gsub(s, "[%s%p]+", " ")
+    s = string.gsub(s, "^ ", "")
+    s = string.gsub(s, " $", "")
+    return s
 end
+
+-- Comparison key of a status or transition name: `words_of` without the spaces.
+local function squash(name: string?): string
+    local key = string.gsub(words_of(name), " ", "")
+    if key == "" then
+        return string.lower(name or "")
+    end
+    return key
+end
+M.status_key = squash
+
+-- Words (prefixes of one word) and phrases (consecutive words) that mark a status or
+-- transition as "closed without doing the work": Won't Do, Won't Fix, Canceled, Declined,
+-- Rejected, Duplicate, Invalid, Obsolete, Abandoned, Not Doing, Cannot Reproduce, ...
+-- Matched on word boundaries, so "In Validation" or "Follow-on Task" are not negative.
+local NEGATIVE_PREFIXES = {
+    "wont", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
+    "withdrawn", "discard", "incomplete",
+}
+local NEGATIVE_PHRASES = {
+    "not doing", "not needed", "not a bug", "not fix", "no fix", "cannot reproduce",
+    "cant reproduce", "not reproducible", "out of scope", "will not",
+}
 
 -- Whether a status or transition name means the work was not done.
 function M.is_negative(name: string?): boolean
-    local s = squash(name)
-    for _, w in ipairs(NEGATIVE_WORDS) do
-        if string.find(s, w, 1, true) ~= nil then
+    local w = " " .. words_of(name) .. " "
+    for _, p in ipairs(NEGATIVE_PREFIXES) do
+        if string.find(w, " " .. p, 1, true) ~= nil then
+            return true
+        end
+    end
+    for _, p in ipairs(NEGATIVE_PHRASES) do
+        if string.find(w, " " .. p, 1, true) ~= nil then
             return true
         end
     end
@@ -282,7 +312,7 @@ function M.pick_transition(transitions: { any }, target_status: string?, transit
                 table.insert(excluded, t.name .. " -> " .. t.to_status)
             end
         else
-            matches = key ~= "" and key == want
+            matches = target_status ~= nil and key == want
         end
         if matches and not M.is_negative(t.to_status) and M.is_negative(t.name) then
             matches = false
@@ -320,7 +350,7 @@ function M.pick_transition(transitions: { any }, target_status: string?, transit
         if #excluded > 0 then
             return nil, "only " .. table.concat(excluded, ", ")
                 .. " would get there, which means the work was not done and is never picked automatically;"
-                .. " pass `transition_id` (or a `status` that names it) to use it"
+                .. " move the issue in Jira, or call the connector's transition_issue with its `transition_id`"
         end
         return nil
     end
@@ -338,7 +368,7 @@ function M.at_target(issue: any, target_status: string?, target_category: string
     if target_category ~= nil then
         return issue.status_category == target_category
     end
-    return target_status ~= nil and string.lower(issue.status or "") == string.lower(target_status)
+    return target_status ~= nil and squash(issue.status) == squash(target_status)
 end
 
 -- Normalized transition target of transition args: an explicit status name, a status

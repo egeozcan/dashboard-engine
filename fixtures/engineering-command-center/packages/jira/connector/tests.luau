@@ -349,3 +349,34 @@ dash.test("negative status and transition names are recognized in their variants
         dash.assert(not model.is_negative(name), "not negative: " .. name)
     end
 end)
+
+dash.test("status names in non-Latin scripts stay distinct: ambiguity fails safe, explicit status works", function(_)
+    local model = require("jira.model")
+    local ru = {
+        { id = "51", name = "Отклонить", to_status = "Отклонено", to_category = "done" },
+        { id = "41", name = "Решить", to_status = "Решено", to_category = "done" },
+    }
+    local t, why = model.pick_transition(ru, nil, nil, "done")
+    dash.assert(t == nil and why ~= nil and string.find(why, "Отклонено", 1, true) ~= nil, "ambiguous, not Declined: " .. tostring(why))
+    dash.assert_eq(model.pick_transition(ru, "Решено", nil, nil).id, "41", "explicit Cyrillic status")
+    local ja = {
+        { id = "61", name = "対応しない", to_status = "対応しない", to_category = "done" },
+        { id = "31", name = "完了", to_status = "完了", to_category = "done" },
+    }
+    local t2 = model.pick_transition(ja, nil, nil, "done")
+    dash.assert(t2 == nil, "two distinct Japanese done statuses are ambiguous")
+    dash.assert_eq(model.pick_transition(ja, "完了", nil, nil).id, "31", "explicit Japanese status")
+    dash.assert(model.at_target({ status = "完了" }, "完了", nil), "at_target in Japanese")
+    dash.assert(model.at_target({ status = "Won't Do" }, "Won’t Do", nil), "at_target ignores apostrophe variants like the picker")
+    dash.assert(not model.at_target({ status = "Решено" }, "Отклонено", nil), "different Cyrillic statuses differ")
+end)
+
+dash.test("negative names match whole words only", function(_)
+    local model = require("jira.model")
+    for _, name in ipairs({ "In Validation", "Begin Validation", "Sign-in Complete", "Follow-on Task", "Review On Test", "Done" }) do
+        dash.assert(not model.is_negative(name), "not negative: " .. name)
+    end
+    for _, name in ipairs({ "Will Not Fix", "Cannot Reproduce", "Out of Scope", "Not a Bug", "Invalidated" }) do
+        dash.assert(model.is_negative(name), "negative: " .. name)
+    end
+end)

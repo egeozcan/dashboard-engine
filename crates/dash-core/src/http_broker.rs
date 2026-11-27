@@ -564,7 +564,9 @@ impl HttpBroker {
                 hop_started,
             );
 
-            if resp.status().is_redirection() {
+            // Only the redirects with defined follow semantics; 300, 304, 305 and 306 are final
+            // answers (unknown for writes, below).
+            if matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 // A raw non-ASCII Location (e.g. a UTF-8 slug) is still a Location: `Url::join`
                 // percent-encodes it.
                 let location = resp
@@ -635,10 +637,7 @@ impl HttpBroker {
             // A redirect answer to a write that is not followed (no Location, or a 3xx that is
             // not a redirect to follow) leaves the write's outcome unknown, like any redirect
             // the broker refuses to follow.
-            if (300..400).contains(&status)
-                && status != 304
-                && (write_sent || !is_safe_method(method.as_str()))
-            {
+            if (300..400).contains(&status) && (write_sent || !is_safe_method(method.as_str())) {
                 return Err(HttpBrokerError::OutcomeUnknown(format!(
                     "{} answered {status} to a {method} request without a redirect to follow; \
                      the write may or may not have been applied",
