@@ -99,6 +99,31 @@ describe("WidgetRenderer layout overrides and sandbox bridge", () => {
     expect(onReq.mock.calls[0][0].payload).toEqual({ a: 1 });
   });
 
+  it("sizes the frame from the declared frame_height unless the Dashboard overrides h", () => {
+    const node = (extra: Record<string, unknown>) => ({
+      widget_id: "w_glance",
+      widget_type: "weather.glance_widget",
+      props: {},
+      ...extra,
+    });
+    const frame = () => screen.getByTitle("Custom widget w_glance") as HTMLIFrameElement;
+    const { rerender } = render(
+      <WidgetRenderer adapterInstance="w" generation={1} onWidgetRequest={vi.fn()} node={node({})} />
+    );
+    expect(frame().style.height).toBe("54px");
+    rerender(<WidgetRenderer adapterInstance="w" generation={1} onWidgetRequest={vi.fn()} node={node({ frame_height: 460 })} />);
+    expect(frame().style.height).toBe("460px");
+    rerender(
+      <WidgetRenderer
+        adapterInstance="w"
+        generation={1}
+        onWidgetRequest={vi.fn()}
+        node={node({ frame_height: 460, layout_override: { h: 6 } })}
+      />
+    );
+    expect(frame().style.height).toBe("288px");
+  });
+
   it("rejects asset URLs outside the provider's assets", () => {
     expect(resolveWidgetAssetUrl("x.w", "/widgets/other/assets/a.html")).toBe("/widgets/x.w/assets/index.html");
     expect(resolveWidgetAssetUrl("x.w", "/widgets/x.w/assets/../runtime.luau")).toBe("/widgets/x.w/assets/index.html");

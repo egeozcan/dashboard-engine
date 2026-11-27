@@ -406,7 +406,7 @@ scenarios/*.yaml        Scenario tests (run in Preview)
 | `dash.data_provider` | `inputs`, `query`, `output`, `updates{on_demand, subscribe}`, `libraries` |
 | `dash.action_provider` | `inputs`, `args`, `result`, optional `dry_run`, `reconcile`, `emits{…durable}`, `invalidates{<data-provider Definition ids>}` |
 | `dash.adapter` | `inputs` (data and actions only), `dashboard_state_reads`, `accepts_requests`, `requests{}`, `handler` (render), `on_request` |
-| `dash.widget_provider` | `asset` (sandboxed HTML), `props`, `accepts_requests` |
+| `dash.widget_provider` | `asset` (sandboxed HTML), `frame_height` (default frame height in px, 24–2000; a Dashboard `h` override wins), `props`, `accepts_requests` |
 | `dash.library` | `runtime`. Imported with `require("pkg.lib")` and listed in `libraries`. Runs with the importer's authority. |
 | `dash.automation` | `inputs`, `triggers{ {kind = "event"\|"cron"\|"signal", …} }` |
 

@@ -272,6 +272,20 @@ export function gridItemStyle(
   return style;
 }
 
+/** Height of a custom widget's sandboxed frame when nothing else sizes it (a one-line badge). */
+export const DEFAULT_FRAME_HEIGHT_PX = 54;
+
+/**
+ * Pixel height of a custom widget's sandboxed frame: the Dashboard's `h` override (row units)
+ * wins, then the widget provider's declared `frame_height` (bounded like the engine's 24–2000),
+ * then the default. The frame cannot size itself: its own messages are never trusted for layout.
+ */
+export function customFrameHeight(ov: LayoutOverride | undefined, frameHeight: unknown): number {
+  if (typeof ov?.h === "number") return clampInt(ov.h, 1, MAX_ROW_SPAN) * ROW_UNIT_PX;
+  if (typeof frameHeight === "number" && Number.isFinite(frameHeight)) return clampInt(frameHeight, 24, 2000);
+  return DEFAULT_FRAME_HEIGHT_PX;
+}
+
 /** Style for a child of a flex container. */
 export function containerItemStyle(ov: LayoutOverride | undefined): React.CSSProperties | undefined {
   const style: React.CSSProperties = {};

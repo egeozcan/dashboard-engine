@@ -21,6 +21,8 @@ import {
   GRID_COLUMNS,
   ROW_UNIT_PX,
   containerItemStyle,
+  customFrameHeight,
+  DEFAULT_FRAME_HEIGHT_PX,
   effectiveProps,
   gridItemStyle,
   moveFromDrag,
@@ -491,6 +493,7 @@ const WidgetRendererImpl: React.FC<RendererProps> = (rp) => {
           generation={generation}
           props={props}
           assetUrl={node.asset_url}
+          height={customFrameHeight(node.layout_override, node.frame_height)}
           onWidgetRequest={onWidgetRequest}
         />
       );
@@ -672,8 +675,10 @@ export const SandboxedWidgetFrame: React.FC<{
   generation: number;
   props: Record<string, unknown>;
   assetUrl?: string;
+  /** Frame height in px (Dashboard override, then the Definition's `frame_height`). */
+  height?: number;
   onWidgetRequest: (ctx: WidgetRequestContext) => Promise<void>;
-}> = ({ defId, widgetId, adapterInstance, generation, props, assetUrl, onWidgetRequest }) => {
+}> = ({ defId, widgetId, adapterInstance, generation, props, assetUrl, height = DEFAULT_FRAME_HEIGHT_PX, onWidgetRequest }) => {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const src = resolveWidgetAssetUrl(defId, assetUrl);
 
@@ -741,7 +746,7 @@ export const SandboxedWidgetFrame: React.FC<{
       onLoad={pushProps}
       style={{
         width: "100%",
-        height: 54,
+        height,
         border: "1px solid var(--border)",
         borderRadius: 6,
         background: "transparent",

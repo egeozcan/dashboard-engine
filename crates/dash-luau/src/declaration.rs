@@ -8,6 +8,7 @@ use crate::manifest::{
     compute_sources_digest, BatchSpec, ConnectorOperationSpec, DefinitionCategory,
     DefinitionManifest, EventDeclSpec, InputRefSpec, PushdownSpec, QueryCapabilities, SchemaSpec,
     StateKeySpec, TriggerDeclSpec, UpdateModes, STATE_MIGRATION_POLICIES, STATE_VALUE_TYPES,
+    WIDGET_FRAME_HEIGHT_RANGE,
 };
 use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use std::collections::BTreeMap;
@@ -418,6 +419,8 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
     }
     let libraries = parse_string_vec(tbl, "libraries")?;
     let widget_asset: Option<String> = get_opt_string(tbl, "asset")?;
+    let widget_frame_height =
+        get_opt_u64(tbl, "frame_height")?.map(|h| u32::try_from(h).unwrap_or(u32::MAX));
 
     let operations = parse_operations(tbl)?;
     let inputs = parse_inputs(tbl)?;
@@ -466,6 +469,7 @@ fn parse_declaration_table(tbl: &Table) -> Result<DefinitionManifest, Declaratio
         request_schemas,
         widget_props,
         widget_asset,
+        widget_frame_height,
         updates,
         triggers,
         libraries,
@@ -658,6 +662,16 @@ fn validate_manifest(m: &DefinitionManifest) -> Result<(), DeclarationError> {
                     m.id
                 )));
             }
+            if let Some(h) = m.widget_frame_height {
+                if !WIDGET_FRAME_HEIGHT_RANGE.contains(&h) {
+                    return Err(DeclarationError::InvalidContract(format!(
+                        "widget_provider '{}': frame_height must be between {} and {} pixels, got {h}",
+                        m.id,
+                        WIDGET_FRAME_HEIGHT_RANGE.start(),
+                        WIDGET_FRAME_HEIGHT_RANGE.end()
+                    )));
+                }
+            }
         }
         _ => {}
     }
@@ -797,6 +811,7 @@ fn allowed_declaration_keys(category: DefinitionCategory) -> &'static [&'static 
             "id",
             "description",
             "asset",
+            "frame_height",
             "props",
             "accepts_requests",
             "requests",
@@ -1541,6 +1556,34 @@ mod tests {
         format!(
             "local dash = require(\"dash\")\nreturn dash.data_provider {{ id = \"p.d\", {body} }}"
         )
+    }
+
+    fn wp(body: &str) -> String {
+        format!(
+            "local dash = require(\"dash\")\nreturn dash.widget_provider {{ id = \"p.w\", asset = \"assets/index.html\", {body} }}"
+        )
+    }
+
+    #[test]
+    fn widget_provider_frame_height_is_parsed_and_bounded() {
+        assert_eq!(eval(&wp("")).unwrap().widget_frame_height, None, "optional");
+        assert_eq!(
+            eval(&wp("frame_height = 460")).unwrap().widget_frame_height,
+            Some(460)
+        );
+        for bad in [
+            "frame_height = 10",
+            "frame_height = 5000",
+            "frame_height = -1",
+            "frame_height = 12.5",
+            "frame_height = \"tall\"",
+        ] {
+            let err = eval(&wp(bad)).unwrap_err().to_string();
+            assert!(err.contains("frame_height"), "{bad}: {err}");
+        }
+        // Only widget providers have a frame.
+        let err = eval(&dp("frame_height = 300")).unwrap_err().to_string();
+        assert!(err.contains("frame_height"), "{err}");
     }
 
     /// R3:decl-ref-options-typos-dropped: a misspelled ref option must fail the declaration

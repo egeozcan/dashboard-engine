@@ -301,6 +301,8 @@ async fn rendered_custom_widgets_carry_declared_asset_url() {
         badge["asset_url"],
         "/widgets/engineering.pr_badge_widget/assets/index.html"
     );
+    // The badge declares no frame_height, so the browser keeps its default frame height.
+    assert!(badge["frame_height"].is_null());
     // Built-in widgets have no asset URL.
     assert!(table["tree"]["asset_url"].is_null());
 

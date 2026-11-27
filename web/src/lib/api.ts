@@ -23,6 +23,8 @@ export interface WidgetNode {
   layout_override?: LayoutOverride;
   /** Entry point of a custom widget provider's declared asset (server-provided). */
   asset_url?: string;
+  /** Default height (px) of a custom widget's sandboxed frame, from its Definition (server-provided). */
+  frame_height?: number;
   /** Set when the server replaced an invalid node by a `dash.text` error node. */
   render_error?: string;
 }

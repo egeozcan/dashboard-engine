@@ -2412,7 +2412,8 @@ pub(crate) fn definition_contract_summaries(g: &ConfiguredGraph) -> serde_json::
 }
 
 /// Add `asset_url` to every rendered Widget node whose widget provider ships a custom asset, so
-/// the browser loads the provider's declared entry point rather than guessing (§10.1).
+/// the browser loads the provider's declared entry point rather than guessing (§10.1), and the
+/// provider's declared `frame_height` so the sandboxed frame is sized without trusting the frame.
 pub(crate) fn annotate_widget_asset_urls(g: &ConfiguredGraph, rendered: &mut serde_json::Value) {
     fn walk(g: &ConfiguredGraph, node: &mut serde_json::Value) {
         let Some(obj) = node.as_object_mut() else {
@@ -2435,6 +2436,9 @@ pub(crate) fn annotate_widget_asset_urls(g: &ConfiguredGraph, rendered: &mut ser
                                 serde_json::Value::String(format!("/widgets/{wt}/{asset}")),
                             );
                         }
+                    }
+                    if let Some(h) = def.manifest.widget_frame_height {
+                        obj.insert("frame_height".into(), serde_json::Value::from(h));
                     }
                 }
             }

@@ -530,6 +530,8 @@ pub const STATE_VALUE_TYPES: &[&str] = &[
 ];
 /// Accepted `StateKeySpec::migration` values.
 pub const STATE_MIGRATION_POLICIES: &[&str] = &["keep", "reset", "reject"];
+/// Accepted widget provider `frame_height` values (CSS pixels).
+pub const WIDGET_FRAME_HEIGHT_RANGE: std::ops::RangeInclusive<u32> = 24..=2000;
 
 /// Provider-declared query capabilities (§6.1 "the scheduler batches compatible dependency
 /// queries and offers provider-declared filtering, pagination, sorting and projections").
@@ -725,6 +727,10 @@ pub struct DefinitionManifest {
     pub widget_props: Option<SchemaSpec>,
     #[serde(default)]
     pub widget_asset: Option<String>,
+    /// Widget providers: default height in CSS pixels of the sandboxed frame
+    /// (`frame_height`, [`WIDGET_FRAME_HEIGHT_RANGE`]). A Dashboard layout override `h` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget_frame_height: Option<u32>,
     #[serde(default)]
     pub updates: UpdateModes,
     #[serde(default)]
@@ -1025,6 +1031,7 @@ mod tests {
             request_schemas: BTreeMap::new(),
             widget_props: None,
             widget_asset: None,
+            widget_frame_height: None,
             updates: UpdateModes::default(),
             triggers: vec![],
             libraries: vec![],

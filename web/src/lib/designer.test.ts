@@ -6,6 +6,8 @@ import {
   effectiveProps,
   gridItemStyle,
   containerItemStyle,
+  customFrameHeight,
+  DEFAULT_FRAME_HEIGHT_PX,
   moveFromDrag,
   resizeFromDrag,
   ROW_UNIT_PX,
@@ -91,6 +93,16 @@ describe("layout override rendering", () => {
     // x near the right edge never overflows the grid.
     expect(gridItemStyle({ x: 10, w: 6 }, 4).gridColumn).toBe("11 / span 2");
     expect(containerItemStyle({ w: 6, h: 2 })).toEqual({ width: "50%", minHeight: 2 * ROW_UNIT_PX });
+  });
+
+  it("sizes custom widget frames from the h override, then the declared frame_height", () => {
+    expect(customFrameHeight(undefined, undefined)).toBe(DEFAULT_FRAME_HEIGHT_PX);
+    expect(customFrameHeight(undefined, 460)).toBe(460);
+    expect(customFrameHeight({ h: 4 }, 460)).toBe(4 * ROW_UNIT_PX);
+    // Bounded like the engine's declaration check; non-numbers fall back to the default.
+    expect(customFrameHeight(undefined, 99999)).toBe(2000);
+    expect(customFrameHeight(undefined, 3)).toBe(24);
+    expect(customFrameHeight(undefined, "460")).toBe(DEFAULT_FRAME_HEIGHT_PX);
   });
 
   it("merges only configurable prop overrides", () => {
