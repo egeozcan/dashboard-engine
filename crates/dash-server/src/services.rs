@@ -1749,7 +1749,7 @@ impl AppServices {
     }
 
     /// Set a secret plus its Administrator policy: destination hosts the credential may be
-    /// attached to and how the broker presents it (`bearer`, `basic`, `header:<Name>`,
+    /// attached to and how the broker presents it (`bearer`, `basic`, `key`, `header:<Name>`,
     /// `query:<param>`). `None` keeps the current policy value.
     #[allow(clippy::too_many_arguments)]
     pub fn secret_set_with_policy(

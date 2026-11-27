@@ -432,6 +432,34 @@ const BUILTIN_LUAU_DEFINITIONS: &[(&str, &[(&str, &str)])] = &[
             builtin_luau_file!("http_action", "runtime.luau"),
         ],
     ),
+    (
+        "fal",
+        &[
+            builtin_luau_file!("fal", "definition.luau"),
+            builtin_luau_file!("fal", "runtime.luau"),
+        ],
+    ),
+    (
+        "fal_mock",
+        &[
+            builtin_luau_file!("fal_mock", "definition.luau"),
+            builtin_luau_file!("fal", "runtime.luau"),
+        ],
+    ),
+    (
+        "hacker_news",
+        &[
+            builtin_luau_file!("hacker_news", "definition.luau"),
+            builtin_luau_file!("hacker_news", "runtime.luau"),
+        ],
+    ),
+    (
+        "hacker_news_mock",
+        &[
+            builtin_luau_file!("hacker_news_mock", "definition.luau"),
+            builtin_luau_file!("hacker_news", "runtime.luau"),
+        ],
+    ),
 ];
 
 /// `tests.luau` of built-in Luau Definitions, keyed by Definition id. They are not attached to
@@ -1403,6 +1431,10 @@ mod tests {
             "dash.http_query",
             "dash.http_action",
             "dash.http_util",
+            "dash.fal",
+            "dash.fal_mock",
+            "dash.hacker_news",
+            "dash.hacker_news_mock",
         ] {
             let d = g
                 .definitions

@@ -388,4 +388,65 @@ function Util.is_success(resp: any): boolean
     return status >= 200 and status < 300
 end
 
+-- A configured value as a response: envelopes as given, anything else a 200 with that body.
+local function response(v: any): any
+    if type(v) == "table" and type(v.status) == "number" then
+        local envelope = true
+        for k in pairs(v) do
+            if k ~= "status" and k ~= "headers" and k ~= "body" then
+                envelope = false
+            end
+        end
+        if envelope then
+            return { status = v.status, headers = v.headers or {}, body = Util.v(v.body) }
+        end
+    end
+    return { status = 200, headers = {}, body = v }
+end
+
+-- A configured HTTP fixture, or nil when the Instance has no matching response.
+function Util.mock_response(mock: any, method: string, path: string, query: any): any
+    if mock == nil then
+        return nil
+    end
+    local only_path = string.match(path, "^([^?]*)") or path
+    local key = method .. " " .. only_path
+    local qs = dash.url.query(query or {})
+    if qs ~= "" and mock[key .. "?" .. qs] ~= nil then
+        return response(mock[key .. "?" .. qs])
+    end
+    local full_key = method .. " " .. path
+    if mock[full_key] ~= nil then
+        return response(mock[full_key])
+    end
+    return if mock[key] ~= nil then response(mock[key]) else nil
+end
+
+-- The service connectors and their Mocks use the same paths, query encoding and error mapping.
+function Util.request_json(ctx: any, default_base: string, req: any, mock: boolean): any
+    local cfg = Util.v(ctx.config) or {}
+    local path = Util.check_path(req.path)
+    local resp
+    if mock then
+        resp = Util.mock_response(Util.v(cfg.mock), req.method, path, req.query)
+        if resp == nil then
+            error("MOCK_NOT_CONFIGURED: no mock response for " .. req.method .. " " .. path)
+        end
+    else
+        local base = Util.base_url({ base_url = Util.v(cfg.base_url) or default_base })
+        resp = ctx:await(ctx.http:request({
+            method = req.method,
+            url = Util.url(base, path, req.query),
+            confine_to = base,
+            credential = req.credential,
+            headers = { Accept = "application/json" },
+            body = req.body,
+        }))
+    end
+    if not Util.is_success(resp) then
+        Util.fail("HTTP", req.method .. " " .. path, resp, req.method ~= "GET")
+    end
+    return resp.body
+end
+
 return Util

@@ -130,7 +130,7 @@ Outbound HTTP is **denied** until the Administrator grants a network ceiling. Se
 # Restrict which Instances may bind it and which host it may be sent to.
 printf %s "$GITHUB_TOKEN" | dash secret set github-work \
   --allowed-binding github_reader --allowed-binding github_maintainer \
-  --allowed-host api.github.com   # optional: --credential-scheme bearer|basic|header:<Name>|query:<param>
+  --allowed-host api.github.com   # optional: --credential-scheme bearer|basic|key|header:<Name>|query:<param>
 
 dash network show                   # compare what the Workspace requests with what is granted
 dash network grant --from-workspace # grant exactly the [network] section of dashboard.toml
@@ -141,7 +141,7 @@ dash serve                          # without --use-mocks, the real connectors a
 To change configuration on disk, edit the Workspace files (for example `instances/connectors.yaml` → `config.base_url`, or the `[network]` section of `dashboard.toml`). Then run `dash reload`. It turns your working-tree changes into a Draft, then validates, tests, commits and activates it. You can also make the change in the UI or over MCP.
 
 > [!NOTE]
-> The GitHub and Jira connectors speak the real APIs: github.com or GitHub Enterprise Server, Jira Cloud (v3) or Server/Data Center (v2). They handle pagination, rate limits and error codes. For any other JSON API, use the built-in `dash.http` connector. See [docs/connectors.md](./docs/connectors.md) for credential schemes, capabilities, operations and examples.
+> The GitHub and Jira connectors speak the real APIs: github.com or GitHub Enterprise Server, Jira Cloud (v3) or Server/Data Center (v2). They handle pagination, rate limits and error codes. Every Workspace also includes `dash.fal` for queued inference, `dash.hacker_news` for Algolia HN Search, and `dash.http` for other JSON APIs. See [docs/connectors.md](./docs/connectors.md) for credential schemes, capabilities, operations and examples.
 
 ### Private access over Tailscale
 
@@ -279,13 +279,13 @@ web/                       React 19 + TypeScript + Vite UI (embedded into the bi
                            widgetFormat.ts, formFields.ts, markdown.tsx (built-in widget helpers)
 builtins/catalog.json      Built-in Definitions (11 widget providers with props contracts,
                            dash.history_series); compiled in. Reference: docs/builtin-widgets.md
-builtins/luau/             Built-in Luau Definitions (dash.http REST/JSON connector, its Mock,
-                           dash.http_query, dash.http_action, dash.http_util); compiled in
+builtins/luau/             Built-in connectors (dash.http, dash.fal, dash.hacker_news), their Mocks,
+                           dash.http_query, dash.http_action and dash.http_util
 fixtures/engineering-command-center/   Reference Workspace (§16); the canonical authoring example
 specs/                     Product specification (v0.2 current)
 docs/adr/                  Architectural Decision Records (also served as MCP resources)
 docs/builtin-widgets.md    Props reference for the built-in widgets and dash.history_series
-docs/connectors.md         GitHub, Jira and dash.http connectors: setup, operations, providers, actions
+docs/connectors.md         Connector setup, operations, data providers and actions
 docs/screenshots/          README images
 GLOSSARY.md                Canonical vocabulary (also served as an MCP resource)
 Dockerfile, docker/        Optional container image (multi-stage; tini; unprivileged)

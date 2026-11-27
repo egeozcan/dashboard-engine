@@ -94,7 +94,7 @@ pub struct SecretMetadata {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// How the broker presents the credential: `bearer` (default), `basic` (value is
-    /// `user:password`), `header:<Name>` or `query:<param>`. Administrator-controlled.
+    /// `user:password`), `key` (Authorization: Key), `header:<Name>` or `query:<param>`. Administrator-controlled.
     #[serde(default = "default_credential_scheme")]
     pub credential_scheme: String,
     pub created_at: String,
@@ -105,7 +105,7 @@ pub fn default_credential_scheme() -> String {
     "bearer".into()
 }
 
-/// Validate a credential scheme string (`bearer`, `basic`, `header:<Name>`, `query:<param>`).
+/// Validate a credential scheme string (`bearer`, `basic`, `key`, `header:<Name>`, `query:<param>`).
 pub fn validate_credential_scheme(scheme: &str) -> Result<(), String> {
     let valid_token = |t: &str| {
         !t.is_empty()
@@ -113,7 +113,7 @@ pub fn validate_credential_scheme(scheme: &str) -> Result<(), String> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     };
     match scheme {
-        "bearer" | "basic" => Ok(()),
+        "bearer" | "basic" | "key" => Ok(()),
         s => {
             if let Some(name) = s.strip_prefix("header:") {
                 let lower = name.to_ascii_lowercase();
@@ -133,7 +133,7 @@ pub fn validate_credential_scheme(scheme: &str) -> Result<(), String> {
                 Ok(())
             } else {
                 Err(format!(
-                    "unknown credential scheme '{s}' (expected bearer, basic, header:<Name> or query:<param>)"
+                    "unknown credential scheme '{s}' (expected bearer, basic, key, header:<Name> or query:<param>)"
                 ))
             }
         }

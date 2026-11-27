@@ -1,21 +1,22 @@
-# Connectors: GitHub, Jira and generic REST/JSON
+# Connectors
 
-Three connector families ship with dash:
+The following connectors ship with dash.
 
 | Connector | Where it lives | Talks to |
 | --- | --- | --- |
 | `github.connector` | `github` Package (in the reference Workspace) | github.com or GitHub Enterprise Server REST API |
 | `jira.connector` | `jira` Package (in the reference Workspace) | Jira Cloud (REST v3) or Jira Server/Data Center (REST v2) |
+| `dash.fal` | built in (every Workspace) | fal.ai asynchronous inference queue |
+| `dash.hacker_news` | built in (every Workspace) | public Hacker News search and items via Algolia |
 | `dash.http` | built in (every Workspace) | any REST/JSON API under one base URL |
 
-All three behave the same way at runtime:
+The connectors share these runtime conventions.
 
 - **The host makes every request.** Requests go through the host HTTP broker: the Workspace
   `[network]` policy intersected with the Administrator network ceiling, SSRF checks, credential
   injection, and redaction. Luau never sees a secret.
-- **Results are stable records.** Every operation returns normalized records, not raw API
-  payloads. Records satisfy the declared contracts and are identical to what the matching Mock
-  returns, so Preview and Definition tests behave like production.
+- **Result contracts apply in live runs and Preview.** Callers can inspect each operation’s manifest to see its return type.
+  Some operations return provider-specific JSON, including fal model results.
 - **Errors carry stable codes.** Each connector error message carries a code (after the Luau
   location prefix in action reasons and query errors): `UNAUTHORIZED`, `FORBIDDEN`,
   `NOT_FOUND`, `CONFLICT`, `INVALID_REQUEST`, `RATE_LIMITED` (with the `Retry-After` or reset
@@ -32,7 +33,7 @@ All three behave the same way at runtime:
   under the connector's `base_url`: same origin and path prefix, and no `.`/`..` segments, even
   behind encoded separators such as `..%2F`. The host broker enforces this for redirects before
   the credential is attached, so a credential never reaches another path on the same host.
-- **Paging is capped.** Pagination follows the API's own scheme (Link headers, which may be
+- **Paging is capped.** Operations that automatically paginate follow the API's own scheme (Link headers, which may be
   relative, plus cursors, tokens and offsets). It stops at `max_pages` (default 5, hard cap 50).
 - **JSON nulls read as absent.** An optional argument or config value sent as `null` means the
   same as leaving it out. Inside a request body a `null` is data and is sent as is (PATCH APIs
@@ -51,6 +52,8 @@ All three behave the same way at runtime:
    | GitHub (PAT, fine-grained token, GitHub App installation token) | the token | `bearer` (default) |
    | Jira Cloud | `email@company.com:API_TOKEN` | `basic` |
    | Jira Server/Data Center | personal access token | `bearer` (default) |
+   | fal.ai | the raw fal API key | `key` (sends `Authorization: Key <value>`) |
+   | Hacker News (Algolia) | anonymous | no secret binding |
    | REST API with an API-key header | the key | `header:X-Api-Key` (any header name) |
    | REST API with an API-key query parameter | the key | `query:api_key` |
 
@@ -66,7 +69,7 @@ All three behave the same way at runtime:
    the Administrator network ceiling (`dash network grant`). Writes need their methods in
    `allowed_methods`: GitHub uses `PUT` (merge), `PATCH` (issue updates) and `POST` (issues and
    comments); Jira writes use `POST`/`PUT`; `dash.http` writes use whichever of `POST`, `PUT`,
-   `PATCH` and `DELETE` your actions send.
+   `PATCH` and `DELETE` your actions send. fal uses `POST` to submit and `PUT` to cancel.
 3. **Declare the connector Instance.** Grant it only the capabilities it needs (least
    privilege: separate reader and writer Instances).
 4. **Bind data providers and actions** to the Instance, in `instances/data.yaml` and
@@ -266,6 +269,96 @@ transitions. Nothing is written in that case.
 | `jira.create_issue` | action: Dry run | Validates the project and summary |
 
 ---
+
+## fal.ai inference queue (`dash.fal`)
+
+Allow `queue.fal.run` in the Workspace and Administrator network policies. Store the raw fal key
+in the vault so the broker can attach it to requests.
+
+```bash
+printf %s "$FAL_KEY" | dash secret set fal-key --credential-scheme key \
+  --allowed-binding fal_queue --allowed-host queue.fal.run
+```
+
+```yaml
+# instances/connectors.yaml
+connectors:
+  fal_queue:
+    definition: dash.fal
+    secrets: { auth: secret://fal-key }
+    capabilities: [queue.submit, queue.read, queue.cancel]
+```
+
+| Operation | Capability | Returns |
+| --- | --- | --- |
+| `submit {endpoint_id, input}` | `queue.submit` | Queue receipt with a `request_id`. The JSON input follows the model's schema. |
+| `status {endpoint_id, request_id, logs?}` | `queue.read` | Current state (`IN_QUEUE`, `IN_PROGRESS`, `COMPLETED`), with queue position, logs, metrics or error details when available. |
+| `result {endpoint_id, request_id}` | `queue.read` | The model's JSON output. Fetch after completion. |
+| `cancel {endpoint_id, request_id}` | `queue.cancel` | The cancellation acknowledgement. `CANCELLATION_REQUESTED` means a running job can still finish. |
+
+For example, bind an action input with
+`dash.connector_ref("dash.fal", { required_capabilities = { "queue.submit" } })`. Its handler
+can submit one job and return its receipt immediately.
+
+```luau
+return ctx:await(ctx.inputs.fal:call("submit", {
+    endpoint_id = "fal-ai/flux/schnell",
+    input = { prompt = ctx.args.prompt },
+}))
+```
+
+Keep the endpoint ID and request ID together. Pass both to a later status, result or cancel
+call, including the original model variant in `endpoint_id`. [fal queue API](https://fal.ai/docs/documentation/model-apis/inference/queue)
+
+## Hacker News search by Algolia (`dash.hacker_news`)
+
+Allow GET requests to `hn.algolia.com` in both network policies. The public Hacker News index
+accepts anonymous requests. [Algolia HN Search API](https://hn.algolia.com/api)
+
+```yaml
+# instances/connectors.yaml
+connectors:
+  hn:
+    definition: dash.hacker_news
+    capabilities: [items.read]
+```
+
+Both operations require `items.read`.
+
+| Operation | Returns |
+| --- | --- |
+| `search {query?, sort?, tags?, numeric_filters?, page?, hits_per_page?}` | One page with `hits`, `page`, `hits_per_page`, `total_hits` and `total_pages`. Each hit includes its numeric `id`, `discussion_url`, tags, and available story or comment fields. |
+| `get_item {id}` | The Algolia item with its nested `children` and a `discussion_url` on the root item. |
+
+Use `sort = "relevance"` (default) or `"date"` (newest first). Pages start at zero.
+`tags` accepts Algolia expressions such as `front_page`, `show_hn` or `comment,story_42`.
+Bind a data provider input with
+`dash.connector_ref("dash.hacker_news", { required_capabilities = { "items.read" } })`.
+For example, its handler can return the latest matching Show HN stories.
+
+```luau
+local page = ctx:await(ctx.inputs.hn:call("search", {
+    query = "dashboard", tags = "show_hn", sort = "date", hits_per_page = 10,
+}))
+return page.hits
+```
+
+### Preview fixtures for fal and Hacker News
+
+Set `config.mock` on the connector Instance to supply upstream response bodies. Keys use the
+HTTP method and path relative to the API base. An exact query-string match takes precedence
+over a path-only match. You can also supply a response envelope with a numeric HTTP `status`,
+`body` and optional `headers`. A missing fixture raises `MOCK_NOT_CONFIGURED`.
+
+```yaml
+# In fal_queue.config.mock
+"POST /fal-ai/flux/schnell": { request_id: demo, status: IN_QUEUE }
+"GET /fal-ai/flux/requests/demo/status": { request_id: demo, status: COMPLETED }
+"GET /fal-ai/flux/requests/demo": { images: [{ url: "https://example.com/demo.png" }] }
+
+# In hn.config.mock
+"GET /search_by_date": { hits: [], page: 0, hitsPerPage: 10, nbPages: 0, nbHits: 0 }
+```
 
 ## Generic REST/JSON (`dash.http`, built in)
 

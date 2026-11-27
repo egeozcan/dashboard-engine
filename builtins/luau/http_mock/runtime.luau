@@ -9,59 +9,23 @@
 -- and goes through the same success/error handling as live responses. An unconfigured GET
 -- fails with MOCK_NOT_CONFIGURED; an unconfigured write succeeds with status 200 and echoes the
 -- request body. Writes are recorded (ctx:mock_get("requests")).
-local dash = require("dash")
 local util = require("dash.http_util")
 
 local Runtime = {}
-
-local function lookup(cfg: any, method: string, path: string, query: any): (boolean, any)
-    local mock = cfg.mock or {}
-    local only_path = string.match(path, "^([^?]*)") or path
-    local qs = dash.url.query(util.merge(query, cfg.query))
-    local candidates = {}
-    if qs ~= "" then
-        table.insert(candidates, method .. " " .. only_path .. "?" .. qs)
-    end
-    table.insert(candidates, method .. " " .. path)
-    table.insert(candidates, method .. " " .. only_path)
-    for _, key in ipairs(candidates) do
-        local v = mock[key]
-        if v ~= nil then
-            return true, v
-        end
-    end
-    return false, nil
-end
-
--- A configured value as a response: envelopes as given, anything else a 200 with that body.
-local function response(v: any): any
-    if type(v) == "table" and type(v.status) == "number" then
-        local envelope = true
-        for k in pairs(v) do
-            if k ~= "status" and k ~= "headers" and k ~= "body" then
-                envelope = false
-            end
-        end
-        if envelope then
-            return { status = v.status, headers = v.headers or {}, body = util.v(v.body) }
-        end
-    end
-    return { status = 200, headers = {}, body = v }
-end
 
 function Runtime.call(ctx: any): any
     local cfg = util.clean(ctx.config, { mock = true })
     local args = util.clean(ctx.args, { body = true })
     local path = util.check_path(args.path)
+    local query = util.merge(args.query, cfg.query)
     if ctx.operation == "get" then
-        local found, v = lookup(cfg, "GET", path, args.query)
-        if not found then
+        local resp = util.mock_response(cfg.mock, "GET", path, query)
+        if resp == nil then
             if args.allow_not_found then
                 return nil
             end
             error("MOCK_NOT_CONFIGURED: no mock response for GET " .. path .. " (set config.mock[\"GET " .. path .. "\"])")
         end
-        local resp = response(v)
         if resp.status == 404 and args.allow_not_found then
             return nil
         end
@@ -78,11 +42,11 @@ function Runtime.call(ctx: any): any
         end
         return util.get_path(resp.body, args.result_path)
     elseif ctx.operation == "request" then
-        local found, v = lookup(cfg, args.method, path, args.query)
+        local resp = util.mock_response(cfg.mock, args.method, path, query)
+            or { status = 200, headers = {}, body = args.body }
         local log = ctx:await(ctx:mock_get("requests")) or {}
         table.insert(log, { method = args.method, path = path, query = args.query, body = args.body })
         ctx:await(ctx:mock_set("requests", log))
-        local resp = if found then response(v) else { status = 200, headers = {}, body = args.body }
         if not util.is_success(resp) then
             util.fail("HTTP", args.method .. " " .. path, resp, true)
         end

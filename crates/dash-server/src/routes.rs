@@ -1040,7 +1040,7 @@ struct SetSecretReq {
     /// Optional destination-host policy for the credential (omitted = keep current).
     #[serde(default)]
     allowed_hosts: Option<Vec<String>>,
-    /// Optional credential scheme: bearer | basic | header:<Name> | query:<param>.
+    /// Optional credential scheme: bearer | basic | key | header:<Name> | query:<param>.
     #[serde(default)]
     credential_scheme: Option<String>,
 }

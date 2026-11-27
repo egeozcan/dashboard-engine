@@ -893,6 +893,9 @@ fn apply_credential(cred: &Credential, url: &mut Url) -> Option<(String, String)
             format!("Basic {}", B64.encode(cred.plaintext.as_bytes())),
         ));
     }
+    if scheme == "key" {
+        return Some(("authorization".into(), format!("Key {}", cred.plaintext)));
+    }
     if let Some(name) = scheme.strip_prefix("header:") {
         return Some((name.to_ascii_lowercase(), cred.plaintext.clone()));
     }

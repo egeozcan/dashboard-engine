@@ -171,7 +171,7 @@ enum SecretAction {
         /// Destination hosts the credential may be attached to (default: any allowed host)
         #[arg(long = "allowed-host")]
         allowed_hosts: Vec<String>,
-        /// How the broker presents the credential: bearer | basic | header:<Name> | query:<param>
+        /// How the broker presents the credential: bearer | basic | key | header:<Name> | query:<param>
         #[arg(long = "credential-scheme")]
         credential_scheme: Option<String>,
     },

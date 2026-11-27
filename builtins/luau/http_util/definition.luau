@@ -2,6 +2,6 @@ local dash = require("dash")
 
 return dash.library {
     id = "dash.http_util",
-    description = "Shared helpers of the dash.http family: safe relative paths, URL building, JSON path extraction, path templates and HTTP error mapping",
+    description = "HTTP helpers for connectors and Preview mocks, including URL confinement, JSON path extraction, fixtures and error mapping",
     runtime = "runtime.luau",
 }

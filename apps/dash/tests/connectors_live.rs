@@ -1,4 +1,4 @@
-//! The GitHub, Jira and generic REST/JSON connectors, end to end: the real engine, host HTTP
+//! The service-specific and generic REST/JSON connectors, end to end: the real engine, host HTTP
 //! broker, network policy, vault credential schemes and Definitions, against a loopback upstream
 //! that answers with the real APIs' payloads (pagination headers, JSON nulls, error bodies,
 //! rate-limit headers, Atlassian Document Format, 204s).
@@ -382,6 +382,42 @@ fn rest_api() -> Router<Up> {
         )
 }
 
+fn fal_api() -> Router<Up> {
+    Router::new()
+        .route("/fal-ai/flux/schnell", post(|| async {
+            Json(json!({ "request_id": "r1", "queue_position": 2 }))
+        }))
+        .route("/fal-ai/flux/requests/r1/status", get(|| async {
+            Json(json!({ "request_id": "r1", "status": "COMPLETED", "logs": [{ "message": "done" }] }))
+        }))
+        .route("/fal-ai/flux/requests/r1", get(|| async {
+            Json(json!({ "images": [{ "url": "https://example.test/image" }] }))
+        }))
+        .route("/fal-ai/flux/requests/r1/cancel", put(|| async {
+            (StatusCode::ACCEPTED, Json(json!({ "status": "CANCELLATION_REQUESTED" })))
+        }))
+        .route("/workflows/team/demo/requests/r2/status", get(|| async {
+            Json(json!({ "request_id": "r2", "status": "IN_PROGRESS" }))
+        }))
+        .route("/team/busy", post(|| async { StatusCode::BAD_GATEWAY }))
+}
+
+fn hn_api() -> Router<Up> {
+    Router::new()
+        .route("/search", get(|| async {
+            Json(json!({ "hits": [], "page": 0, "nbHits": 0, "nbPages": 0, "hitsPerPage": 20 }))
+        }))
+        .route("/search_by_date", get(|| async {
+            Json(json!({ "hits": [{
+                "objectID": "42", "_tags": ["comment", "story_9"], "title": null,
+                "story_id": 9, "story_title": "A story", "comment_text": "A reply", "author": "reader"
+            }], "page": 1, "nbHits": 12, "nbPages": 6, "hitsPerPage": 2 }))
+        }))
+        .route("/items/42", get(|| async {
+            Json(json!({ "id": 42, "type": "comment", "children": [{ "id": 43, "text": "reply" }] }))
+        }))
+}
+
 async fn start_upstream() -> (Up, String) {
     let up = Up::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -391,6 +427,8 @@ async fn start_upstream() -> (Up, String) {
         .nest("/jira", jira_cloud())
         .nest("/jdc", jira_dc())
         .nest("/api", rest_api())
+        .nest("/fal", fal_api())
+        .nest("/hn/api/v1", hn_api())
         .layer(axum::middleware::from_fn_with_state(up.clone(), recorder))
         .with_state(up.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -430,6 +468,22 @@ fn workspace(base: &str) -> Workspace {
       base_url: {base}/jdc
       api_version: "2"
       page_size: 2
+  fal:
+    definition: dash.fal
+    secrets: {{ auth: secret://fal-token }}
+    capabilities: [queue.submit, queue.read, queue.cancel]
+    config:
+      base_url: {base}/fal
+      mock:
+        "POST /fal-ai/flux/schnell": {{ request_id: preview1, status: IN_QUEUE }}
+  hn:
+    definition: dash.hacker_news
+    capabilities: [items.read]
+    config:
+      base_url: {base}/hn/api/v1
+      mock:
+        "GET /search?tags=front_page": {{ hits: [], page: 0, nbHits: 0, nbPages: 0, hitsPerPage: 20 }}
+        "GET /items/12": {{ status: 429, headers: {{ retry-after: "10" }}, body: {{ message: slow down }} }}
   svc_api:
     definition: dash.http
     secrets:
@@ -528,6 +582,7 @@ fn workspace(base: &str) -> Workspace {
             .set_secret_with_policy(name, name, plaintext, &[binding.to_string()], None, scheme)
             .unwrap();
     };
+    put("fal-token", "fal_e2e_key", "fal", Some("key"));
     put("gh-token", "ghp_e2e_token_123", "gh", None);
     put(
         "jira-cloud",
@@ -1137,4 +1192,154 @@ async fn generic_rest_connector_serves_configured_mock_responses_in_preview() {
         up.seen.lock().unwrap().is_empty(),
         "Preview never reaches the upstream"
     );
+}
+
+#[tokio::test]
+async fn fal_queue_uses_key_auth_and_model_scoped_request_paths() {
+    let (up, base) = start_upstream().await;
+    let w = workspace(&base);
+    let b = boot(&w, false, ResourceBudget::default()).await;
+    let endpoint = "fal-ai/flux/schnell";
+    let input = json!({ "prompt": "a landscape", "seed": null });
+    let queued = connector(
+        &b,
+        "fal",
+        "submit",
+        json!({ "endpoint_id": endpoint, "input": input }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(queued["queue_position"], 2);
+    let sent = &up.find("POST", "/fal/fal-ai/flux/schnell")[0];
+    assert_eq!(sent.body, input);
+    assert_eq!(sent.headers["authorization"], "Key fal_e2e_key");
+
+    let job = json!({ "endpoint_id": endpoint, "request_id": queued["request_id"] });
+    let mut with_logs = job.clone();
+    with_logs["logs"] = json!(true);
+    let status = connector(&b, "fal", "status", with_logs).await.unwrap();
+    assert_eq!(status["logs"][0]["message"], "done");
+    assert_eq!(
+        up.find("GET", "/fal/fal-ai/flux/requests/r1/status?logs=1")
+            .len(),
+        1
+    );
+    let result = connector(&b, "fal", "result", job.clone()).await.unwrap();
+    assert_eq!(result["images"][0]["url"], "https://example.test/image");
+    let cancel = connector(&b, "fal", "cancel", job).await.unwrap();
+    assert_eq!(cancel["status"], "CANCELLATION_REQUESTED");
+
+    let status = connector(
+        &b,
+        "fal",
+        "status",
+        json!({
+            "endpoint_id": "workflows/team/demo", "request_id": "r2"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status["status"], "IN_PROGRESS");
+    let err = connector(
+        &b,
+        "fal",
+        "submit",
+        json!({ "endpoint_id": "team/busy", "input": {} }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("UNKNOWN_OUTCOME"), "{err}");
+    let before = up.seen.lock().unwrap().len();
+    for (endpoint, request_id) in [
+        ("owner/../alias", "r1"),
+        ("owner/app", "r1/status"),
+        ("owner/app%2fextra", "r1"),
+    ] {
+        let err = connector(
+            &b,
+            "fal",
+            "result",
+            json!({ "endpoint_id": endpoint, "request_id": request_id }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("INVALID_ARGS"), "{err}");
+    }
+    assert_eq!(up.seen.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn hacker_news_search_and_item_lookup_are_anonymous() {
+    let (up, base) = start_upstream().await;
+    let w = workspace(&base);
+    let b = boot(&w, false, ResourceBudget::default()).await;
+    let search = connector(
+        &b,
+        "hn",
+        "search",
+        json!({
+            "query": "C++ & Rust", "sort": "date", "tags": "comment,story_9",
+            "numeric_filters": "created_at_i>100", "page": 1, "hits_per_page": 2
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(search["total_pages"], 6);
+    assert_eq!(search["total_hits"], 12);
+    assert_eq!(search["hits"][0]["text"], "A reply");
+    assert_eq!(
+        search["hits"][0]["discussion_url"],
+        "https://news.ycombinator.com/item?id=42"
+    );
+    let sent = &up.find("GET", "/hn/api/v1/search_by_date")[0];
+    assert_eq!(sent.uri, "/hn/api/v1/search_by_date?hitsPerPage=2&numericFilters=created_at_i%3E100&page=1&query=C%2B%2B%20%26%20Rust&tags=comment%2Cstory_9");
+    assert!(!sent.headers.contains_key("authorization"));
+    let empty = connector(&b, "hn", "search", json!({ "sort": null }))
+        .await
+        .unwrap();
+    assert_eq!(empty["hits"], json!([]));
+
+    let item = connector(
+        &b,
+        "hn",
+        "get_item",
+        json!({ "id": search["hits"][0]["id"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(item["children"][0]["id"], 43);
+    let missing = connector(&b, "hn", "get_item", json!({ "id": 123 }))
+        .await
+        .unwrap_err();
+    assert!(missing.contains("NOT_FOUND"), "{missing}");
+}
+
+#[tokio::test]
+async fn fal_and_hacker_news_use_http_fixtures_in_preview() {
+    let (up, base) = start_upstream().await;
+    let w = workspace(&base);
+    let b = boot(&w, true, ResourceBudget::default()).await;
+    let job = connector(
+        &b,
+        "fal",
+        "submit",
+        json!({ "endpoint_id": "fal-ai/flux/schnell", "input": {} }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(job["request_id"], "preview1");
+    let search = connector(&b, "hn", "search", json!({ "tags": "front_page" }))
+        .await
+        .unwrap();
+    assert_eq!(search["hits"], json!([]));
+    let err = connector(&b, "hn", "search", json!({})).await.unwrap_err();
+    assert!(err.contains("MOCK_NOT_CONFIGURED"), "{err}");
+    let err = connector(&b, "hn", "get_item", json!({ "id": 12 }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("RATE_LIMITED") && err.contains("retry after 10s"),
+        "{err}"
+    );
+    assert!(up.seen.lock().unwrap().is_empty());
 }
