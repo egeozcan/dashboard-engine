@@ -380,3 +380,21 @@ dash.test("negative names match whole words only", function(_)
         dash.assert(model.is_negative(name), "negative: " .. name)
     end
 end)
+
+dash.test("negative names are caught in every apostrophe, symbol and joined spelling", function(_)
+    local model = require("jira.model")
+    for _, name in ipairs({ "Won`t Do", "Won\u{2bc}t Do", "Won\u{ff07}t Do", "Won\u{2032}t Fix", "❌Won't Do", "【Won't Fix】",
+        "Closed—Won't Fix", "×Cancelled", "NotABug", "NotDoing", "OutOfScope", "CannotReproduce", "WontDo",
+        "Not Planned", "Can't Fix", "Dropped" }) do
+        dash.assert(model.is_negative(name), "negative: " .. name)
+    end
+    for _, name in ipairs({ "In Validation", "Follow-on Task", "Sign-in Complete", "Done", "✅ Done", "Erledigt", "Résolu", "Not started" }) do
+        dash.assert(not model.is_negative(name), "not negative: " .. name)
+    end
+    -- Into Done via "❌Won't Do" (first) or "Resolve": Resolve.
+    local t = model.pick_transition({
+        { id = "98", name = "❌Won't Do", to_status = "Done", to_category = "done" },
+        { id = "31", name = "Resolve", to_status = "Done", to_category = "done" },
+    }, nil, nil, "done")
+    dash.assert_eq(t.id, "31", "not the Won't Do transition")
+end)

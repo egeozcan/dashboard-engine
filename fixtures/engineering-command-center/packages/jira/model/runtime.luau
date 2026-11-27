@@ -239,22 +239,39 @@ local function squash(name: string?): string
 end
 M.status_key = squash
 
--- Words (prefixes of one word) and phrases (consecutive words) that mark a status or
--- transition as "closed without doing the work": Won't Do, Won't Fix, Canceled, Declined,
--- Rejected, Duplicate, Invalid, Obsolete, Abandoned, Not Doing, Cannot Reproduce, ...
--- Matched on word boundaries, so "In Validation" or "Follow-on Task" are not negative.
+-- Words (prefixes of one word) and phrases (consecutive words, also written as one word) that
+-- mark a status or transition as "closed without doing the work": Won't Do, Won't Fix,
+-- Canceled, Declined, Rejected, Duplicate, Invalid, Obsolete, Abandoned, Not Doing, NotABug,
+-- Cannot Reproduce, ... Matched at word starts, so "In Validation" or "Follow-on Task" are not
+-- negative.
 local NEGATIVE_PREFIXES = {
-    "wont", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
-    "withdrawn", "discard", "incomplete",
+    "wont", "cant fix", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
+    "withdrawn", "discard", "incomplete", "dropped", "descoped", "superseded",
 }
 local NEGATIVE_PHRASES = {
-    "not doing", "not needed", "not a bug", "not fix", "no fix", "cannot reproduce",
-    "cant reproduce", "not reproducible", "out of scope", "will not",
+    "not doing", "not needed", "not a bug", "not fix", "no fix", "cannot reproduce", "cant reproduce",
+    "cannot repro", "cant repro", "not reproducible", "not repro", "out of scope", "will not",
+    "not planned", "not done", "cant fix",
 }
+
+-- Apostrophe look-alikes people type in "won't": ' ` ´ ‘ ’ ʼ ′ ＇
+local APOSTROPHES = { "'", "`", "\u{b4}", "\u{2018}", "\u{2019}", "\u{2bc}", "\u{2032}", "\u{ff07}" }
+
+-- The ASCII words of a name for negative matching: lower case, apostrophes removed, and every
+-- run of anything else that is not an ASCII letter or digit (punctuation, spaces, symbols such
+-- as ❌ or 【】, letters of other scripts) a word boundary.
+local function ascii_words(name: string?): string
+    local s = string.lower(name or "")
+    for _, a in ipairs(APOSTROPHES) do
+        s = string.gsub(s, a, "")
+    end
+    s = string.gsub(s, "[^%w]+", " ")
+    return " " .. s .. " "
+end
 
 -- Whether a status or transition name means the work was not done.
 function M.is_negative(name: string?): boolean
-    local w = " " .. words_of(name) .. " "
+    local w = ascii_words(name)
     for _, p in ipairs(NEGATIVE_PREFIXES) do
         if string.find(w, " " .. p, 1, true) ~= nil then
             return true
@@ -262,6 +279,11 @@ function M.is_negative(name: string?): boolean
     end
     for _, p in ipairs(NEGATIVE_PHRASES) do
         if string.find(w, " " .. p, 1, true) ~= nil then
+            return true
+        end
+        -- The same phrase written as one word: NotABug, OutOfScope, CannotReproduce.
+        local joined = string.gsub(p, " ", "")
+        if string.find(w, " " .. joined, 1, true) ~= nil then
             return true
         end
     end
