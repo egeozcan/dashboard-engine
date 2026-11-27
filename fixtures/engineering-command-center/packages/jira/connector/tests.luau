@@ -413,6 +413,11 @@ dash.test("among several transitions into one status only a plain completion is 
         { id = "7", name = "Resolve Issue", to_status = "Resolved", to_category = "done" },
     }
     dash.assert_eq(model.pick_transition(resolved, nil, nil, "done").id, "7", "Resolve Issue")
+    dash.assert_eq(model.pick_transition({
+        { id = "11", name = "Resolve as duplicate", to_status = "Resolved", to_category = "done" },
+        { id = "12", name = "Escalate and resolve", to_status = "Resolved", to_category = "done" },
+        { id = "13", name = "Resolve this issue", to_status = "Resolved", to_category = "done" },
+    }, nil, nil, "done").id, "13", "JSM's Resolve this issue")
     -- Unknown names only: ambiguous, never the first in workflow order.
     local t, why = model.pick_transition({
         { id = "8", name = "Later", to_status = "Closed", to_category = "done" },

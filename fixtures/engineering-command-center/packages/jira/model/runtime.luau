@@ -299,6 +299,7 @@ end
 local COMPLETION_TRANSITIONS = {
     "done", "markasdone", "markdone", "close", "closeissue", "closed", "resolve", "resolveissue",
     "resolved", "complete", "completed", "finish", "finished", "fix", "fixed",
+    "resolvethisissue", "markasresolved", "markascomplete", "markascompleted",
 }
 
 -- Conventional status names of each category, in order of preference (squashed).

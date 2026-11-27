@@ -16,7 +16,8 @@ All three behave the same way at runtime:
 - **Results are stable records.** Every operation returns normalized records, not raw API
   payloads. Records satisfy the declared contracts and are identical to what the matching Mock
   returns, so Preview and Definition tests behave like production.
-- **Errors carry stable codes.** Each error starts with a code: `UNAUTHORIZED`, `FORBIDDEN`,
+- **Errors carry stable codes.** Each connector error message carries a code (after the Luau
+  location prefix in action reasons and query errors): `UNAUTHORIZED`, `FORBIDDEN`,
   `NOT_FOUND`, `CONFLICT`, `INVALID_REQUEST`, `RATE_LIMITED` (with the `Retry-After` or reset
   time), `UPSTREAM_ERROR`, `INVALID_ARGS`, `INVALID_RESPONSE`, `CONFIG`, and connector-specific
   ones (`NOT_MERGEABLE`, `NO_TRANSITION`). The upstream's own error message is appended.
@@ -64,7 +65,8 @@ All three behave the same way at runtime:
 2. **Allow the host.** Add the API host to `[network] allowed_hosts` in `dashboard.toml`, and to
    the Administrator network ceiling (`dash network grant`). Writes need their methods in
    `allowed_methods`: GitHub uses `PUT` (merge), `PATCH` (issue updates) and `POST` (issues and
-   comments); Jira and REST writes use `POST`/`PUT`.
+   comments); Jira writes use `POST`/`PUT`; `dash.http` writes use whichever of `POST`, `PUT`,
+   `PATCH` and `DELETE` your actions send.
 3. **Declare the connector Instance.** Grant it only the capabilities it needs (least
    privilege: separate reader and writer Instances).
 4. **Bind data providers and actions** to the Instance, in `instances/data.yaml` and
@@ -136,7 +138,7 @@ Fields of each record:
   `total`, the per-state counts, and `checks[]` (`{name, kind: status|check, state, url, ...}`).
   A timed-out, cancelled or action-required check run counts as a failure; skipped and neutral
   ones count as neutral.
-- **`dev.workflow_run@1`:** `id`, `name`, `title`, `workflow_id`, `run_number`, `run_attempt`,
+- **`dev.workflow_run@1`:** `id`, `repository`, `name`, `title`, `workflow_id`, `run_number`, `run_attempt`,
   `status`, `conclusion`, `branch`, `head_sha`, `event`, `actor`, `url`, timestamps.
 
 ### Data providers and actions
@@ -305,7 +307,8 @@ connectors:
 | `offset` | `page_param` (default `offset`) advanced by the number of items received | `size_param` (default `limit`) |
 
 Paging stops at an empty or short page, when there is no next cursor or link, or at
-`max_pages`.
+`max_pages`. In `link` mode later pages use the upstream's `next` URL as given (most APIs
+repeat the full query string there).
 
 ### `dash.http_query`: a data provider configured in YAML
 
