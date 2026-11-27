@@ -213,15 +213,17 @@ function M.transition(raw: any): any
     }
 end
 
+-- Apostrophe look-alikes people type in "won't": ' ` ´ ‘ ’ ʼ ′ ＇
+local APOSTROPHES = { "'", "`", "\u{b4}", "\u{2018}", "\u{2019}", "\u{2bc}", "\u{2032}", "\u{ff07}" }
+
 -- Lower-cased name without apostrophes (', ’, ‘, ´) and with every other ASCII space or
 -- punctuation run turned into one space (also a no-break space). Non-ASCII letters (Решено,
 -- 完了, Erledigt) are kept, so names in any script stay distinct.
 local function words_of(name: string?): string
     local s = string.lower(name or "")
-    s = string.gsub(s, "\u{2019}", "")
-    s = string.gsub(s, "\u{2018}", "")
-    s = string.gsub(s, "\u{b4}", "")
-    s = string.gsub(s, "'", "")
+    for _, a in ipairs(APOSTROPHES) do
+        s = string.gsub(s, a, "")
+    end
     s = string.gsub(s, "\u{a0}", " ")
     s = string.gsub(s, "[%s%p]+", " ")
     s = string.gsub(s, "^ ", "")
@@ -245,17 +247,19 @@ M.status_key = squash
 -- Cannot Reproduce, ... Matched at word starts, so "In Validation" or "Follow-on Task" are not
 -- negative.
 local NEGATIVE_PREFIXES = {
-    "wont", "cant fix", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
-    "withdrawn", "discard", "incomplete", "dropped", "descoped", "superseded",
+    "wont", "cancel", "reject", "declin", "duplicat", "invalid", "obsolete", "abandon",
+    "withdrawn", "discard", "incomplete", "dropped", "descoped", "superseded", "denied", "refused",
+    "revoked",
 }
+-- Whole-word phrases (also matched written as one word).
 local NEGATIVE_PHRASES = {
-    "not doing", "not needed", "not a bug", "not fix", "no fix", "cannot reproduce", "cant reproduce",
-    "cannot repro", "cant repro", "not reproducible", "not repro", "out of scope", "will not",
-    "not planned", "not done", "cant fix",
+    "not doing", "not needed", "not a bug", "not fix", "not fixed", "no fix", "cannot fix",
+    "cant fix", "can not fix", "unable to fix", "unable to reproduce", "cannot reproduce",
+    "cant reproduce", "cannot repro", "cant repro", "not reproducible", "not repro", "out of scope",
+    "will not", "not planned", "not done", "not a problem", "not an issue", "not a defect",
+    "works for me", "works as designed", "working as designed", "works as intended",
+    "as designed", "no longer needed", "no longer required", "not required",
 }
-
--- Apostrophe look-alikes people type in "won't": ' ` ´ ‘ ’ ʼ ′ ＇
-local APOSTROPHES = { "'", "`", "\u{b4}", "\u{2018}", "\u{2019}", "\u{2bc}", "\u{2032}", "\u{ff07}" }
 
 -- The ASCII words of a name for negative matching: lower case, apostrophes removed, and every
 -- run of anything else that is not an ASCII letter or digit (punctuation, spaces, symbols such
@@ -278,17 +282,24 @@ function M.is_negative(name: string?): boolean
         end
     end
     for _, p in ipairs(NEGATIVE_PHRASES) do
-        if string.find(w, " " .. p, 1, true) ~= nil then
+        if string.find(w, " " .. p .. " ", 1, true) ~= nil then
             return true
         end
         -- The same phrase written as one word: NotABug, OutOfScope, CannotReproduce.
         local joined = string.gsub(p, " ", "")
-        if string.find(w, " " .. joined, 1, true) ~= nil then
+        if string.find(w, " " .. joined .. " ", 1, true) ~= nil then
             return true
         end
     end
     return false
 end
+
+-- Conventional names of a transition that completes work (squashed): among several
+-- transitions into one status, only these (or one named like the status) are picked.
+local COMPLETION_TRANSITIONS = {
+    "done", "markasdone", "markdone", "close", "closeissue", "closed", "resolve", "resolveissue",
+    "resolved", "complete", "completed", "finish", "finished", "fix", "fixed",
+}
 
 -- Conventional status names of each category, in order of preference (squashed).
 local PREFERRED_STATUS = {
@@ -308,7 +319,8 @@ local PREFERRED_STATUS = {
 -- always identifies the resulting status (idempotency and reconcile depend on that). Among
 -- several transitions into the chosen status, one with a negative name ("Won't Do" into Done,
 -- whose post-function sets resolution Won't Do) is never picked unless the target status is
--- itself negative; a transition named like the status wins, else the first in workflow order.
+-- itself negative; a transition named like the status wins, then a conventional completion
+-- name (Done, Close Issue, Resolve Issue, ...); any other choice among several is ambiguous.
 function M.pick_transition(transitions: { any }, target_status: string?, transition_id: string?, target_category: string?): (any, string?)
     if transition_id ~= nil then
         for _, t in ipairs(transitions) do
@@ -377,12 +389,30 @@ function M.pick_transition(transitions: { any }, target_status: string?, transit
         return nil
     end
     local group = groups[chosen_key]
+    if #group == 1 then
+        return group[1]
+    end
+    -- Several transitions into the status: a deny list of "not done" names can never be
+    -- complete (Not a Problem, Works for Me, Later, ... set their own resolution), so only a
+    -- transition named like the status or a conventional completion name is picked.
     for _, t in ipairs(group) do
         if squash(t.name) == chosen_key then
             return t
         end
     end
-    return group[1]
+    for _, name in ipairs(COMPLETION_TRANSITIONS) do
+        for _, t in ipairs(group) do
+            if squash(t.name) == name then
+                return t
+            end
+        end
+    end
+    local names = {}
+    for _, t in ipairs(group) do
+        table.insert(names, t.name)
+    end
+    return nil, "several transitions lead to '" .. group[1].to_status .. "' (" .. table.concat(names, ", ")
+        .. ") and none is a plain completion; call the connector's transition_issue with a `transition_id`"
 end
 
 -- Whether an issue already satisfies a transition target (status name or category).

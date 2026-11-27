@@ -240,8 +240,11 @@ The steps:
    Transitions are never matched by their own name, so a target always names the resulting
    status, and repeating the call or reconciling it is reliable. When several transitions lead
    into that status, one named like "Won't Do" or "Cancel" (whose post-function usually sets a
-   Won't Do resolution) is never picked unless the target status itself is such a status; a
-   transition named like the status wins, else the first in workflow order. If only such
+   Won't Do resolution) is never picked unless the target status itself is such a status. A
+   single remaining transition is used. Among several, only one named like the status or a plain
+   completion (Done, Mark as Done, Close, Close Issue, Resolve, Resolve Issue, Complete, Finish,
+   Fix) is picked, because transitions such as Not a Problem or Works for Me set their own
+   resolution; otherwise the call fails with `NO_TRANSITION` as ambiguous. If only such
    transitions lead there, the call fails with `NO_TRANSITION`: move the issue in Jira, or call
    the connector operation `transition_issue` with that `transition_id`.
 3. It posts `{transition: {id}}`, plus the optional resolution and comment (atomically, in the

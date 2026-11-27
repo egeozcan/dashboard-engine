@@ -398,3 +398,34 @@ dash.test("negative names are caught in every apostrophe, symbol and joined spel
     }, nil, nil, "done")
     dash.assert_eq(t.id, "31", "not the Won't Do transition")
 end)
+
+dash.test("among several transitions into one status only a plain completion is picked", function(_)
+    local model = require("jira.model")
+    local closed = {
+        { id = "711", name = "Not a Problem", to_status = "Closed", to_category = "done" },
+        { id = "2", name = "Close Issue", to_status = "Closed", to_category = "done" },
+    }
+    dash.assert_eq(model.pick_transition(closed, nil, nil, "done").id, "2", "category: Close Issue")
+    dash.assert_eq(model.pick_transition(closed, "Closed", nil, nil).id, "2", "explicit status: Close Issue")
+    local resolved = {
+        { id = "5", name = "Won't Fix", to_status = "Resolved", to_category = "done" },
+        { id = "6", name = "Works for Me", to_status = "Resolved", to_category = "done" },
+        { id = "7", name = "Resolve Issue", to_status = "Resolved", to_category = "done" },
+    }
+    dash.assert_eq(model.pick_transition(resolved, nil, nil, "done").id, "7", "Resolve Issue")
+    -- Unknown names only: ambiguous, never the first in workflow order.
+    local t, why = model.pick_transition({
+        { id = "8", name = "Later", to_status = "Closed", to_category = "done" },
+        { id = "9", name = "Ship it", to_status = "Closed", to_category = "done" },
+    }, nil, nil, "done")
+    dash.assert(t == nil and why ~= nil and string.find(why, "transition_id", 1, true) ~= nil, tostring(why))
+    -- A single transition into the status is used whatever its name.
+    dash.assert_eq(model.pick_transition({ { id = "9", name = "Ship it", to_status = "Closed", to_category = "done" } }, nil, nil, "done").id, "9", "single")
+    for _, name in ipairs({ "Not a Problem", "Not an Issue", "Works for Me", "Works as Designed", "Cannot Fix", "Unable to Reproduce", "No Longer Needed", "Denied" }) do
+        dash.assert(model.is_negative(name), "negative: " .. name)
+    end
+    for _, name in ipairs({ "Done (will notify reporter)", "No Fixture", "Not Started", "Ready for Release" }) do
+        dash.assert(not model.is_negative(name), "not negative: " .. name)
+    end
+    dash.assert(model.at_target({ status = "Won\u{2bc}t Do" }, "Won't Do", nil), "apostrophe look-alikes in status keys too")
+end)

@@ -1414,7 +1414,7 @@ mod mock_test_bridge_tests {
         // Every GitHub data provider and action reaches the Mock's operations.
         for (id, cases) in [
             ("github.connector", 13),
-            ("jira.connector", 18),
+            ("jira.connector", 19),
             ("jira.search", 1),
             ("jira.issues_by_keys", 2),
             ("jira.transition_issue", 4),
