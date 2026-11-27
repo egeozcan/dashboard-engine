@@ -441,11 +441,22 @@ textarea.code {
   cursor: grab;
 }
 
+/* Node badges carry sentences (issues, capability requirements) that wrap in a narrow column:
+   a pill radius would turn a multi-line badge into an ellipse that clips its text. */
+.graph-node .badge {
+  max-width: 100%;
+  border-radius: 6px;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
 .graph-node .issue {
   display: block;
   margin-top: 4px;
+  padding: 4px 6px;
   font-size: 10px;
-  white-space: normal;
+  font-weight: 500;
 }
 
 .graph-input-row {

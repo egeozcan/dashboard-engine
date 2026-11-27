@@ -22,6 +22,22 @@ function attrSelectorValue(v: string): string {
   return v.replace(/["\\]/g, "\\$&");
 }
 
+/** An issue code (`POLL_WITHOUT_BACKGROUND_QUERY`) that may wrap after each underscore in a
+ *  narrow node card instead of mid-word. `<wbr>` adds no text, so the badge text is unchanged. */
+function breakableCode(code: string): React.ReactNode {
+  const parts = code.split("_");
+  return parts.map((part, i) => (
+    <React.Fragment key={i}>
+      {part}
+      {i < parts.length - 1 && (
+        <>
+          _<wbr />
+        </>
+      )}
+    </React.Fragment>
+  ));
+}
+
 export const GraphEditorView: React.FC = () => {
   const [activeGraph, setActiveGraph] = useState<GraphInspectResponse | null>(null);
   const [activeDefs, setActiveDefs] = useState<Record<string, DefinitionSummary>>({});
@@ -468,7 +484,7 @@ const GraphNodeCard: React.FC<{
 
       {nodeIssues.map((iss, i) => (
         <div key={i} className={`badge ${iss.severity === "error" ? "danger" : "warn"} issue`} title={iss.message}>
-          {iss.code}: {iss.message}
+          {breakableCode(iss.code)}: {iss.message}
         </div>
       ))}
 
@@ -497,7 +513,7 @@ const GraphNodeCard: React.FC<{
                   className={`badge ${iss.severity === "error" ? "danger" : "warn"} issue`}
                   title={iss.message}
                 >
-                  {iss.code}: {iss.message}
+                  {breakableCode(iss.code)}: {iss.message}
                 </div>
               ))}
             </div>
@@ -513,7 +529,7 @@ const GraphNodeCard: React.FC<{
               className={`badge ${iss.severity === "error" ? "danger" : "warn"} issue`}
               title={iss.message}
             >
-              {iss.code} ({slot}): {iss.message}
+              {breakableCode(iss.code)} ({slot}): {iss.message}
             </div>
           ))
         )}
