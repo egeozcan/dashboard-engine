@@ -110,6 +110,45 @@ function xLabel(mode: XMode, x: unknown, spanMs: number): string {
   return s.length > 14 ? `${s.slice(0, 13)}…` : s;
 }
 
+const HOUR_MS = 3600_000;
+const HOUR_STEPS = [1, 2, 3, 4, 6, 12];
+
+/** Short time axes (3 hours to 3 days) get hour ticks and day boundaries instead of date+time labels. */
+export function isHourAxis(mode: XMode, spanMs: number): boolean {
+  return mode === "time" && spanMs >= 3 * HOUR_MS && spanMs <= 3 * 86400_000;
+}
+
+/** Hours between ticks: the smallest of 1/2/3/4/6/12 that keeps at most `maxTicks` ticks. */
+export function hourStep(spanMs: number, maxTicks = 8): number {
+  return HOUR_STEPS.find((h) => spanMs / (h * HOUR_MS) < maxTicks) ?? 24;
+}
+
+/** Whole local hours in [from, to] that are multiples of `step`. */
+export function hourTicks(from: number, to: number, step: number): number[] {
+  const d = new Date(from);
+  d.setMinutes(0, 0, 0);
+  let t = d.getTime() < from ? d.getTime() + HOUR_MS : d.getTime();
+  const out: number[] = [];
+  for (; t <= to; t += HOUR_MS) if (new Date(t).getHours() % step === 0) out.push(t);
+  return out;
+}
+
+/** Local midnights strictly after `from` and at or before `to`. */
+export function localMidnights(from: number, to: number): number[] {
+  const out: number[] = [];
+  const d = new Date(from);
+  for (;;) {
+    d.setHours(24, 0, 0, 0);
+    if (d.getTime() > to) return out;
+    out.push(d.getTime());
+  }
+}
+
+const hourLabel = (ms: number) => {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
 const W = 600;
 
 export const ChartWidget: React.FC<{
@@ -170,31 +209,61 @@ export const ChartWidget: React.FC<{
     label: formatValue(t, { ...fmt, format: fmt.format === "number" || !fmt.format ? "compact" : fmt.format, unit: undefined, prefix: undefined }),
   }));
 
+  const banded = kind === "bar" || data.mode === "category";
+  const xMin = n ? data.xNum[0] : 0;
+  const xMax = n ? data.xNum[n - 1] : 1;
+  const spanMs = data.mode === "time" ? xMax - xMin : 0;
+  const hourAxis = isHourAxis(data.mode, spanMs);
+  const midnights = hourAxis ? localMidnights(xMin, xMax) : [];
+
   const padLeft = Math.max(28, 10 + 6.5 * Math.max(1, ...tickLabels.map((t) => t.label.length)));
   const padRight = 14;
-  const padTop = 10;
+  // Room above the plot for the day labels beside each boundary.
+  const padTop = midnights.length ? 22 : 10;
   const padBottom = 22;
   const plotW = W - padLeft - padRight;
   const plotH = H - padTop - padBottom;
   const yScale = (v: number) => padTop + plotH - ((v - dLo) / (dHi - dLo || 1)) * plotH;
 
-  const banded = kind === "bar" || data.mode === "category";
-  const xMin = n ? data.xNum[0] : 0;
-  const xMax = n ? data.xNum[n - 1] : 1;
   const xPos = (i: number) => {
     if (banded) return padLeft + ((i + 0.5) * plotW) / Math.max(1, n);
     if (n <= 1 || xMax === xMin) return padLeft + plotW / 2;
     return padLeft + ((data.xNum[i] - xMin) / (xMax - xMin)) * plotW;
   };
-  const spanMs = data.mode === "time" ? xMax - xMin : 0;
+  // x of a time on an hour axis: proportional on a line chart. A bar covers the interval that
+  // starts at its x value, so on bars a time sits at the left edge of the bar starting then, and
+  // a boundary in the gap before the first bar at or after it.
+  const timeX = (t: number, boundary: boolean): number | null => {
+    if (!banded) return xMax === xMin ? null : padLeft + ((t - xMin) / (xMax - xMin)) * plotW;
+    const i = data.xNum.findIndex((x) => x >= t);
+    if (i < 0) return null;
+    if (!boundary) return data.xNum[i] === t ? xPos(i) - plotW / Math.max(1, n) / 2 : null;
+    return i === 0 ? null : (xPos(i - 1) + xPos(i)) / 2;
+  };
 
-  // At most ~6 x labels, evenly spread over the points.
-  const labelIdx: number[] = [];
-  if (n === 1) labelIdx.push(0);
-  else if (n > 1) {
+  // x labels: whole hours on short time axes, else at most ~6 spread evenly over the points.
+  const xLabels: Array<{ x: number; text: string; anchor: "start" | "middle" | "end" }> = [];
+  if (hourAxis) {
+    for (const t of hourTicks(xMin, xMax, hourStep(spanMs))) {
+      const x = timeX(t, false);
+      if (x === null) continue;
+      const anchor = x - padLeft < 14 ? "start" : W - padRight - x < 14 ? "end" : "middle";
+      xLabels.push({ x, text: hourLabel(t), anchor });
+    }
+  } else if (n === 1) {
+    xLabels.push({ x: xPos(0), text: xLabel(data.mode, data.xs[0], spanMs), anchor: "middle" });
+  } else if (n > 1) {
     const want = Math.min(n, 6);
-    for (let k = 0; k < want; k++) labelIdx.push(Math.round((k * (n - 1)) / (want - 1)));
+    for (let k = 0; k < want; k++) {
+      const i = Math.round((k * (n - 1)) / (want - 1));
+      const anchor = banded ? "middle" : k === 0 ? "start" : k === want - 1 ? "end" : "middle";
+      xLabels.push({ x: xPos(i), text: xLabel(data.mode, data.xs[i], spanMs), anchor });
+    }
   }
+  const dayBoundaries = midnights.flatMap((t) => {
+    const x = timeX(t, true);
+    return x === null ? [] : [{ t, x }];
+  });
 
   const clampY = (v: number) => Math.min(padTop + plotH, Math.max(padTop, yScale(v)));
   const baseY = clampY(Math.max(dLo, Math.min(dHi, 0)));
@@ -389,16 +458,24 @@ export const ChartWidget: React.FC<{
         {active !== null && active < n && kind !== "bar" && (
           <line x1={xPos(active)} y1={padTop} x2={xPos(active)} y2={padTop + plotH} stroke="var(--text-muted)" strokeDasharray="2 3" />
         )}
-        {labelIdx.map((i, k) => (
-          <text
-            key={`x-${i}-${k}`}
-            x={xPos(i)}
-            y={H - 5}
-            textAnchor={n === 1 || banded ? "middle" : k === 0 ? "start" : k === labelIdx.length - 1 ? "end" : "middle"}
-            fontSize="10"
-            fill="var(--text-muted)"
-          >
-            {xLabel(data.mode, data.xs[i], spanMs)}
+        {dayBoundaries.map(({ t, x }) => (
+          <g key={`day-${t}`} className="chart-day-boundary">
+            <line x1={x} y1={padTop - 14} x2={x} y2={padTop + plotH} stroke="var(--text-muted)" strokeWidth="1.25" strokeDasharray="5 4" />
+            {x - padLeft >= 34 && (
+              <text x={x - 5} y={padTop - 6} textAnchor="end" fontSize="10" fontWeight="600" fill="var(--text-muted)">
+                {formatAxisTime(t - 1, true)}
+              </text>
+            )}
+            {W - padRight - x >= 34 && (
+              <text x={x + 5} y={padTop - 6} textAnchor="start" fontSize="10" fontWeight="600" fill="var(--text-muted)">
+                {formatAxisTime(t, true)}
+              </text>
+            )}
+          </g>
+        ))}
+        {xLabels.map(({ x, text, anchor }, k) => (
+          <text key={`x-${k}`} x={x} y={H - 5} textAnchor={anchor} fontSize="10" fill="var(--text-muted)">
+            {text}
           </text>
         ))}
       </svg>

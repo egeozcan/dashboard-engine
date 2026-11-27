@@ -107,7 +107,9 @@ Empty cells always sort last, whichever direction you sort in.
 | `height`, `show_legend`, `empty_message`, `series_label` | | The legend shows automatically when there are several series. |
 | formatting props | | Apply to tooltips and the summary. Axis ticks use the compact form. |
 
-Values that aren't numbers leave gaps in lines. Hovering the chart, or focusing it and pressing
+A time axis spanning 3 hours to 3 days is labeled with whole hours (every 1–12 hours, in the
+viewer's time zone), and each local midnight inside it is a dashed line with the dates on either
+side. Longer axes keep date labels. Values that aren't numbers leave gaps in lines. Hovering the chart, or focusing it and pressing
 ←/→/Home/End, shows a tooltip. The SVG carries a text summary for screen readers (points, latest,
 min and max per series).
 
